@@ -14,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -1135,16 +1136,30 @@ class Config:
     def set_openai_asr_api_url(self, url: str) -> bool:
         """Set the base URL for the OpenAI-compatible STT endpoint.
 
-        Rejects a blank/whitespace-only URL (mirrors set_openai_asr_model): an
-        empty base URL can't form a valid ``/audio/transcriptions`` request, so
-        persisting it would leave the endpoint unusable. Returns False and keeps
-        the prior value instead. The renderer treats a cleared field as
-        "reset to default" and sends the default URL explicitly.
+        Rejects blank URLs and plaintext remote endpoints. HTTP is allowed only
+        for loopback development servers; all other hosts must use HTTPS.
         """
         if not url or not url.strip():
             logger.error("openai_asr_api_url must not be empty")
             return False
-        self._config["openai_asr_api_url"] = url.strip()
+        clean_url = url.strip()
+        try:
+            parsed = urllib.parse.urlsplit(clean_url)
+            scheme = parsed.scheme.lower()
+            hostname = (parsed.hostname or "").lower()
+        except ValueError as error:
+            logger.error("openai_asr_api_url is not a valid URL: %s", error)
+            return False
+        is_loopback_http = (
+            scheme == "http"
+            and hostname in {"localhost", "127.0.0.1", "::1"}
+        )
+        if scheme != "https" and not is_loopback_http:
+            logger.error(
+                "openai_asr_api_url requires HTTPS except for localhost or loopback hosts"
+            )
+            return False
+        self._config["openai_asr_api_url"] = clean_url
         return self._save()
 
     def get_openai_asr_api_key(self) -> str:
