@@ -269,6 +269,7 @@
       "copyNotes": "Notizen kopieren",
       "copyTranscript": "Transkript kopieren",
       "deleteNote": "Notiz löschen",
+      "editNote": "Notiz bearbeiten",
       "generateNotes": "Notizen erzeugen",
       "home": "Start",
       "moreOptions": "Weitere Optionen",
@@ -338,6 +339,7 @@
     "retranscribeDialog": {
       "body": "Die Transkription läuft mit deinen aktuellen Transkriptionseinstellungen erneut. Das Transkript wird ersetzt und die Zusammenfassung neu erzeugt.",
       "confirm": "Neu transkribieren",
+      "editedSuffix": "Du hast {{sections}} bearbeitet. Deine bearbeitete Fassung bleibt als \"Standard\" mit Zeitstempel im Menü neben Zusammenfassung verfügbar.",
       "title": "Diese Aufnahme neu transkribieren?"
     },
     "section": {

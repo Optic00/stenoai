@@ -269,6 +269,7 @@
       "copyNotes": "Copy notes",
       "copyTranscript": "Copy transcript",
       "deleteNote": "Delete note",
+      "editNote": "Edit note",
       "generateNotes": "Generate notes",
       "home": "Home",
       "moreOptions": "More options",
@@ -338,6 +339,7 @@
     "retranscribeDialog": {
       "body": "This re-runs transcription with your current transcription settings, replacing the transcript and regenerating the summary.",
       "confirm": "Re-transcribe",
+      "editedSuffix": "You edited {{sections}}. Your edited version stays available as \"Standard\" with a timestamp, in the menu next to Summary.",
       "title": "Re-transcribe this recording?"
     },
     "section": {
