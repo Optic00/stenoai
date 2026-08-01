@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { useTranslation } from 'react-i18next';
-import { FileAudio, MessageSquare, MoreHorizontal, Monitor, PanelLeftClose, PanelLeftOpen, PencilLine } from 'lucide-react';
+import { FileAudio, MessageSquare, MoreHorizontal, Monitor, PanelLeftClose, PanelLeftOpen, Plus } from 'lucide-react';
 import type { UseMutationResult } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -10,6 +10,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import {
   useSetSystemAudio,
   useSystemAudioSetting,
@@ -80,26 +81,32 @@ export function MainToolbar({
             Settings — SettingsNav is non-collapsible, so there's nothing for
             it to toggle. */}
         {!settingsMode && (
-          <button
-            type="button"
-            onClick={onToggleSidebar}
-            aria-label={sidebarCollapsed ? t('toolbar.showSidebar') : t('toolbar.hideSidebar')}
-            title={sidebarCollapsed ? t('toolbar.showSidebar') : t('toolbar.hideSidebar')}
-            style={{
-              position: 'fixed',
-              top: 14,
-              left: toggleLeft,
-              zIndex: 30,
-              WebkitAppRegion: 'no-drag',
-            } as React.CSSProperties}
-            className="inline-flex h-[26px] w-7 items-center justify-center rounded-md text-[color:var(--fg-2)] transition-colors hover:bg-[color:var(--surface-hover)] hover:text-[color:var(--fg-1)]"
-          >
-            {sidebarCollapsed ? (
-              <PanelLeftOpen className="size-[15px]" />
-            ) : (
-              <PanelLeftClose className="size-[15px]" />
-            )}
-          </button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={onToggleSidebar}
+                aria-label={sidebarCollapsed ? t('toolbar.showSidebar') : t('toolbar.hideSidebar')}
+                style={{
+                  position: 'fixed',
+                  top: 14,
+                  left: toggleLeft,
+                  zIndex: 30,
+                  WebkitAppRegion: 'no-drag',
+                } as React.CSSProperties}
+                className="inline-flex h-[26px] w-7 items-center justify-center rounded-md text-[color:var(--fg-2)] transition-colors hover:bg-[color:var(--surface-hover)] hover:text-[color:var(--fg-1)]"
+              >
+                {sidebarCollapsed ? (
+                  <PanelLeftOpen className="size-[15px]" />
+                ) : (
+                  <PanelLeftClose className="size-[15px]" />
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {sidebarCollapsed ? t('toolbar.showSidebar') : t('toolbar.hideSidebar')}
+            </TooltipContent>
+          </Tooltip>
         )}
         {/* Starting a new recording with options isn't a Settings action. */}
         {!settingsMode && (
@@ -156,7 +163,7 @@ export function MainToolbar({
               </>
             ) : (
               <>
-                <PencilLine className="size-[13px]" />
+                <Plus className="size-[13px]" />
                 {t('toolbar.newNote')}
               </>
             )}
@@ -192,17 +199,21 @@ function RecordingOptionsPopover({
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-8"
-          aria-label={t('toolbar.recordingOptions')}
-          title={t('toolbar.recordingOptions')}
-        >
-          <MoreHorizontal className="size-4" />
-        </Button>
-      </PopoverTrigger>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <PopoverTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8"
+              aria-label={t('toolbar.recordingOptions')}
+            >
+              <MoreHorizontal className="size-4" />
+            </Button>
+          </PopoverTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">{t('toolbar.recordingOptions')}</TooltipContent>
+      </Tooltip>
       <PopoverContent align="end" className="w-72" data-recording-options>
         <div className="space-y-3">
           <div className="space-y-0.5">

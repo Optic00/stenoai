@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Calendar, ChevronLeft, ChevronRight, PencilLine, RefreshCw, Search, Square, X } from 'lucide-react';
+import { Calendar, ChevronLeft, ChevronRight, Plus, RefreshCw, Search, Square, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { cn, isMac } from '@/lib/utils';
@@ -520,7 +520,7 @@ export function Home({ mode }: HomeProps) {
               onClick={onToggleRecording}
               className="gap-2"
             >
-              {isRecording ? <Square className="size-4" /> : <PencilLine className="size-4" />}
+              {isRecording ? <Square className="size-4" /> : <Plus className="size-4" />}
               {isRecording ? t('home.empty.stopRecording') : t('home.empty.newNote')}
             </Button>
             {hotkeyEnabled && (

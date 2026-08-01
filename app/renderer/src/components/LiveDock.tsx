@@ -2,6 +2,7 @@ import * as React from 'react';
 import { useTranslation } from 'react-i18next';
 import { ChevronUp, Play, Square } from 'lucide-react';
 import { AudioWave } from '@/components/AudioWave';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { useRecording } from '@/hooks/useRecording';
 import { useLiveTranscript } from '@/hooks/useLiveTranscript';
 import { useLiveTranscriptOpen } from '@/hooks/liveTranscriptOpenStore';
@@ -104,46 +105,60 @@ export function LiveDock() {
           drop). There is no manual pause: stop ends the segment and the note
           can be continued later. */}
       {paused && (
-        <button
-          type="button"
-          onClick={onResume}
-          aria-label={t('dock.resumeRecording')}
-          title={t('dock.resumeRecording')}
-          className="inline-flex size-7 cursor-pointer items-center justify-center rounded-full border-0 transition-colors hover:bg-[color:var(--surface-hover)]"
-          style={{ background: 'transparent', color: 'var(--fg-1)' }}
-        >
-          <Play size={13} />
-        </button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={onResume}
+              aria-label={t('dock.resumeRecording')}
+              className="inline-flex size-7 cursor-pointer items-center justify-center rounded-full border-0 transition-colors hover:bg-[color:var(--surface-hover)]"
+              style={{ background: 'transparent', color: 'var(--fg-1)' }}
+            >
+              <Play size={13} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top">{t('dock.resumeRecording')}</TooltipContent>
+        </Tooltip>
       )}
       {/* Expand — Parakeet only. Whisper recordings have no live drawer
           (post-stop pipeline produces the final transcript on the meeting
           detail page). Hiding the button entirely rather than disabling
           avoids the dead-control. */}
       {liveAvailable && (
-        <button
-          type="button"
-          onClick={toggleTranscript}
-          disabled={stopped}
-          aria-label={transcriptOpen ? t('dock.hideTranscript') : t('dock.showTranscript')}
-          aria-pressed={transcriptOpen}
-          title={transcriptOpen ? t('dock.hideTranscript') : t('dock.showTranscript')}
-          className="inline-flex size-7 cursor-pointer items-center justify-center rounded-full border-0 transition-colors hover:bg-[color:var(--surface-hover)] disabled:cursor-not-allowed disabled:opacity-50"
-          style={{ background: 'transparent', color: 'var(--fg-1)' }}
-        >
-          <ChevronUp size={14} />
-        </button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={toggleTranscript}
+              disabled={stopped}
+              aria-label={transcriptOpen ? t('dock.hideTranscript') : t('dock.showTranscript')}
+              aria-pressed={transcriptOpen}
+              className="inline-flex size-7 cursor-pointer items-center justify-center rounded-full border-0 transition-colors hover:bg-[color:var(--surface-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+              style={{ background: 'transparent', color: 'var(--fg-1)' }}
+            >
+              <ChevronUp size={14} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            {transcriptOpen ? t('dock.hideTranscript') : t('dock.showTranscript')}
+          </TooltipContent>
+        </Tooltip>
       )}
-      <button
-        type="button"
-        onClick={onStop}
-        disabled={stopped}
-        aria-label={t('dock.stopRecording')}
-        title={t('dock.stopRecording')}
-        className="inline-flex size-7 cursor-pointer items-center justify-center rounded-full border-0 transition-colors hover:bg-[color:var(--surface-hover)] disabled:cursor-not-allowed disabled:opacity-50"
-        style={{ background: 'transparent', color: 'var(--recording)' }}
-      >
-        <Square size={12} fill="currentColor" stroke="currentColor" />
-      </button>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            onClick={onStop}
+            disabled={stopped}
+            aria-label={t('dock.stopRecording')}
+            className="inline-flex size-7 cursor-pointer items-center justify-center rounded-full border-0 transition-colors hover:bg-[color:var(--surface-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+            style={{ background: 'transparent', color: 'var(--recording)' }}
+          >
+            <Square size={12} fill="currentColor" stroke="currentColor" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="top">{t('dock.stopRecording')}</TooltipContent>
+      </Tooltip>
     </div>
   );
 }
