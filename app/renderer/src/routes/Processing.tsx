@@ -1,4 +1,6 @@
 import * as React from 'react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import {
   Calendar as CalendarIcon,
   ChevronLeft,
@@ -31,11 +33,18 @@ const useProcessingWatchdogStore = create<{
   setGaveUp: (gaveUp) => set({ gaveUp }),
 }));
 
-const STAGE_LABEL: Record<ProcessingStage, string> = {
-  transcribing: 'Analyzing transcript',
-  summarizing: 'Generating notes',
-  finalizing: 'Almost done…',
-  error: 'Couldn’t process this recording.',
+/** Map-reduce sub-progress inside the summarizing stage. */
+type ChunkProgress =
+  | { kind: 'reducing' }
+  | { kind: 'part'; step: number; total: number };
+
+/** Translation key per stage — resolved through `t` at render time so a
+ *  language switch re-labels the running spinner. */
+const STAGE_LABEL_KEY: Record<ProcessingStage, string> = {
+  transcribing: 'processing.stage.transcribing',
+  summarizing: 'processing.stage.summarizing',
+  finalizing: 'processing.stage.finalizing',
+  error: 'processing.stage.error',
 };
 
 // Queue-state watchdog (issue #343). Stopping a recording navigates here
@@ -60,6 +69,7 @@ const WATCHDOG_TICK_MS = 1500;
 const WATCHDOG_IDLE_TICKS = 8;
 
 export function Processing() {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const recording = useRecording();
   const updateMeeting = useUpdateMeeting();
@@ -81,7 +91,10 @@ export function Processing() {
 
 
   const [stage, setStage] = React.useState<ProcessingStage>('transcribing');
-  const [chunkProgress, setChunkProgress] = React.useState<string | null>(null);
+  // Held structurally rather than as a pre-formatted sentence so the IPC
+  // subscription below never has to depend on `t` (re-subscribing the stream
+  // listeners on a language switch could drop an in-flight chunk).
+  const [chunkProgress, setChunkProgress] = React.useState<ChunkProgress | null>(null);
   const [streamText, setStreamText] = React.useState('');
   const [streamedTitle, setStreamedTitle] = React.useState<string | null>(null);
   // Preserved source-audio path from a hard processing crash — the only handle
@@ -216,11 +229,11 @@ export function Processing() {
         if (e.summaryFile) return;
         const raw = e.line.replace(/^PROGRESS:summarize:/, '');
         if (raw === 'reducing') {
-          setChunkProgress('Merging summaries…');
+          setChunkProgress({ kind: 'reducing' });
         } else {
           const [step, total] = raw.split('/').map(Number);
           if (!Number.isNaN(step) && !Number.isNaN(total)) {
-            setChunkProgress(`Summarizing part ${step} of ${total}…`);
+            setChunkProgress({ kind: 'part', step, total });
           }
         }
         setStage((s) => (s === 'transcribing' ? 'summarizing' : s));
@@ -325,7 +338,7 @@ export function Processing() {
     try {
       const res = await ipc().recording.processFile(retryAudioFile, activeSession);
       if (!res.success) {
-        setRetryError(res.error || 'Couldn’t restart processing. Please try again.');
+        setRetryError(res.error || t('processing.error.restartFailed'));
         return;
       }
       pendingChunkRef.current = '';
@@ -336,15 +349,15 @@ export function Processing() {
       setStage('transcribing');
     } catch (err) {
       setRetryError(
-        err instanceof Error ? err.message : 'Couldn’t restart processing. Please try again.',
+        err instanceof Error ? err.message : t('processing.error.restartFailed'),
       );
     } finally {
       setRetrying(false);
     }
-  }, [retryAudioFile, activeSession, retrying]);
+  }, [retryAudioFile, activeSession, retrying, t]);
 
   const displayTitle =
-    streamedTitle ?? draft?.title ?? activeSession ?? 'Note';
+    streamedTitle ?? draft?.title ?? activeSession ?? t('processing.untitledNote');
 
   return (
     <MeetingsShell activeSummaryFile={null}>
@@ -355,10 +368,10 @@ export function Processing() {
             onClick={() => navigate('/')}
             className="mb-6 inline-flex cursor-pointer items-center gap-1 border-0 bg-transparent text-[13px] transition-colors hover:text-[color:var(--fg-1)]"
             style={{ color: 'var(--fg-2)' }}
-            aria-label="Back to home"
+            aria-label={t('processing.backToHome')}
           >
             <ChevronLeft size={15} />
-            Home
+            {t('processing.home')}
           </button>
 
           <h1
@@ -409,7 +422,7 @@ export function Processing() {
               style={{ color: 'var(--fg-2)' }}
             >
               <PencilLine size={13} />
-              My notes
+              {t('processing.myNotes')}
             </div>
             <div
               className="whitespace-pre-wrap text-[15px]"
@@ -442,8 +455,9 @@ function StageCard({
 }: {
   stage: ProcessingStage;
   streamText: string;
-  chunkProgress: string | null;
+  chunkProgress: ChunkProgress | null;
 }) {
+  const { t } = useTranslation();
   // FLIP animation for the scanner bar. The bar is in normal flow under the
   // streaming markdown, so each token batch shifts it down by a discrete
   // amount — jerky if rendered as-is. On every layout we measure the bar's
@@ -526,7 +540,9 @@ function StageCard({
           className="text-[13px] transition-colors"
           style={{ color: 'var(--fg-1)', fontFamily: 'var(--font-sans)' }}
         >
-          {chunkProgress && stage === 'summarizing' ? chunkProgress : STAGE_LABEL[stage]}
+          {chunkProgress && stage === 'summarizing'
+            ? formatChunkProgress(chunkProgress, t)
+            : t(STAGE_LABEL_KEY[stage])}
         </span>
       </div>
     </div>
@@ -546,14 +562,17 @@ function ErrorPanel({
   error: string | null;
   nothingRecorded: boolean;
 }) {
+  const { t } = useTranslation();
   // The watchdog case is not a failure — nothing was lost because nothing was
   // captured — so it gets a calmer heading and copy than the hard-crash path.
-  const heading = nothingRecorded ? 'Nothing to process' : STAGE_LABEL.error;
+  const heading = nothingRecorded
+    ? t('processing.error.nothingRecordedHeading')
+    : t(STAGE_LABEL_KEY.error);
   const detail = nothingRecorded
-    ? 'This recording didn’t capture any audio, so there’s nothing to process. Nothing was lost. Head back to Home to start a new note.'
+    ? t('processing.error.nothingRecordedDetail')
     : canRetry
-      ? 'Try again to re-run processing on this recording.'
-      : 'This recording couldn’t be recovered automatically. Try importing the audio file again from Home.';
+      ? t('processing.error.canRetry')
+      : t('processing.error.cannotRetry');
   return (
     <div className="py-3">
       <p
@@ -588,13 +607,14 @@ function ErrorPanel({
         }}
       >
         {retrying && <Loader2 className="animate-spin" size={14} />}
-        {retrying ? 'Retrying…' : 'Try again'}
+        {retrying ? t('processing.error.retrying') : t('processing.error.tryAgain')}
       </button>
     </div>
   );
 }
 
 function ProcessingChip() {
+  const { t } = useTranslation();
   return (
     <span
       data-testid="processing-chip"
@@ -606,7 +626,7 @@ function ProcessingChip() {
       }}
     >
       <Loader2 className="animate-spin" size={11} />
-      Processing
+      {t('processing.chip')}
     </span>
   );
 }
@@ -639,6 +659,7 @@ function Chip({
 // ---------------------------------------------------------------------------
 
 export function ProcessingDock() {
+  const { t } = useTranslation();
   const recording = useRecording();
   const sessionName = recording.sessionName;
   const draft = useLiveDraftStore((s) =>
@@ -670,7 +691,7 @@ export function ProcessingDock() {
             size={14}
             style={{ color: 'var(--fg-2)' }}
           />
-          <span style={{ color: 'var(--fg-2)' }}>Processing</span>
+          <span style={{ color: 'var(--fg-2)' }}>{t('processing.chip')}</span>
           <span
             className="tabular-nums"
             style={{
@@ -692,6 +713,7 @@ export function ProcessingDock() {
 // ---------------------------------------------------------------------------
 
 function ElapsedTimer({ startedAt, fallbackElapsed }: { startedAt: Date | null, fallbackElapsed: number }) {
+  const { t } = useTranslation();
   const [now, setNow] = React.useState(() => Date.now());
   React.useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
@@ -702,7 +724,7 @@ function ElapsedTimer({ startedAt, fallbackElapsed }: { startedAt: Date | null, 
     ? Math.max(0, Math.floor((now - startedAt.getTime()) / 1000))
     : fallbackElapsed;
 
-  return <>{formatDurationEnglish(totalElapsedSeconds)}</>;
+  return <>{formatDuration(totalElapsedSeconds, t)}</>;
 }
 
 function formatDate(d: Date): string {
@@ -714,13 +736,22 @@ function formatDate(d: Date): string {
   });
 }
 
-/** Plain-English duration ("12 min", "1 h 4 min"). Mono is reserved for the live timer. */
-function formatDurationEnglish(seconds: number): string {
-  if (seconds < 60) return `${seconds} sec`;
+/** Localised prose duration ("12 min", "1 h 4 min"). Mono is reserved for the
+ *  live timer. Pure — `t` is passed in so this stays callable outside a hook. */
+function formatDuration(seconds: number, t: TFunction): string {
+  if (seconds < 60) return t('processing.duration.seconds', { count: seconds });
   const totalMinutes = Math.floor(seconds / 60);
-  if (totalMinutes < 60) return `${totalMinutes} min`;
+  if (totalMinutes < 60) return t('processing.duration.minutes', { count: totalMinutes });
   const h = Math.floor(totalMinutes / 60);
   const m = totalMinutes % 60;
-  if (m === 0) return `${h} h`;
-  return `${h} h ${m} min`;
+  if (m === 0) return t('processing.duration.hours', { count: h });
+  // Pluralised on the trailing minutes; the hour count is a plain placeholder.
+  return t('processing.duration.hoursMinutes', { hours: h, count: m });
+}
+
+/** Map-reduce sub-progress as one sentence. Pure, same reasoning as above. */
+function formatChunkProgress(progress: ChunkProgress, t: TFunction): string {
+  return progress.kind === 'reducing'
+    ? t('processing.progress.merging')
+    : t('processing.progress.part', { step: progress.step, total: progress.total });
 }
