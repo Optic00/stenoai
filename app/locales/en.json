@@ -671,6 +671,7 @@
       "part": "Summarizing part {{step}} of {{total}}…"
     },
     "stage": {
+      "diarizing": "Identifying speakers",
       "error": "Couldn’t process this recording.",
       "finalizing": "Almost done…",
       "summarizing": "Generating notes",

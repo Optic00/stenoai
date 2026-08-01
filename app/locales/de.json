@@ -671,6 +671,7 @@
       "part": "Teil {{step}} von {{total}} wird zusammengefasst…"
     },
     "stage": {
+      "diarizing": "Sprecher werden erkannt",
       "error": "Diese Aufnahme konnte nicht verarbeitet werden.",
       "finalizing": "Fast fertig…",
       "summarizing": "Notizen werden erstellt",
