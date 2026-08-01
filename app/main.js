@@ -1603,6 +1603,15 @@ function createWindow(options = {}) {
       // avoids; process.argv is readable synchronously even in a sandboxed
       // preload.
       additionalArguments: [`--stenoai-ui-language=${resolvedUiLanguage}`],
+      // Audio capture is fully renderer-owned (getUserMedia + MediaRecorder on a
+      // 1s timeslice + a 1s silence-auto-stop interval, useSystemAudioCapture.ts).
+      // A recording can legitimately run while the window is HIDDEN — the close
+      // handler hides rather than quits, and #bug1 makes auto-detect start
+      // recording without ever showing the window. Chromium background-throttles
+      // timers/rAF in hidden windows by default, which would slow the capture
+      // timeslice and silence-auto-stop cadence. Disable it so capture behaves
+      // the same hidden as visible.
+      backgroundThrottling: false,
     },
     // Windows/Linux render the Electron application menu as an in-window menu
     // bar (File/Edit/View/…); macOS puts it in the global bar. Hide it off-mac
@@ -3118,6 +3127,12 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
       });
 
       let stderrBuf = '';
+      // Mirrors the main pipeline: true only if summarization actually ran
+      // (STREAM_COMPLETE). "Generate notes" reprocess always summarises; a
+      // retranscribe with auto_summarize off wouldn't, so track it rather than
+      // assume. Threaded into processing-complete so the renderer fires
+      // "Note ready" only when notes exist (#bug2).
+      let summarizationCompleted = false;
 
       // Liveness watchdog — see makeInactivityWatchdog. Summary CHUNK:
       // lines (and HEARTBEAT: lines if a retranscribe is ever added here)
@@ -3147,6 +3162,7 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
               mainWindow.webContents.send('summary-title', { title, sessionName });
             }
           } else if (line === 'STREAM_COMPLETE') {
+            summarizationCompleted = true;
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('summary-complete', { success: true, sessionName, summaryFile });
             }
@@ -3185,6 +3201,7 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
               success: true,
               sessionName,
               summaryFile,
+              notesGenerated: summarizationCompleted,
               message: 'Reprocessing completed successfully'
             });
           }
@@ -3361,6 +3378,11 @@ ipcMain.handle('generate-report-meeting', async (event, summaryFile, templateId)
               sessionName,
               summaryFile,
               report: true,
+              // A report is only ever generated for a note that already has
+              // notes, so "notes exist" is true — preserves the pre-existing
+              // note-ready behavior and keeps this off the transcript-only
+              // "generate notes?" branch (#bug2).
+              notesGenerated: true,
               message: 'Report generation completed successfully'
             });
           }
@@ -5057,6 +5079,25 @@ ipcMain.handle('get-queue-status', async () => {
       (currentRecordingProcess !== null || systemAudioRecordingActive)
         ? (currentRecordingAppendTarget || null)
         : null,
+    // The real note file the CURRENT recording/processing session produces (the
+    // instant-stop placeholder written at stop, then rewritten in place by the
+    // pipeline). Lets useMeetings dedupe the synthetic "__live__/…" row against
+    // the real note once it exists, so one recording is never shown twice
+    // (#bug4). Deterministic from the audio stem, so it's the same key across
+    // this session's recording → processing phases.
+    //
+    // Precedence matters: prefer the ACTIVE recording's key over a PROCESSING
+    // job's. In the supported back-to-back flow (stop meeting A → immediately
+    // start meeting B while A is still processing), `sessionName` reports B (the
+    // recording), so liveSummaryFile must also be B's — otherwise it'd be A's,
+    // A's note is already in the list, and B's live row would be wrongly dropped
+    // (B shows no row at all). At B's own stop, teardown nulls
+    // activeSysAudioSummaryFile before currentProcessingJob is set to B, so the
+    // fallback still yields B and the intended dedup against B's placeholder
+    // fires. Only the Parakeet instant-stop path writes a placeholder, so this
+    // only actually bites there; Whisper/import have no placeholder (dedup is a
+    // no-op) and it's null when idle.
+    liveSummaryFile: activeSysAudioSummaryFile || currentProcessingJob?.summaryFile || null,
   };
 });
 
@@ -5840,6 +5881,12 @@ async function processNextInQueue() {
   // Set when TRANSCRIPTION_COMPLETE arrives, so summarization_completed's
   // processing_bucket measures summarization time alone, not the whole job.
   let transcriptionEndedAtMs = null;
+  // Set true only when STREAM_COMPLETE arrives (summarization actually ran).
+  // Stays false on the transcript-only path (auto_summarize off → the backend
+  // prints SUMMARY_SKIPPED, never STREAM_COMPLETE), so the renderer can fire
+  // "Note ready" only when notes really exist, and a "Transcript ready —
+  // generate notes?" prompt otherwise (#bug2/#bug3).
+  let summarizationCompleted = false;
 
   try {
     const queueAiEnv = getAiEnv();
@@ -5930,6 +5977,7 @@ async function processNextInQueue() {
               mainWindow.webContents.send('summary-title', { title, sessionName: currentProcessingJob.sessionName });
             }
           } else if (line === 'STREAM_COMPLETE') {
+            summarizationCompleted = true;
             const summarizationStartMs = transcriptionEndedAtMs || currentProcessingStartedAtMs;
             trackEvent('summarization_completed', {
               success: true,
@@ -6039,6 +6087,7 @@ async function processNextInQueue() {
                     ? 'Transcription failed; recording preserved (not deleted)'
                     : 'Processing completed successfully',
                   meetingData: processedMeeting,
+                  notesGenerated: summarizationCompleted,
                   transcriptionFailed: Boolean(transcriptionFailedMsg),
                   transcriptionError: transcriptionFailedMsg || undefined
                 });
@@ -6055,6 +6104,7 @@ async function processNextInQueue() {
                   message: transcriptionFailedMsg
                     ? 'Transcription failed; recording preserved (not deleted)'
                     : 'Processing completed successfully',
+                  notesGenerated: summarizationCompleted,
                   transcriptionFailed: Boolean(transcriptionFailedMsg),
                   transcriptionError: transcriptionFailedMsg || undefined
                 });
@@ -7341,13 +7391,29 @@ function showMeetingEndedNotification(appName) {
     body: appName,
     actions: [{ type: 'button', text: i18n.t('notification.meetingEnded.action') }],
   });
-  // Only the explicit Summarise button commits — body click just opens
-  // Steno so the user can decide (summarise / resume / leave paused) from
-  // the in-app UI. Once summarised the meeting is finalised and AI
-  // processing has begun, so a stray body tap shouldn't trigger it.
-  notif.on('action', (_evt, _index) => requestAutoSummarise());
+  // The explicit "Wrap up" ACTION STOPS the recording (it had been auto-paused
+  // on mic-idle); the shared pipeline then transcribes and — only after that —
+  // prompts to generate notes / fires "Note ready". This notification
+  // deliberately no longer says "Summarise": there are no notes to summarise
+  // yet at meeting end, which is exactly the premature-prompt bug we're fixing.
+  //
+  // A body tap does NOT commit — it just opens Steno so the user can decide
+  // (wrap up / resume / leave paused). Stopping is not low-stakes: it hands the
+  // recording to the pipeline (and, with auto-summarize on, summarises), so if
+  // mic-idle was a false positive and the meeting is still live, a stray body
+  // tap that committed would silently end the recording — and since wrap-up no
+  // longer shows the window, nothing would tell the user. Keeping the split
+  // (action commits, body opens) avoids that.
+  //
+  // Gating (deliberate): like the meeting-detected toast, this is an
+  // auto-detect *lifecycle* prompt gated by the auto_detect_meetings toggle,
+  // NOT by notificationsEnabled() — that gate covers the result toasts
+  // (note-ready / transcript-ready / silence). Splitting lifecycle vs result
+  // toasts is intentional so turning off result notifications doesn't strand a
+  // paused auto-detected recording with no way to wrap it up.
+  notif.on('action', (_evt, _index) => requestWrapUp());
   notif.on('click', () => {
-    sendDebugLog('[auto-detect] Meeting ended notif body clicked — opening Steno (no commit)');
+    sendDebugLog('[auto-detect] Meeting ended notif body tapped — opening Steno (no commit)');
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (!mainWindow.isVisible()) mainWindow.show();
       mainWindow.focus();
@@ -7380,18 +7446,26 @@ function requestAutoRecord(appName, originatingEvt, calEvent) {
     endNotif: null,
   };
 
+  // Start recording in the background pill-dock — do NOT pull the window to
+  // the foreground. Auto-detect recording is a background convenience and the
+  // renderer's auto-record handler works whether or not the window is visible;
+  // stealing focus on "Take Notes" interrupts whatever the user is doing (the
+  // notification is the confirmation). See spec: kick-off taps stay background.
   if (mainWindow && !mainWindow.isDestroyed()) {
-    if (!mainWindow.isVisible()) mainWindow.show();
-    mainWindow.focus();
     mainWindow.webContents.send('auto-record-requested', { sessionName, appName });
   }
 }
 
-function requestAutoSummarise() {
-  sendDebugLog('[auto-detect] user requested summarise from end notification');
+// The user chose to wrap up an auto-detected meeting (the "Wrap up" action on
+// the meeting-ended notification). This STOPS the paused recording, which then
+// drives the shared post-stop pipeline; the decision to *summarise* now happens
+// after transcription (see the note-ready / transcript-ready notifications),
+// not here. Kept on the `auto-summarise-requested` channel (whose renderer
+// handler already just stops the recording) to avoid churn. Background only —
+// no focus-steal, matching requestAutoRecord.
+function requestWrapUp() {
+  sendDebugLog('[auto-detect] user chose to wrap up the meeting from the end notification');
   if (mainWindow && !mainWindow.isDestroyed()) {
-    if (!mainWindow.isVisible()) mainWindow.show();
-    mainWindow.focus();
     mainWindow.webContents.send('auto-summarise-requested');
   }
   clearAutoStartedSession();
@@ -8621,6 +8695,48 @@ ipcMain.handle('show-note-ready-notification', async (_event, payload) => {
     return { success: true, shown: true };
   } catch (e) {
     sendDebugLog(`Failed to show note-ready notification: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+});
+
+// Fired by the renderer's processing-complete handler when a recording finished
+// transcription but NO notes were generated (auto_summarize off → transcript-
+// only note). Unlike note-ready, this prompts the user to generate notes and is
+// the correctly-timed replacement for the old premature meeting-end "Summarise?"
+// prompt (#bug2/#bug3). The "Generate notes" ACTION starts generation in the
+// BACKGROUND (no focus, matching the kick-off-taps-stay-background rule) by
+// sending `generate-notes-requested`; a body tap opens the note (a result the
+// user asked to see), like note-ready.
+ipcMain.handle('show-transcript-ready-notification', async (_event, payload) => {
+  try {
+    // `shown` = passed the notifications_enabled gate (see show-note-ready).
+    if (!(await notificationsEnabled())) return { success: true, shown: false };
+    const { title, summaryFile, name } = payload || {};
+    const notif = new Notification({
+      title: 'Transcript ready',
+      body: title ? `Generate notes for "${title}"?` : 'Generate notes?',
+      actions: [{ type: 'button', text: 'Generate notes' }],
+      iconType: 'success',
+    });
+    notif.on('action', () => {
+      // Background: kick off note generation without pulling the window forward.
+      if (mainWindow && !mainWindow.isDestroyed() && summaryFile) {
+        mainWindow.webContents.send('generate-notes-requested', { summaryFile, name });
+      }
+    });
+    notif.on('click', () => {
+      // Body tap opens the (transcript-only) note so the user can read it.
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        if (!mainWindow.isVisible()) mainWindow.show();
+        mainWindow.focus();
+        if (summaryFile) mainWindow.webContents.send('navigate-to-meeting', { summaryFile });
+      }
+    });
+    trackNotificationLifecycle(notif, 'transcript_ready');
+    notif.show();
+    return { success: true, shown: true };
+  } catch (e) {
+    sendDebugLog(`Failed to show transcript-ready notification: ${e.message}`);
     return { success: false, error: e.message };
   }
 });
