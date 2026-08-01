@@ -1114,6 +1114,7 @@ export interface StenoaiBridge {
     updateDownloadProgress: Subscribe<UpdateProgressEvent>;
     updateDownloaded: Subscribe<UpdateDownloadedEvent>;
     updateError: Subscribe<UpdateErrorEvent>;
+    updateErrorCleared: Subscribe<void>;
     googleAuthChanged: Subscribe<{ connected: boolean }>;
     outlookAuthChanged: Subscribe<{ connected: boolean }>;
     shortcutStartRecording: Subscribe<ShortcutStartRecordingEvent>;
