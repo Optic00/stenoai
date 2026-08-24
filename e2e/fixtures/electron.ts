@@ -78,6 +78,9 @@ export const test = base.extend<Fixtures>({
         // Until the i18n foundation reads this variable it is inert — written down here
         // first so the contract exists before anything depends on it.
         STENOAI_UI_LANGUAGE: 'en',
+        // Model-free E2E defaults to deterministic Ollama fixtures unless a spec
+        // explicitly tests Apple LM integration via opts.env.
+        STENOAI_DISABLE_APPLE_LM: '1',
         ...(opts.mockIpc ? { STENOAI_E2E_MOCK_IPC: '1' } : {}),
         ...(opts.env ?? {}),
       };
@@ -92,6 +95,7 @@ export const test = base.extend<Fixtures>({
           app = await electron.launch({
             args: [
               '.',
+              ...(process.env.ELECTRON_EXTRA_LAUNCH_ARGS ? process.env.ELECTRON_EXTRA_LAUNCH_ARGS.split(' ') : []),
               ...(opts.fakeAudio
                 ? ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream']
                 : []),
