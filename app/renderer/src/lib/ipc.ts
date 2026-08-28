@@ -1288,7 +1288,11 @@ export interface StenoaiBridge {
       Result<Record<string, never>>
     >;
     showObsidianForkNotification: RequestFn<
-      [payload: NonNullable<ProcessingCompleteEvent['obsidianSync']>],
+      [
+        payload: NonNullable<ProcessingCompleteEvent['obsidianSync']> & {
+          summaryFile: string;
+        },
+      ],
       Result<{ shown: boolean }>
     >;
     /** Transcript-only note finished transcription with no notes generated

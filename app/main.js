@@ -2953,9 +2953,12 @@ async function showObsidianForkNotification(result) {
   notif.on('click', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       exposeMainWindow();
-      mainWindow.webContents.send('tray-open-settings', { tab: 'integrations' });
+      if (result.summaryFile) {
+        mainWindow.webContents.send('navigate-to-meeting', { summaryFile: result.summaryFile });
+      }
     }
   });
+  trackNotificationLifecycle(notif, 'obsidian_fork');
   notif.show();
   return { success: true, shown: true };
 }

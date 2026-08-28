@@ -218,6 +218,21 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
       .toBe(1);
     const originalName = vaultFiles(vault)[0];
     const originalPath = path.join(vault, originalName);
+
+    // The vault write and its ownership index are separate atomic writes. Wait
+    // for both before simulating an external edit so a slow Windows filesystem
+    // cannot make the edit race the initial index commit.
+    const statePath = path.join(userDataDir, '.obsidian-sync-state.json');
+    await expect
+      .poll(() => {
+        try {
+          const state = JSON.parse(readFileSync(statePath, 'utf8'));
+          return state.notes?.['obs-reprocess']?.vaultRelPath === originalName;
+        } catch {
+          return false;
+        }
+      }, { timeout: 20_000, intervals: [250] })
+      .toBe(true);
     writeFileSync(originalPath, 'HAND-EDITED IN OBSIDIAN', 'utf8');
 
     const notificationWindow = app.waitForEvent('window', { timeout: 30_000 });
@@ -227,6 +242,20 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
       summaryPath,
     );
     expect(result.success).toBe(true);
+
+    // Assert the short-lived toast immediately. The remaining disk and settings
+    // checks can legitimately take longer than its 15-second lifetime on CI.
+    const notification = await notificationWindow;
+    await notification.waitForLoadState('domcontentloaded');
+    await expect(notification.getByText('Obsidian edit preserved')).toBeVisible();
+    await expect(notification.getByText(/^Latest version saved as .+\.$/)).toBeVisible();
+    await notification.getByText('Obsidian edit preserved').click();
+    await expect
+      .poll(() => page.evaluate(() => window.location.hash), {
+        timeout: 10_000,
+        intervals: [100],
+      })
+      .toBe(`#/meetings/${encodeURIComponent(summaryPath)}`);
 
     await expect
       .poll(() => vaultFiles(vault).length, { timeout: 20_000, intervals: [250] })
@@ -266,11 +295,6 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
         'Edited vault file kept on the left. Its regenerated Steno copy was saved on the right.',
       ),
     ).toBeVisible();
-
-    const notification = await notificationWindow;
-    await notification.waitForLoadState('domcontentloaded');
-    await expect(notification.getByText('Obsidian edit preserved')).toBeVisible();
-    await expect(notification.getByText(`Latest version saved as ${replacementName}.`)).toBeVisible();
 
     expect(fileSig(realUserDataDir())).toBe(realDirBefore);
   } finally {

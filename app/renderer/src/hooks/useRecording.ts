@@ -577,7 +577,10 @@ export function useRecordingProcessingEffects() {
           // toast. The actionable transcript-ready prompt has higher priority.
           // The main-side handler owns the notifications_enabled gate.
           void ipc()
-            .settings.showObsidianForkNotification(data.obsidianSync)
+            .settings.showObsidianForkNotification({
+              ...data.obsidianSync,
+              summaryFile: finishedSummaryFile,
+            })
             .catch(() => {
               // The persistent conflict detail remains available in Integrations.
             });
