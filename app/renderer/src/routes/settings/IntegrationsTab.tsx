@@ -1,4 +1,4 @@
-import { Gem } from 'lucide-react';
+import { ArrowRight, Gem } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import {
@@ -35,7 +35,8 @@ export function IntegrationsTab() {
   const clearFolder = () => setVaultPath.mutate('');
 
   const path = vaultPath.data || '';
-  const conflictCount = conflicts.data ? Object.keys(conflicts.data).length : 0;
+  const conflictEntries = Object.entries(conflicts.data || {});
+  const conflictCount = conflictEntries.length;
 
   return (
     <section data-settings-tab="integrations">
@@ -112,12 +113,55 @@ export function IntegrationsTab() {
       )}
 
       {conflictCount > 0 && (
-        <div className="py-3 text-[13px]" style={{ color: 'var(--fg-2)' }}>
-          <span style={{ color: 'var(--fg-1)' }}>
-            {conflictCount} note{conflictCount === 1 ? '' : 's'} skipped
-          </span>{' '}
-          because the vault copy was edited in Obsidian. Those edits were kept — Steno
-          won’t overwrite them.
+        <div className="space-y-2 py-3 text-[13px]" style={{ color: 'var(--fg-2)' }}>
+          <div>
+            <span style={{ color: 'var(--fg-1)' }}>
+              {conflictCount} Obsidian edit{conflictCount === 1 ? '' : 's'} preserved.
+            </span>{' '}
+            Steno never overwrites a vault file that changed outside the app.
+          </div>
+          <div className="space-y-1.5">
+            {conflictEntries.map(([stem, conflict]) => (
+              <div
+                key={stem}
+                className="rounded-lg border px-2.5 py-2"
+                style={{ borderColor: 'var(--border-subtle)' }}
+              >
+                <div className="flex min-w-0 items-center gap-2">
+                  <code
+                    className="min-w-0 flex-1 truncate font-mono text-[12px]"
+                    title={conflict.vaultRelPath}
+                    style={{ color: 'var(--fg-1)' }}
+                  >
+                    {conflict.vaultRelPath}
+                  </code>
+                  {conflict.replacementVaultRelPath ? (
+                    <>
+                      <ArrowRight className="size-3.5 shrink-0" aria-hidden />
+                      <code
+                        className="min-w-0 flex-1 truncate font-mono text-[12px]"
+                        title={conflict.replacementVaultRelPath}
+                        style={{ color: 'var(--fg-1)' }}
+                      >
+                        {conflict.replacementVaultRelPath}
+                      </code>
+                    </>
+                  ) : (
+                    <span className="shrink-0 text-[12px]">
+                      {conflict.reason === 'external-edit-on-delete'
+                        ? 'Deletion skipped'
+                        : 'Update skipped'}
+                    </span>
+                  )}
+                </div>
+                {conflict.replacementVaultRelPath && (
+                  <div className="mt-1 text-[11px]">
+                    Edited vault file kept on the left. Latest Steno copy saved on the right.
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </section>

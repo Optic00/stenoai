@@ -76,6 +76,14 @@ test('deriveFilename disambiguates a collision with the stem', () => {
   assert.equal(deriveFilename('2026-07-15', 'Sync', 'abc', taken), '2026-07-15 Sync (abc).md');
 });
 
+test('deriveFilename keeps collision names within a cross-platform byte limit', () => {
+  const title = 'Planning '.repeat(30);
+  const stem = 'recording-'.repeat(20);
+  const name = deriveFilename('2026-07-15', title, stem, (candidate) => !candidate.includes('('));
+  assert.ok(Buffer.byteLength(name) <= 220, `filename is ${Buffer.byteLength(name)} bytes`);
+  assert.match(name, /-[a-f0-9]{8}\)\.md$/);
+});
+
 // --- engine (temp vault) ---------------------------------------------------
 
 function harness() {
@@ -170,6 +178,85 @@ test('external edit is not clobbered; conflict recorded', () => {
   assert.equal(fs.readFileSync(target, 'utf8'), 'MY OWN OBSIDIAN EDIT', 'edit preserved');
   assert.ok(h.eng.loadIndex().conflicts.n1, 'conflict flagged');
   fs.rmSync(h.root, { recursive: true, force: true });
+});
+
+test('reprocess conflict preserves the Obsidian edit and writes a stable replacement', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  const original = path.join(h.vault, 'Sales', '2026-07-15 Acme Q3 Planning.md');
+  fs.writeFileSync(original, 'HAND-EDITED IN OBSIDIAN');
+
+  h.writeNote('n1', NOTE.replace('Ship the pricing page Friday.', 'Ship the pricing page Thursday.'));
+  const result = h.eng.syncNoteBySummaryPath(
+    path.join(h.output, 'n1_summary.md'),
+    { onConflict: 'fork' },
+  );
+
+  assert.equal(result.status, 'forked');
+  assert.equal(result.preservedVaultRelPath, path.join('Sales', '2026-07-15 Acme Q3 Planning.md'));
+  assert.equal(result.vaultRelPath, path.join('Sales', '2026-07-15 Acme Q3 Planning (n1).md'));
+  assert.equal(fs.readFileSync(original, 'utf8'), 'HAND-EDITED IN OBSIDIAN');
+  assert.match(
+    fs.readFileSync(path.join(h.vault, result.vaultRelPath), 'utf8'),
+    /Ship the pricing page Thursday\./,
+  );
+
+  // The replacement becomes the tracked mirror. A later sync updates it in
+  // place instead of creating a chain of additional conflict copies.
+  h.writeNote('n1', NOTE.replace('Ship the pricing page Friday.', 'Ship the pricing page Wednesday.'));
+  const next = h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  assert.equal(next.status, 'synced');
+  assert.equal(h.eng.loadIndex().notes.n1.vaultRelPath, result.vaultRelPath);
+  assert.deepEqual(
+    fs.readdirSync(path.join(h.vault, 'Sales')).sort(),
+    ['2026-07-15 Acme Q3 Planning (n1).md', '2026-07-15 Acme Q3 Planning.md'],
+  );
+});
+
+test('reprocess conflict with a new title uses the new filename and keeps the old edit', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  const original = path.join(h.vault, 'Sales', '2026-07-15 Acme Q3 Planning.md');
+  fs.writeFileSync(original, 'HAND-EDITED IN OBSIDIAN');
+
+  h.writeNote('n1', NOTE.replace('Acme Q3 Planning', 'Acme Renamed'));
+  const result = h.eng.syncNoteBySummaryPath(
+    path.join(h.output, 'n1_summary.md'),
+    { onConflict: 'fork' },
+  );
+
+  assert.equal(result.status, 'forked');
+  assert.equal(result.vaultRelPath, path.join('Sales', '2026-07-15 Acme Renamed.md'));
+  assert.equal(fs.readFileSync(original, 'utf8'), 'HAND-EDITED IN OBSIDIAN');
+  assert.ok(fs.existsSync(path.join(h.vault, result.vaultRelPath)));
+});
+
+test('reprocess conflict with a long stem still writes the replacement', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  const stem = `recording-${'x'.repeat(100)}`;
+  const longTitle = 'T'.repeat(180);
+  const note = NOTE.replace('Acme Q3 Planning', longTitle);
+  const summaryPath = path.join(h.output, `${stem}_summary.md`);
+  h.writeNote(stem, note);
+  const first = h.eng.syncNoteBySummaryPath(summaryPath);
+  assert.equal(first.status, 'synced');
+  const firstVaultRelPath = h.eng.loadIndex().notes[stem].vaultRelPath;
+  fs.writeFileSync(path.join(h.vault, firstVaultRelPath), 'HAND-EDITED IN OBSIDIAN');
+
+  h.writeNote(stem, note.replace('Friday.', 'Thursday.'));
+  const result = h.eng.syncNoteBySummaryPath(summaryPath, { onConflict: 'fork' });
+
+  assert.equal(result.status, 'forked');
+  assert.ok(Buffer.byteLength(path.basename(result.vaultRelPath)) <= 220);
+  assert.ok(fs.existsSync(path.join(h.vault, result.vaultRelPath)));
 });
 
 test('remove deletes the vault copy; preserves an externally-edited one', () => {

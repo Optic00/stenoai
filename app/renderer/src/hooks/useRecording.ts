@@ -549,7 +549,18 @@ export function useRecordingProcessingEffects() {
           // whether or not Steno is focused.
           navigate(finishedMeetingRoute);
         }
-        if (shouldNotify) {
+        if (data.obsidianSync?.status === 'forked') {
+          // The preservation notice replaces the ordinary note-ready toast for
+          // this completion. Custom notifications have single-toast semantics,
+          // so firing both would immediately hide the information that explains
+          // why Obsidian now contains two files. The main-side handler keeps the
+          // notifications_enabled gate as the single source of truth.
+          void ipc()
+            .settings.showObsidianForkNotification(data.obsidianSync)
+            .catch(() => {
+              // The persistent conflict detail remains available in Integrations.
+            });
+        } else if (shouldNotify) {
           // A different route (Home, Chat, Settings, recording another note, a
           // different meeting) OR this note's route but the window is
           // hidden/minimised (tray-only after an auto-detected wrap-up) → fire a

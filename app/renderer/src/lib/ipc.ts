@@ -758,7 +758,12 @@ export type StoragePathResponse = Result<{
 export type PickStorageFolderResponse = Result<{ folderPath: string }>;
 export type GetObsidianSyncResponse = Result<{ obsidian_sync_enabled: boolean }>;
 export type GetObsidianVaultPathResponse = Result<{ obsidian_vault_path: string }>;
-export type ObsidianConflict = { vaultRelPath: string; detectedAt: string; reason: string };
+export type ObsidianConflict = {
+  vaultRelPath: string;
+  detectedAt: string;
+  reason: string;
+  replacementVaultRelPath?: string;
+};
 export type GetObsidianConflictsResponse = Result<{ conflicts: Record<string, ObsidianConflict> }>;
 export type GetAiPromptsResponse = Result<{ summarization: string }>;
 
@@ -871,6 +876,13 @@ export interface ProcessingCompleteEvent {
    *  off → SUMMARY_SKIPPED). Drives whether the renderer fires "Note ready" vs
    *  the "Transcript ready — generate notes?" prompt (#bug2/#bug3). */
   notesGenerated?: boolean;
+  /** A reprocess preserved an externally edited Obsidian file and wrote the
+   *  regenerated note to a separate tracked path. */
+  obsidianSync?: {
+    status: 'forked';
+    preservedVaultRelPath: string;
+    vaultRelPath: string;
+  };
 }
 export interface QueryChunkEvent {
   queryId: string;
@@ -1275,6 +1287,10 @@ export interface StenoaiBridge {
       ],
       Result<Record<string, never>>
     >;
+    showObsidianForkNotification: RequestFn<
+      [payload: NonNullable<ProcessingCompleteEvent['obsidianSync']>],
+      Result<{ shown: boolean }>
+    >;
     /** Transcript-only note finished transcription with no notes generated
      *  (auto_summarize off). Prompts "Generate notes?" — the action starts
      *  generation in the background, a body tap opens the note. Returns `shown`
@@ -1399,7 +1415,7 @@ export interface StenoaiBridge {
      *  notification). Renderer runs the same reprocess path as GenerateNotesBar. */
     generateNotesRequested: Subscribe<{ summaryFile: string; name?: string | null }>;
     navigateToMeeting: Subscribe<{ summaryFile: string }>;
-    trayOpenSettings: Subscribe<void>;
+    trayOpenSettings: Subscribe<{ tab?: 'integrations' } | undefined>;
     showQuitDialog: Subscribe<{ type: 'recording' | 'processing'; jobCount?: number }>;
     showNotification: Subscribe<{
       id?: string;

@@ -14,8 +14,9 @@
 //     commit. Every public method swallows its own fs errors.
 //   - ONE-WAY. Obsidian-side edits are never read back. If the vault copy was
 //     edited externally (its bytes differ from what we last wrote), we SKIP the
-//     overwrite and flag a conflict rather than clobber the user's edit — on
-//     update AND on delete.
+//     overwrite and flag a conflict rather than clobber the user's edit. A
+//     caller may explicitly request a separate replacement copy for an update;
+//     deletes always preserve the edited file.
 //   - Identity is the stem (stable across title/folder changes); the index maps
 //     stem -> vault path so a rename moves the file instead of orphaning it.
 //
@@ -30,6 +31,9 @@ const crypto = require('crypto');
 
 const SUMMARY_SUFFIX = '_summary.md';
 const STATE_VERSION = 1;
+// Leaves room below the 255-byte component limit for atomicWriteFileSync's
+// temporary-file prefix and process/time suffix.
+const MAX_VAULT_FILENAME_BYTES = 220;
 // Windows reserved device names (case-insensitive, with or without extension).
 const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i;
 
@@ -147,20 +151,54 @@ function sanitizeFilename(name, stem) {
     .replace(/^[.\s]+|[.\s]+$/g, ''); // no leading/trailing dot/space (kills '.'/'..')
   let s = clean(name) || clean(stem) || '_';
   if (process.platform === 'win32' && WIN_RESERVED.test(s)) s = '_' + s;
-  if (s.length > 180) s = s.slice(0, 180).replace(/[.\s]+$/, '') || '_';
+  if (Buffer.byteLength(s) > 180) {
+    s = truncateUtf8(s, 180).replace(/[.\s]+$/, '') || '_';
+  }
   return s;
 }
 
+function truncateUtf8(value, maxBytes) {
+  let result = '';
+  let bytes = 0;
+  for (const char of String(value)) {
+    const charBytes = Buffer.byteLength(char);
+    if (bytes + charBytes > maxBytes) break;
+    result += char;
+    bytes += charBytes;
+  }
+  return result;
+}
+
+function fitVaultFilename(base, suffix = '') {
+  const extension = '.md';
+  const reservedBytes = Buffer.byteLength(suffix + extension);
+  const fittedBase = truncateUtf8(
+    base,
+    Math.max(1, MAX_VAULT_FILENAME_BYTES - reservedBytes),
+  ).replace(/[.\s]+$/, '') || '_';
+  return `${fittedBase}${suffix}${extension}`;
+}
+
+function collisionToken(stem) {
+  const clean = sanitizeFilename(stem, '_');
+  if (Buffer.byteLength(clean) <= 64) return clean;
+  const digest = sha256(Buffer.from(String(stem))).slice(0, 8);
+  return `${truncateUtf8(clean, 54).replace(/[.\s]+$/, '') || '_'}-${digest}`;
+}
+
 // `YYYY-MM-DD Title.md`. When a *different* note already owns that name
-// (collision), append the stem — and keep probing suffixed candidates so even
+// (collision), append a stable stem-derived token and keep probing suffixed candidates so even
 // a second pre-existing collision is never clobbered.
 function deriveFilename(dateStr, title, stem, isTaken) {
   const base = [dateStr, sanitizeFilename(title, stem)].filter(Boolean).join(' ');
-  let name = `${base}.md`;
+  let name = fitVaultFilename(base);
   const taken = (n) => typeof isTaken === 'function' && isTaken(n);
   if (taken(name)) {
-    name = `${base} (${stem}).md`;
-    for (let i = 2; taken(name); i += 1) name = `${base} (${stem}-${i}).md`;
+    const token = collisionToken(stem);
+    name = fitVaultFilename(base, ` (${token})`);
+    for (let i = 2; taken(name); i += 1) {
+      name = fitVaultFilename(base, ` (${token}-${i})`);
+    }
   }
   return name;
 }
@@ -283,12 +321,17 @@ function registerObsidianSync({
     } catch (_) { return false; } // gone → not a conflict, we'll recreate
   }
 
-  function recordConflict(idx, stem, vaultRelPath, reason) {
-    idx.conflicts[stem] = { vaultRelPath, detectedAt: new Date().toISOString(), reason };
+  function recordConflict(idx, stem, vaultRelPath, reason, details = {}) {
+    idx.conflicts[stem] = {
+      vaultRelPath,
+      detectedAt: new Date().toISOString(),
+      reason,
+      ...details,
+    };
   }
 
   // Core: reconcile the vault copy of one note from disk. Returns a status.
-  function syncNoteBySummaryPath(summaryPath, { idx } = {}) {
+  function syncNoteBySummaryPath(summaryPath, { idx, onConflict = 'preserve' } = {}) {
     if (!isActive()) return { status: 'disabled' };
     const ownIdx = !idx;
     idx = idx || loadIndex();
@@ -325,6 +368,42 @@ function registerObsidianSync({
       const absDest = path.join(cached.vaultPath, vaultRelPath);
       const newHash = sha256(Buffer.from(vaultBody));
 
+      // A reprocess can opt into preserving the edited vault file while writing
+      // Steno's regenerated note beside it. Re-run filename derivation while
+      // treating every existing path, including this note's current path, as
+      // taken. For an unchanged title this yields the stable `(stem)` collision
+      // name; for a title/folder change the normal new path remains available.
+      const forkExternallyEdited = (preservedVaultRelPath) => {
+        const strictlyTakenBy = (name) => {
+          const rel = path.join(sub, name);
+          if (Object.values(idx.notes).some((e) => e && e.vaultRelPath === rel)) return true;
+          return fs.existsSync(path.join(cached.vaultPath, rel));
+        };
+        const replacementFilename = deriveFilename(
+          dateStr,
+          title,
+          stem,
+          strictlyTakenBy,
+        );
+        const replacementVaultRelPath = path.join(sub, replacementFilename);
+        const replacementDest = path.join(cached.vaultPath, replacementVaultRelPath);
+        atomicWriteFileSync(replacementDest, vaultBody);
+        idx.notes[stem] = {
+          vaultRelPath: replacementVaultRelPath,
+          lastWrittenHash: newHash,
+          lastSyncedAt: new Date().toISOString(),
+        };
+        recordConflict(idx, stem, preservedVaultRelPath, 'external-edit-preserved', {
+          replacementVaultRelPath,
+        });
+        if (ownIdx) saveIndex(idx);
+        return {
+          status: 'forked',
+          preservedVaultRelPath,
+          vaultRelPath: replacementVaultRelPath,
+        };
+      };
+
       // Rename: the note moved (title or folder changed) since we last wrote it.
       // Remove the old-name copy (unless the user edited it) — the normal write
       // below recreates it at the new path. Deliberately NOT fs.renameSync: it is
@@ -334,6 +413,7 @@ function registerObsidianSync({
       if (entry && entry.vaultRelPath !== vaultRelPath) {
         const absOld = path.join(cached.vaultPath, entry.vaultRelPath);
         if (isExternallyEdited(absOld, entry)) {
+          if (onConflict === 'fork') return forkExternallyEdited(entry.vaultRelPath);
           recordConflict(idx, stem, entry.vaultRelPath, 'external-edit');
           if (ownIdx) saveIndex(idx);
           return { status: 'conflict' };
@@ -361,6 +441,7 @@ function registerObsidianSync({
       // Conflict: an existing, tracked destination was edited in Obsidian since
       // our last write. (destHash === null means no file there — safe to create.)
       if (destHash !== null && isExternallyEdited(absDest, entry)) {
+        if (onConflict === 'fork') return forkExternallyEdited(vaultRelPath);
         recordConflict(idx, stem, vaultRelPath, 'external-edit');
         if (ownIdx) saveIndex(idx);
         return { status: 'conflict' };

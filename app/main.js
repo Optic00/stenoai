@@ -2941,6 +2941,34 @@ ipcMain.handle('clear-state', async () => {
   }
 });
 
+async function showObsidianForkNotification(result) {
+  if (!result || result.status !== 'forked') return { success: true, shown: false };
+  if (!(await notificationsEnabled())) return { success: true, shown: false };
+  const replacementName = path.basename(result.vaultRelPath || 'the new copy');
+  const notif = new Notification({
+    title: 'Obsidian edit preserved',
+    body: `Latest version saved as ${replacementName}.`,
+    iconType: 'success',
+  });
+  notif.on('click', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      exposeMainWindow();
+      mainWindow.webContents.send('tray-open-settings', { tab: 'integrations' });
+    }
+  });
+  notif.show();
+  return { success: true, shown: true };
+}
+
+ipcMain.handle('show-obsidian-fork-notification', async (_event, result) => {
+  try {
+    return await showObsidianForkNotification(result);
+  } catch (e) {
+    sendDebugLog(`Failed to show Obsidian preservation notification: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+});
+
 ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, sessionName, retranscribe) => {
   try {
     // Security: symlink-safe containment-check the renderer-supplied summary path
@@ -3055,7 +3083,17 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
           // Reprocess / generate-notes / re-transcribe rewrote the note — mirror
           // it into the vault (#413) if sync is on. Use the canonical realPath
           // (not the renderer alias) so it indexes under the true summary stem.
-          try { if (realPath) obsidianSync.syncNoteBySummaryPath(realPath); } catch (_) {}
+          let obsidianSyncResult;
+          try {
+            if (realPath) {
+              obsidianSyncResult = obsidianSync.syncNoteBySummaryPath(realPath, {
+                onConflict: 'fork',
+              });
+            }
+          } catch (_) {}
+          const obsidianFork = obsidianSyncResult?.status === 'forked'
+            ? obsidianSyncResult
+            : undefined;
           // Look up the saved meeting so the completion event carries meetingData
           // with the note's CURRENT title — reprocess may have generated an LLM
           // title, so `sessionName` here can still be the 'Note' placeholder. The
@@ -3074,6 +3112,7 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
                   summaryFile,
                   meetingData: processedMeeting,
                   notesGenerated: summarizationCompleted,
+                  obsidianSync: obsidianFork,
                   message: 'Reprocessing completed successfully'
                 });
               }
@@ -3088,6 +3127,7 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
                   sessionName,
                   summaryFile,
                   notesGenerated: summarizationCompleted,
+                  obsidianSync: obsidianFork,
                   message: 'Reprocessing completed successfully'
                 });
               }
