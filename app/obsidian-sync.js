@@ -262,6 +262,25 @@ function registerObsidianSync({
 
   const statePath = () => path.join(getUserDataDir(), '.obsidian-sync-state.json');
 
+  function preservedConflictKey(stem, vaultRelPath) {
+    return `preserved:${sha256(Buffer.from(`${stem}\0${vaultRelPath}`)).slice(0, 16)}`;
+  }
+
+  function normalizeConflicts(raw) {
+    const conflicts = raw && typeof raw === 'object' ? { ...raw } : {};
+    for (const [key, conflict] of Object.entries(conflicts)) {
+      if (!conflict || conflict.reason !== 'external-edit-preserved' ||
+          key.startsWith('preserved:')) continue;
+      const stem = conflict.stem || key;
+      delete conflicts[key];
+      conflicts[preservedConflictKey(stem, conflict.vaultRelPath)] = {
+        ...conflict,
+        stem,
+      };
+    }
+    return conflicts;
+  }
+
   function loadIndex() {
     try {
       const d = JSON.parse(fs.readFileSync(statePath(), 'utf8'));
@@ -269,7 +288,7 @@ function registerObsidianSync({
         return {
           version: STATE_VERSION,
           notes: d.notes || {},
-          conflicts: d.conflicts || {},
+          conflicts: normalizeConflicts(d.conflicts),
           stale: Array.isArray(d.stale) ? d.stale : [],
         };
       }
@@ -322,12 +341,64 @@ function registerObsidianSync({
   }
 
   function recordConflict(idx, stem, vaultRelPath, reason, details = {}) {
-    idx.conflicts[stem] = {
+    // Active conflicts use the stem as their stable slot and disappear once
+    // the tracked mirror is healthy again. Preserved copies are history: each
+    // fork gets its own key so a later fork, sync, restart, or note deletion
+    // cannot erase the explanation for a file that remains in the vault.
+    const key = reason === 'external-edit-preserved'
+      ? preservedConflictKey(stem, vaultRelPath)
+      : stem;
+    idx.conflicts[key] = {
+      stem,
       vaultRelPath,
       detectedAt: new Date().toISOString(),
       reason,
       ...details,
     };
+  }
+
+  function clearResolvedActiveConflict(idx, stem) {
+    const conflict = idx.conflicts[stem];
+    // Compatibility with state written by the first fork implementation,
+    // which stored preserved history directly under the stem key.
+    if (conflict && conflict.reason !== 'external-edit-preserved') {
+      delete idx.conflicts[stem];
+    }
+  }
+
+  function pruneMissingPreservedConflicts(idx) {
+    try {
+      if (!fs.statSync(cached.vaultPath).isDirectory()) return;
+    } catch (_) {
+      // A temporarily unavailable vault must not erase the preservation log.
+      return;
+    }
+    for (const [key, conflict] of Object.entries(idx.conflicts)) {
+      if (conflict && conflict.reason === 'external-edit-preserved' &&
+          typeof conflict.vaultRelPath === 'string' &&
+          !fs.existsSync(path.join(cached.vaultPath, conflict.vaultRelPath))) {
+        delete idx.conflicts[key];
+      }
+    }
+  }
+
+  function detachRemovedReplacement(idx, stem, vaultRelPath) {
+    for (const conflict of Object.values(idx.conflicts)) {
+      if (conflict && conflict.reason === 'external-edit-preserved' &&
+          conflict.stem === stem && conflict.replacementVaultRelPath === vaultRelPath) {
+        delete conflict.replacementVaultRelPath;
+      }
+    }
+  }
+
+  function retargetMovedReplacement(idx, stem, oldVaultRelPath, newVaultRelPath) {
+    if (!oldVaultRelPath || oldVaultRelPath === newVaultRelPath) return;
+    for (const conflict of Object.values(idx.conflicts)) {
+      if (conflict && conflict.reason === 'external-edit-preserved' &&
+          conflict.stem === stem && conflict.replacementVaultRelPath === oldVaultRelPath) {
+        conflict.replacementVaultRelPath = newVaultRelPath;
+      }
+    }
   }
 
   // Core: reconcile the vault copy of one note from disk. Returns a status.
@@ -337,6 +408,7 @@ function registerObsidianSync({
     idx = idx || loadIndex();
     try {
       drainStale(idx); // retry any previously-blocked unlink first
+      pruneMissingPreservedConflicts(idx);
       if (!summaryPath || !summaryPath.endsWith(SUMMARY_SUFFIX)) {
         return { status: 'skipped' };
       }
@@ -393,6 +465,7 @@ function registerObsidianSync({
           lastWrittenHash: newHash,
           lastSyncedAt: new Date().toISOString(),
         };
+        clearResolvedActiveConflict(idx, stem);
         recordConflict(idx, stem, preservedVaultRelPath, 'external-edit-preserved', {
           replacementVaultRelPath,
         });
@@ -433,7 +506,8 @@ function registerObsidianSync({
       // never mistakes a pre-existing user file for our own.
       if (destHash === newHash) {
         idx.notes[stem] = { vaultRelPath, lastWrittenHash: newHash, lastSyncedAt: new Date().toISOString() };
-        delete idx.conflicts[stem];
+        retargetMovedReplacement(idx, stem, entry && entry.vaultRelPath, vaultRelPath);
+        clearResolvedActiveConflict(idx, stem);
         if (ownIdx) saveIndex(idx);
         return { status: 'synced' };
       }
@@ -453,7 +527,8 @@ function registerObsidianSync({
         lastWrittenHash: newHash,
         lastSyncedAt: new Date().toISOString(),
       };
-      delete idx.conflicts[stem];
+      retargetMovedReplacement(idx, stem, entry && entry.vaultRelPath, vaultRelPath);
+      clearResolvedActiveConflict(idx, stem);
       if (ownIdx) saveIndex(idx);
       return { status: 'synced' };
     } catch (e) {
@@ -481,7 +556,8 @@ function registerObsidianSync({
       if (!rmWithRetry(abs)) idx.stale.push(entry.vaultRelPath);
       try { fs.rmdirSync(path.dirname(abs)); } catch (_) { /* not empty / root */ }
       delete idx.notes[stem];
-      delete idx.conflicts[stem];
+      clearResolvedActiveConflict(idx, stem);
+      detachRemovedReplacement(idx, stem, entry.vaultRelPath);
       saveIndex(idx);
       return { status: 'removed' };
     } catch (e) {
@@ -542,6 +618,7 @@ function registerObsidianSync({
     if (!isActive()) return { status: 'disabled' };
     const idx = loadIndex();
     drainStale(idx);
+    pruneMissingPreservedConflicts(idx);
     const scan = listSummaryFiles();
     const onDisk = new Map(scan.files.map((p) => [stemFromSummaryPath(p), p]));
     // Only delete on the strength of a scan that (a) completed without a read
@@ -565,6 +642,8 @@ function registerObsidianSync({
             if (!rmWithRetry(abs)) idx.stale.push(entry.vaultRelPath);
             try { fs.rmdirSync(path.dirname(abs)); } catch (_) {}
             delete idx.notes[stem];
+            clearResolvedActiveConflict(idx, stem);
+            detachRemovedReplacement(idx, stem, entry.vaultRelPath);
           }
         }
       }

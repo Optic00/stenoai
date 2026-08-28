@@ -55,8 +55,8 @@ export function IntegrationsTab() {
             <Gem size={14} style={{ color: '#7c6cf5' }} aria-hidden />
           </div>
           <div className="mt-[2px] text-[13px]" style={{ color: 'var(--fg-2)' }}>
-            Mirror your notes into an Obsidian vault folder as Markdown. One-way
-            (Steno → vault); edits made in Obsidian are never overwritten.
+            Mirror your notes into an Obsidian vault folder as Markdown. One-way (Steno → vault);
+            edits made in Obsidian are never overwritten.
           </div>
         </div>
         <Switch
@@ -150,13 +150,16 @@ export function IntegrationsTab() {
                     <span className="shrink-0 text-[12px]">
                       {conflict.reason === 'external-edit-on-delete'
                         ? 'Deletion skipped'
-                        : 'Update skipped'}
+                        : conflict.reason === 'external-edit-preserved'
+                          ? 'Steno copy removed'
+                          : 'Update skipped'}
                     </span>
                   )}
                 </div>
                 {conflict.replacementVaultRelPath && (
                   <div className="mt-1 text-[11px]">
-                    Edited vault file kept on the left. Latest Steno copy saved on the right.
+                    Edited vault file kept on the left. Its regenerated Steno copy was saved on the
+                    right.
                   </div>
                 )}
               </div>

@@ -10,6 +10,7 @@ import { composeShareBody, pickTranscriptForShare } from '@/routes/MeetingDetail
 import { streamCache } from '@/lib/meetingDetailState';
 import {
   classifyCompletionNotification,
+  chooseCompletionNotification,
   meetingAlreadyHasNotes,
   completionActions,
 } from '@/lib/completionNotification';
@@ -549,18 +550,38 @@ export function useRecordingProcessingEffects() {
           // whether or not Steno is focused.
           navigate(finishedMeetingRoute);
         }
-        if (data.obsidianSync?.status === 'forked') {
-          // The preservation notice replaces the ordinary note-ready toast for
-          // this completion. Custom notifications have single-toast semantics,
-          // so firing both would immediately hide the information that explains
-          // why Obsidian now contains two files. The main-side handler keeps the
-          // notifications_enabled gate as the single source of truth.
+        const title =
+          data.meetingData?.session_info.name?.trim() ||
+          data.sessionName?.trim() ||
+          'Your note has finished processing';
+        const isFailed =
+          Boolean(data.transcriptionFailed) ||
+          Boolean(data.meetingData?.session_info.transcription_failed);
+        const kind = classifyCompletionNotification({
+          notesGenerated: data.notesGenerated,
+          // Continue-recording (append) skips summarization but the note it
+          // appended to already has notes. Treat it as note-ready instead of
+          // offering to generate notes that already exist.
+          notesAlreadyExist: meetingAlreadyHasNotes(data.meetingData),
+          transcriptionFailed: data.transcriptionFailed,
+          meetingTranscriptionFailed: data.meetingData?.session_info.transcription_failed,
+        });
+        const notification = chooseCompletionNotification({
+          kind,
+          shouldNotify,
+          obsidianForked: data.obsidianSync?.status === 'forked',
+        });
+
+        if (notification === 'obsidian-fork' && data.obsidianSync) {
+          // A preservation notice replaces only the informational note-ready
+          // toast. The actionable transcript-ready prompt has higher priority.
+          // The main-side handler owns the notifications_enabled gate.
           void ipc()
             .settings.showObsidianForkNotification(data.obsidianSync)
             .catch(() => {
               // The persistent conflict detail remains available in Integrations.
             });
-        } else if (shouldNotify) {
+        } else if (notification === 'note-ready') {
           // A different route (Home, Chat, Settings, recording another note, a
           // different meeting) OR this note's route but the window is
           // hidden/minimised (tray-only after an auto-detected wrap-up) → fire a
@@ -569,57 +590,33 @@ export function useRecordingProcessingEffects() {
           // explicit "take me there", so no back-to-back-recording interruption
           // risk. When the window is visible AND already on this note, we skip
           // it: the static summary is right there.
-          const title =
-            data.meetingData?.session_info.name?.trim() ||
-            data.sessionName?.trim() ||
-            'Your note has finished processing';
-          const isFailed =
-            Boolean(data.transcriptionFailed) ||
-            Boolean(data.meetingData?.session_info.transcription_failed);
-          const kind = classifyCompletionNotification({
-            notesGenerated: data.notesGenerated,
-            // Continue-recording (append) skips summarization but the note it
-            // appended to already has notes — treat as note-ready, not
-            // "generate notes?" (M2). meetingAlreadyHasNotes encodes the subtle
-            // notes_generated frontmatter semantics (absent = has notes).
-            notesAlreadyExist: meetingAlreadyHasNotes(data.meetingData),
-            transcriptionFailed: data.transcriptionFailed,
-            meetingTranscriptionFailed: data.meetingData?.session_info.transcription_failed,
-          });
           // Note: no `notifications_enabled` pre-check here — the IPC
           // handlers in main.js gate internally via `notificationsEnabled()`
           // and short-circuit when the user has notifications disabled. A
           // renderer round-trip to fetch the setting first would be a wasted
           // poll; the gate stays single-source-of-truth in main.
-          if (kind === 'note-ready') {
-            // Notes were generated (auto-summarize on, or the deferred
-            // Generate-notes/reprocess finished) — or a transcription failure
-            // that still wrote a note. Either way it's "ready": open on click.
-            void ipc()
-              .settings.showNoteReadyNotification({
-                title,
-                summaryFile: finishedSummaryFile,
-                failed: isFailed,
-              })
-              .catch(() => {
-                // Notification failure isn't fatal — the note is still
-                // visible in Home + sidebar. Don't bubble up.
-              });
-          } else {
-            // Transcript-only note (auto_summarize off → no notes generated).
-            // Prompt to generate notes rather than claim "Note ready" (#bug2);
-            // this is also the correctly-timed replacement for the old
-            // premature meeting-end "Summarise?" prompt (#bug3).
-            void ipc()
-              .settings.showTranscriptReadyNotification({
-                title,
-                summaryFile: finishedSummaryFile,
-                name: data.sessionName ?? null,
-              })
-              .catch(() => {
-                // Notification failure isn't fatal.
-              });
-          }
+          void ipc()
+            .settings.showNoteReadyNotification({
+              title,
+              summaryFile: finishedSummaryFile,
+              failed: isFailed,
+            })
+            .catch(() => {
+              // Notification failure isn't fatal. The note remains available.
+            });
+        } else if (notification === 'transcript-ready') {
+          // Transcript-only note (auto_summarize off). This actionable prompt
+          // wins over the Obsidian preservation notice when only one toast can
+          // be shown, so the user retains the route to generate notes.
+          void ipc()
+            .settings.showTranscriptReadyNotification({
+              title,
+              summaryFile: finishedSummaryFile,
+              name: data.sessionName ?? null,
+            })
+            .catch(() => {
+              // Notification failure isn't fatal.
+            });
         }
         // else: on this note's own detail page → nothing. The streaming
         // UI's own listener swaps to the static view; no extra signal

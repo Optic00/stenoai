@@ -244,7 +244,11 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
       () => (window as StenoWin).stenoai.settings.getObsidianConflicts(),
     );
     expect(conflicts.success).toBe(true);
-    expect(conflicts.conflicts['obs-reprocess']).toMatchObject({
+    const preservedConflict = Object.values(conflicts.conflicts).find(
+      (conflict) =>
+        conflict.reason === 'external-edit-preserved' && conflict.vaultRelPath === originalName,
+    );
+    expect(preservedConflict).toMatchObject({
       vaultRelPath: originalName,
       replacementVaultRelPath: replacementName,
       reason: 'external-edit-preserved',
@@ -258,7 +262,9 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
     await expect(integrations.getByText(originalName, { exact: true })).toBeVisible();
     await expect(integrations.getByText(replacementName!, { exact: true })).toBeVisible();
     await expect(
-      integrations.getByText('Edited vault file kept on the left. Latest Steno copy saved on the right.'),
+      integrations.getByText(
+        'Edited vault file kept on the left. Its regenerated Steno copy was saved on the right.',
+      ),
     ).toBeVisible();
 
     const notification = await notificationWindow;

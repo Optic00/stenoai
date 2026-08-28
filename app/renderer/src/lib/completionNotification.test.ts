@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   classifyCompletionNotification,
+  chooseCompletionNotification,
   meetingAlreadyHasNotes,
   completionActions,
 } from './completionNotification';
@@ -86,6 +87,68 @@ describe('classifyCompletionNotification (#bug2/#bug3)', () => {
     expect(
       classifyCompletionNotification({ notesGenerated: false, notesAlreadyExist: false }),
     ).toBe('transcript-ready');
+  });
+});
+
+describe('chooseCompletionNotification (Obsidian fork priority)', () => {
+  it('keeps the ordinary note-ready notification when no fork occurred', () => {
+    expect(
+      chooseCompletionNotification({
+        kind: 'note-ready',
+        shouldNotify: true,
+        obsidianForked: false,
+      }),
+    ).toBe('note-ready');
+  });
+
+  it('keeps the ordinary transcript-ready notification when no fork occurred', () => {
+    expect(
+      chooseCompletionNotification({
+        kind: 'transcript-ready',
+        shouldNotify: true,
+        obsidianForked: false,
+      }),
+    ).toBe('transcript-ready');
+  });
+
+  it('keeps the actionable generate-notes prompt when a transcript-only fork finishes', () => {
+    expect(
+      chooseCompletionNotification({
+        kind: 'transcript-ready',
+        shouldNotify: true,
+        obsidianForked: true,
+      }),
+    ).toBe('transcript-ready');
+  });
+
+  it('uses the preservation notice instead of the informational note-ready toast', () => {
+    expect(
+      chooseCompletionNotification({
+        kind: 'note-ready',
+        shouldNotify: true,
+        obsidianForked: true,
+      }),
+    ).toBe('obsidian-fork');
+  });
+
+  it('still explains a fork when the user is already watching the transcript-only note', () => {
+    expect(
+      chooseCompletionNotification({
+        kind: 'transcript-ready',
+        shouldNotify: false,
+        obsidianForked: true,
+      }),
+    ).toBe('obsidian-fork');
+  });
+
+  it('shows nothing when the user is watching and no fork occurred', () => {
+    expect(
+      chooseCompletionNotification({
+        kind: 'note-ready',
+        shouldNotify: false,
+        obsidianForked: false,
+      }),
+    ).toBeNull();
   });
 });
 

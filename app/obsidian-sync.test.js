@@ -180,7 +180,7 @@ test('external edit is not clobbered; conflict recorded', () => {
   fs.rmSync(h.root, { recursive: true, force: true });
 });
 
-test('reprocess conflict preserves the Obsidian edit and writes a stable replacement', (t) => {
+test('reprocess conflict preserves the Obsidian edit and writes a stable replacement', async (t) => {
   const h = harness();
   t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 
@@ -190,12 +190,18 @@ test('reprocess conflict preserves the Obsidian edit and writes a stable replace
   fs.writeFileSync(original, 'HAND-EDITED IN OBSIDIAN');
 
   h.writeNote('n1', NOTE.replace('Ship the pricing page Friday.', 'Ship the pricing page Thursday.'));
+  assert.equal(
+    h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md')).status,
+    'conflict',
+    'an ordinary sync records the active conflict before reprocessing',
+  );
   const result = h.eng.syncNoteBySummaryPath(
     path.join(h.output, 'n1_summary.md'),
     { onConflict: 'fork' },
   );
 
   assert.equal(result.status, 'forked');
+  assert.equal(h.eng.loadIndex().conflicts.n1, undefined, 'fork resolves the active conflict');
   assert.equal(result.preservedVaultRelPath, path.join('Sales', '2026-07-15 Acme Q3 Planning.md'));
   assert.equal(result.vaultRelPath, path.join('Sales', '2026-07-15 Acme Q3 Planning (n1).md'));
   assert.equal(fs.readFileSync(original, 'utf8'), 'HAND-EDITED IN OBSIDIAN');
@@ -213,6 +219,167 @@ test('reprocess conflict preserves the Obsidian edit and writes a stable replace
   assert.deepEqual(
     fs.readdirSync(path.join(h.vault, 'Sales')).sort(),
     ['2026-07-15 Acme Q3 Planning (n1).md', '2026-07-15 Acme Q3 Planning.md'],
+  );
+  assert.equal(
+    Object.values(h.eng.loadIndex().conflicts).filter(
+      (conflict) => conflict.reason === 'external-edit-preserved',
+    ).length,
+    1,
+    'ordinary sync keeps the preserved-copy history',
+  );
+
+  await h.eng.reconcileOnLaunch();
+  assert.equal(
+    Object.values(h.eng.loadIndex().conflicts).filter(
+      (conflict) => conflict.reason === 'external-edit-preserved',
+    ).length,
+    1,
+    'launch reconciliation keeps the preserved-copy history',
+  );
+
+  fs.unlinkSync(original);
+  await h.eng.reconcileOnLaunch();
+  assert.equal(
+    Object.values(h.eng.loadIndex().conflicts).filter(
+      (conflict) => conflict.reason === 'external-edit-preserved',
+    ).length,
+    0,
+    'launch reconciliation drops history after the preserved file is removed',
+  );
+});
+
+test('repeated reprocess conflicts retain every preserved copy in the ledger', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  const originalRelPath = path.join('Sales', '2026-07-15 Acme Q3 Planning.md');
+  fs.writeFileSync(path.join(h.vault, originalRelPath), 'FIRST OBSIDIAN EDIT');
+
+  h.writeNote('n1', NOTE.replace('Friday.', 'Thursday.'));
+  const firstFork = h.eng.syncNoteBySummaryPath(
+    path.join(h.output, 'n1_summary.md'),
+    { onConflict: 'fork' },
+  );
+  assert.equal(firstFork.status, 'forked');
+  fs.writeFileSync(path.join(h.vault, firstFork.vaultRelPath), 'SECOND OBSIDIAN EDIT');
+
+  h.writeNote('n1', NOTE.replace('Friday.', 'Wednesday.'));
+  const secondFork = h.eng.syncNoteBySummaryPath(
+    path.join(h.output, 'n1_summary.md'),
+    { onConflict: 'fork' },
+  );
+  assert.equal(secondFork.status, 'forked');
+
+  const preserved = Object.values(h.eng.loadIndex().conflicts)
+    .filter((conflict) => conflict.reason === 'external-edit-preserved');
+  assert.deepEqual(
+    preserved.map((conflict) => [
+      conflict.vaultRelPath,
+      conflict.replacementVaultRelPath,
+    ]),
+    [
+      [originalRelPath, firstFork.vaultRelPath],
+      [firstFork.vaultRelPath, secondFork.vaultRelPath],
+    ],
+  );
+  assert.equal(fs.readFileSync(path.join(h.vault, originalRelPath), 'utf8'), 'FIRST OBSIDIAN EDIT');
+  assert.equal(
+    fs.readFileSync(path.join(h.vault, firstFork.vaultRelPath), 'utf8'),
+    'SECOND OBSIDIAN EDIT',
+  );
+  assert.match(
+    fs.readFileSync(path.join(h.vault, secondFork.vaultRelPath), 'utf8'),
+    /Ship the pricing page Wednesday\./,
+  );
+});
+
+test('deleting a forked note keeps the preserved-copy ledger entry', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  const originalRelPath = path.join('Sales', '2026-07-15 Acme Q3 Planning.md');
+  fs.writeFileSync(path.join(h.vault, originalRelPath), 'HAND-EDITED IN OBSIDIAN');
+  h.writeNote('n1', NOTE.replace('Friday.', 'Thursday.'));
+  const fork = h.eng.syncNoteBySummaryPath(
+    path.join(h.output, 'n1_summary.md'),
+    { onConflict: 'fork' },
+  );
+
+  assert.equal(h.eng.removeNoteBySummaryPath('n1').status, 'removed');
+  assert.ok(fs.existsSync(path.join(h.vault, originalRelPath)));
+  assert.ok(!fs.existsSync(path.join(h.vault, fork.vaultRelPath)));
+  const preserved = Object.values(h.eng.loadIndex().conflicts)
+    .filter((conflict) => conflict.reason === 'external-edit-preserved');
+  assert.deepEqual(preserved.map((conflict) => conflict.vaultRelPath), [originalRelPath]);
+  assert.equal(
+    preserved[0].replacementVaultRelPath,
+    undefined,
+    'history no longer points at the deleted Steno copy',
+  );
+});
+
+test('renaming a forked note retargets its preserved-copy history', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  const originalRelPath = path.join('Sales', '2026-07-15 Acme Q3 Planning.md');
+  fs.writeFileSync(path.join(h.vault, originalRelPath), 'HAND-EDITED IN OBSIDIAN');
+  h.writeNote('n1', NOTE.replace('Friday.', 'Thursday.'));
+  const fork = h.eng.syncNoteBySummaryPath(
+    path.join(h.output, 'n1_summary.md'),
+    { onConflict: 'fork' },
+  );
+
+  h.writeNote('n1', NOTE
+    .replace('Acme Q3 Planning', 'Acme Renamed')
+    .replace('Friday.', 'Thursday.'));
+  assert.equal(h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md')).status, 'synced');
+  const renamedRelPath = path.join('Sales', '2026-07-15 Acme Renamed.md');
+  assert.ok(!fs.existsSync(path.join(h.vault, fork.vaultRelPath)));
+  assert.ok(fs.existsSync(path.join(h.vault, renamedRelPath)));
+
+  const preserved = Object.values(h.eng.loadIndex().conflicts)
+    .find((conflict) => conflict.reason === 'external-edit-preserved');
+  assert.equal(preserved.vaultRelPath, originalRelPath);
+  assert.equal(preserved.replacementVaultRelPath, renamedRelPath);
+
+  assert.equal(h.eng.removeNoteBySummaryPath('n1').status, 'removed');
+  const afterDelete = Object.values(h.eng.loadIndex().conflicts)
+    .find((conflict) => conflict.reason === 'external-edit-preserved');
+  assert.equal(afterDelete.replacementVaultRelPath, undefined);
+});
+
+test('legacy stem-keyed preserved history survives a healthy sync', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  const idx = h.eng.loadIndex();
+  const legacyRelPath = path.join('Sales', 'legacy-preserved.md');
+  fs.writeFileSync(path.join(h.vault, legacyRelPath), 'LEGACY OBSIDIAN EDIT');
+  idx.conflicts.n1 = {
+    vaultRelPath: legacyRelPath,
+    replacementVaultRelPath: idx.notes.n1.vaultRelPath,
+    detectedAt: new Date().toISOString(),
+    reason: 'external-edit-preserved',
+  };
+  h.eng.saveIndex(idx);
+
+  assert.equal(h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md')).status, 'synced');
+  const migrated = h.eng.loadIndex().conflicts;
+  assert.equal(migrated.n1, undefined);
+  assert.equal(
+    Object.values(migrated).filter(
+      (conflict) => conflict.reason === 'external-edit-preserved',
+    ).length,
+    1,
   );
 });
 
@@ -291,6 +458,44 @@ test('reconcile removes vault copies whose source note is gone', async () => {
   assert.ok(!h.eng.loadIndex().notes.n1, 'index entry dropped');
   assert.ok(fs.existsSync(survivor), 'the still-present note is untouched');
   fs.rmSync(h.root, { recursive: true, force: true });
+});
+
+test('reconcile detaches preservation history when a forked source vanished', async (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.writeNote('n2', NOTE.replace('Acme Q3 Planning', 'Second Note'));
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n2_summary.md'));
+
+  const originalRelPath = path.join('Sales', '2026-07-15 Acme Q3 Planning.md');
+  fs.writeFileSync(path.join(h.vault, originalRelPath), 'HAND-EDITED IN OBSIDIAN');
+  h.writeNote('n1', NOTE.replace('Friday.', 'Thursday.'));
+  const fork = h.eng.syncNoteBySummaryPath(
+    path.join(h.output, 'n1_summary.md'),
+    { onConflict: 'fork' },
+  );
+  const idx = h.eng.loadIndex();
+  idx.conflicts.n1 = {
+    stem: 'n1',
+    vaultRelPath: fork.vaultRelPath,
+    detectedAt: new Date().toISOString(),
+    reason: 'external-edit',
+  };
+  h.eng.saveIndex(idx);
+
+  fs.unlinkSync(path.join(h.output, 'n1_summary.md'));
+  await h.eng.reconcileOnLaunch();
+
+  const after = h.eng.loadIndex();
+  const preserved = Object.values(after.conflicts)
+    .find((conflict) => conflict.reason === 'external-edit-preserved');
+  assert.ok(fs.existsSync(path.join(h.vault, originalRelPath)));
+  assert.ok(!fs.existsSync(path.join(h.vault, fork.vaultRelPath)));
+  assert.equal(after.notes.n1, undefined);
+  assert.equal(after.conflicts.n1, undefined, 'resolved active conflict is removed');
+  assert.equal(preserved.replacementVaultRelPath, undefined);
 });
 
 test('reconcile does NOT mass-delete when the source scan comes back empty (H2)', async () => {
