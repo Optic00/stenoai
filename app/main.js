@@ -58,6 +58,7 @@ const { registerFoldersIpc } = require('./folders-ipc');
 const { registerSettingsIpc } = require('./settings-ipc');
 const { registerPersonSampleIpc } = require('./person-sample-ipc');
 const { registerSpeakerIpc } = require('./speaker-ipc');
+const { registerNotificationIpc } = require('./notification-ipc');
 const { registerObsidianSync } = require('./obsidian-sync');
 const { registerObsidianIpc } = require('./obsidian-ipc');
 const { isSafeToAutoInstall } = require('./update-idle-gate');
@@ -447,8 +448,6 @@ class Notification extends EventEmitter {
       autoCloseTimer = setTimeout(() => {
         if (!win.isDestroyed()) win.close();
       }, 15000);
-
-      win.webContents.send('show-notification', this.payload);
     });
   }
 
@@ -8333,6 +8332,11 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
 registerSettingsIpc({ ipcMain, runPythonScript, sendDebugLog });
 registerPersonSampleIpc({ ipcMain, runPythonScript });
 registerSpeakerIpc({ ipcMain, runPythonScript, parsePythonFailureJson });
+registerNotificationIpc({
+  ipcMain,
+  BrowserWindow,
+  getNotificationWindow: () => notificationWindow,
+});
 
 // Fired by the renderer's silence detector. The renderer has already
 // asked main to stop the recording via pause/stop; this just surfaces

@@ -1460,6 +1460,7 @@ export interface StenoaiBridge {
   };
 
   notification: {
+    rendererReady: SendFn<[]>;
     close: RequestFn<[], void>;
     actionClicked: SendFn<[actionId: string, notifId?: string]>;
     bodyClicked: SendFn<[notifId?: string]>;

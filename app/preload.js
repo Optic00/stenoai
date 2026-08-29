@@ -390,6 +390,7 @@ const stenoai = {
   },
 
   notification: {
+    rendererReady: () => send('notification-renderer-ready'),
     close: () => invoke('close-notification-window'),
     actionClicked: (actionId, notifId) => send('notification-action-clicked', { actionId, notifId }),
     bodyClicked: (notifId) => send('notification-body-clicked', { notifId }),
