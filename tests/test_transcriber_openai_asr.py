@@ -27,9 +27,17 @@ OPENAI_ASR_CHUNK_THRESHOLD_BYTES = 24 * 1024 * 1024
 
 
 class _FakeResponse:
-    def __init__(self, body: bytes, content_type: str = "application/json"):
+    def __init__(
+        self,
+        body: bytes,
+        content_type: str = "application/json",
+        content_length: str | None = None,
+    ):
         self._body = body
         self.headers = {"Content-Type": content_type}
+        if content_length is not None:
+            self.headers["Content-Length"] = content_length
+        self.read_sizes = []
 
     def __enter__(self):
         return self
@@ -37,8 +45,9 @@ class _FakeResponse:
     def __exit__(self, exc_type, exc, traceback):
         return False
 
-    def read(self):
-        return self._body
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        return self._body if size < 0 else self._body[:size]
 
     def close(self):
         pass
@@ -51,7 +60,7 @@ class _TricklingResponse(_FakeResponse):
         import threading
         self.released = threading.Event()
 
-    def read(self):
+    def read(self, _size=-1):
         self.released.wait()
         return b""
 
@@ -335,6 +344,41 @@ class OpenAiAsrTests(unittest.TestCase):
                 response, time.monotonic() + 0.01
             )
         self.assertTrue(response.released.is_set())
+
+    def test_success_response_body_is_bounded_without_content_length(self):
+        marker = b"PRIVATE-OVERSIZED-PROVIDER-BODY"
+        limit = 64
+        response = _FakeResponse(marker + b"x" * limit)
+        transcriber = _build_transcriber()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch("src.transcriber.OPENAI_ASR_MAX_RESPONSE_BYTES", limit), patch(
+                "urllib.request.build_opener", return_value=_FakeOpener([response])
+            ):
+                with self.assertRaisesRegex(RuntimeError, "response exceeds safe size") as raised:
+                    transcriber._run_openai_asr(audio, language="en")
+
+        self.assertEqual(response.read_sizes, [limit + 1])
+        self.assertNotIn(marker.decode(), str(raised.exception))
+
+    def test_oversized_declared_response_fails_before_body_read(self):
+        limit = 64
+        response = _FakeResponse(
+            b"PRIVATE-DECLARED-OVERSIZED-BODY",
+            content_length=str(limit + 1),
+        )
+        transcriber = _build_transcriber()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch("src.transcriber.OPENAI_ASR_MAX_RESPONSE_BYTES", limit), patch(
+                "urllib.request.build_opener", return_value=_FakeOpener([response])
+            ):
+                with self.assertRaisesRegex(RuntimeError, "response exceeds safe size"):
+                    transcriber._run_openai_asr(audio, language="en")
+
+        self.assertEqual(response.read_sizes, [])
 
     def test_run_enforces_deadline_while_opening_request(self):
         transcriber = _build_transcriber()
@@ -819,6 +863,98 @@ class OpenAiAsrTests(unittest.TestCase):
                     self.assertTrue(failure["transcription_failed"])
                     self.assertNotIn(marker, failure["error"])
                     self.assertNotIn(marker, "\n".join(logs.output))
+
+    def test_provider_timestamps_must_be_finite_nonnegative_and_ordered(self):
+        def payload(duration, start=0, end=1, segment_text="provider transcript"):
+            return {
+                "text": "provider transcript",
+                "segments": [{"text": segment_text, "start": start, "end": end}],
+                "duration": duration,
+            }
+
+        bad_payloads = (
+            payload(float("nan")),
+            payload(float("inf")),
+            payload("1e999"),
+            payload(-1),
+            payload(1, start=float("nan")),
+            payload(1, start=float("inf")),
+            payload(1, start=-0.1),
+            payload(1, start=0.8, end=0.7),
+            {"text": "provider transcript", "segments": [], "duration": "1e999"},
+            payload(1, start="1e999", segment_text=""),
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            streaming_failure = None
+            for provider_payload in bad_payloads:
+                with self.subTest(payload=provider_payload):
+                    transcriber = _build_transcriber()
+                    with patch.object(
+                        transcriber, "_preprocess_audio", return_value=(audio, False)
+                    ), patch.object(
+                        transcriber, "_build_whisper_fallback", return_value=False
+                    ), patch(
+                        "urllib.request.build_opener",
+                        return_value=_FakeOpener([_json_response(provider_payload)]),
+                    ):
+                        failure = transcriber.transcribe_audio(audio, language="en")
+                    self.assertTrue(failure["transcription_failed"])
+                    self.assertEqual(
+                        failure["error"],
+                        "openai-asr verbose_json response has invalid segment metadata",
+                    )
+                    if provider_payload.get("duration") == "1e999":
+                        streaming_failure = failure
+
+            self.assertIsNotNone(streaming_failure)
+            recorder = MeetingPipeline.__new__(MeetingPipeline)
+            recorder.output_dir = Path(tmp_dir) / "output"
+            recorder.output_dir.mkdir()
+            recorder.transcripts_dir = Path(tmp_dir) / "transcripts"
+            recorder.transcripts_dir.mkdir()
+            recorder.transcriber = Mock()
+            recorder.transcriber.transcribe_diarised.return_value = streaming_failure
+            recorder.summarizer = None
+            config = Mock()
+            config.get_language.return_value = "en"
+            config.get_whisper_language.return_value = "en"
+            config.get_keep_recordings.return_value = False
+            with patch("src.config.get_config", return_value=config), patch.dict(
+                "os.environ", {"STENOAI_USER_DATA_DIR": tmp_dir}
+            ), contextlib.redirect_stdout(io.StringIO()):
+                result = asyncio.run(
+                    recorder.process_recording_streaming(str(audio), "Bad timestamps")
+                )
+
+            summary_path = Path(result["session_info"]["summary_file"])
+            parsed = _parse_meeting_markdown(summary_path)
+            self.assertTrue(audio.exists())
+            self.assertTrue(parsed["session_info"]["transcription_failed"])
+            self.assertTrue(parsed["session_info"]["reprocessable"])
+
+    def test_multipart_filename_and_logs_never_expose_meeting_name(self):
+        marker = "PRIVATE-MEETING-STEM"
+        transcriber = _build_transcriber()
+        opener = _FakeOpener([
+            _json_response({"text": "safe transcript", "segments": []})
+        ])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / f'{marker}-quote".wav'
+            _write_pcm_wav(audio, frame_count=16000)
+            with self.assertLogs("src.transcriber", level="INFO") as logs, patch(
+                "urllib.request.build_opener", return_value=opener
+            ), patch.object(
+                transcriber, "_preprocess_audio", return_value=(audio, False)
+            ):
+                result = transcriber.transcribe_audio(audio, language="en")
+
+        self.assertEqual(result["text"], "safe transcript")
+        prefix = opener.requests[0]["prefix"]
+        self.assertIn(b'name="file"; filename="audio"\r\n', prefix)
+        self.assertNotIn(marker.encode(), prefix)
+        self.assertNotIn(marker, "\n".join(logs.output))
 
     def test_json_rung_fallback_synthesizes_segment(self):
         transcriber = _build_transcriber()

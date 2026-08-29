@@ -52,7 +52,12 @@ const path = require('path');
 // runPythonScript), the debug-log sink, and the quit teardown registry are
 // carved out of this file (RFC #327, Phase 0); wired once below via factories.
 const { spawn, killProcessTree, createBackendCli, withoutOpenAiAsrKey } = require('./backend-cli');
-const { saveEncryptedKeyAtomically } = require('./openai-asr-key-store');
+const {
+  isEncryptedKeyCleared,
+  legacyKeyMigrationAction,
+  markEncryptedKeyClearedAtomically,
+  saveEncryptedKeyAtomically,
+} = require('./openai-asr-key-store');
 const { createDebugLog } = require('./debug-log');
 const { createTeardownRegistry } = require('./teardown');
 const { registerFoldersIpc } = require('./folders-ipc');
@@ -8092,11 +8097,11 @@ ipcMain.handle('set-openai-asr-config', async (_event, cfg) => {
 ipcMain.handle('set-openai-asr-key', async (_event, key) => {
   try {
     if (!key) {
-      try {
-        if (fs.existsSync(getOpenAiAsrKeyPath())) fs.unlinkSync(getOpenAiAsrKeyPath());
-      } catch (e) {
-        return { success: false, error: e.message };
-      }
+      markOpenAiAsrKeyCleared();
+      // The durable marker already makes every encrypted/legacy copy
+      // ineffective. Retry plaintext removal now, while retaining the marker
+      // if the locked config write is temporarily unavailable.
+      await migrateLegacyOpenAiAsrApiKey();
       return { success: true, api_key_set: false };
     }
     const saved = saveOpenAiAsrKey(key);
@@ -8921,6 +8926,20 @@ function getOpenAiAsrKeyPath() {
   return path.join(getUserDataDir(), '.openai-asr-api-key');
 }
 
+function isOpenAiAsrKeyCleared() {
+  return isEncryptedKeyCleared({ fs, keyPath: getOpenAiAsrKeyPath() });
+}
+
+function markOpenAiAsrKeyCleared() {
+  return markEncryptedKeyClearedAtomically({
+    fs,
+    path,
+    processId: process.pid,
+    now: Date.now(),
+    keyPath: getOpenAiAsrKeyPath(),
+  });
+}
+
 function saveOpenAiAsrKey(key) {
   try {
     return saveEncryptedKeyAtomically({
@@ -8940,6 +8959,7 @@ function saveOpenAiAsrKey(key) {
 
 function loadOpenAiAsrKey() {
   try {
+    if (isOpenAiAsrKeyCleared()) return null;
     const keyPath = getOpenAiAsrKeyPath();
     migrateLegacyCredentialFile(keyPath, '.openai-asr-api-key');
     if (!fs.existsSync(keyPath)) return null;
@@ -8952,7 +8972,7 @@ function loadOpenAiAsrKey() {
 }
 
 function hasOpenAiAsrKey() {
-  return fs.existsSync(getOpenAiAsrKeyPath());
+  return !isOpenAiAsrKeyCleared() && fs.existsSync(getOpenAiAsrKeyPath());
 }
 
 function readLegacyOpenAiAsrApiKey() {
@@ -8975,7 +8995,12 @@ function secureLegacyOpenAiAsrApiKey() {
   const legacyKey = readLegacyOpenAiAsrApiKey();
   if (!legacyKey) return false;
   const stored = loadOpenAiAsrKey();
-  if (stored) return stored === legacyKey;
+  const action = legacyKeyMigrationAction({
+    cleared: isOpenAiAsrKeyCleared(),
+    legacyKey,
+    storedKey: stored,
+  });
+  if (action !== 'secure') return action === 'remove-legacy' && Boolean(stored);
   try {
     // Do not remove config.json's value unless encrypt + decrypt both work.
     return saveOpenAiAsrKey(legacyKey) && Boolean(loadOpenAiAsrKey());
@@ -8985,16 +9010,38 @@ function secureLegacyOpenAiAsrApiKey() {
 }
 
 async function migrateLegacyOpenAiAsrApiKey() {
-  if (!secureLegacyOpenAiAsrApiKey()) return false;
-  try {
-    const raw = await runPythonScript(
-      'simple_recorder.py', ['remove-legacy-openai-asr-api-key'], true,
-    );
-    return JSON.parse(raw.trim()).success === true;
-  } catch (_) {
-    // The encrypted copy is safe and the plaintext remains for a future retry.
-    return false;
+  const legacyKey = readLegacyOpenAiAsrApiKey();
+  if (!legacyKey) return true;
+  let stored = loadOpenAiAsrKey();
+  const action = legacyKeyMigrationAction({
+    cleared: isOpenAiAsrKeyCleared(),
+    legacyKey,
+    storedKey: stored,
+  });
+  if (action === 'none') return false;
+  const removeLegacyKey = async () => {
+    try {
+      const raw = await runPythonScript(
+        'simple_recorder.py', ['remove-legacy-openai-asr-api-key'], true,
+      );
+      return JSON.parse(raw.trim()).success === true;
+    } catch (_) {
+      // A clear marker remains authoritative, or the encrypted copy is safe;
+      // either way the plaintext can be removed on a future retry.
+      return false;
+    }
+  };
+  if (action === 'remove-legacy') return removeLegacyKey();
+  if (action === 'secure') {
+    try {
+      if (!saveOpenAiAsrKey(legacyKey)) return false;
+      stored = loadOpenAiAsrKey();
+      if (stored !== legacyKey) return false;
+    } catch (_) {
+      return false;
+    }
   }
+  return removeLegacyKey();
 }
 
 // Build the env additions a Python AI-driven subprocess needs. Merges
@@ -9028,7 +9075,8 @@ function getTranscriptionEnv() {
   // A legacy plaintext key must be secured before this first cloud job. The
   // deletion itself is async (via the locked Python config writer), but this
   // sync path can safely use the encrypted copy immediately.
-  if (secureLegacyOpenAiAsrApiKey()) void migrateLegacyOpenAiAsrApiKey();
+  secureLegacyOpenAiAsrApiKey();
+  void migrateLegacyOpenAiAsrApiKey();
   const oaiKey = loadOpenAiAsrKey();
   if (oaiKey) env.STENOAI_OAI_API_KEY = oaiKey;
   return env;

@@ -5,7 +5,12 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { saveEncryptedKeyAtomically } = require('./openai-asr-key-store');
+const {
+  isEncryptedKeyCleared,
+  legacyKeyMigrationAction,
+  markEncryptedKeyClearedAtomically,
+  saveEncryptedKeyAtomically,
+} = require('./openai-asr-key-store');
 
 const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 
@@ -157,4 +162,116 @@ test('successful key rotation persists a decryptable replacement', () => {
     assert.strictEqual(save(keyPath, 'new-key'), true);
     assert.strictEqual(safeStorage().decryptString(fs.readFileSync(keyPath)), 'new-key');
   });
+});
+
+test('clear marker remains authoritative when stale encrypted-key deletion fails', () => {
+  withKeyDirectory((keyPath) => {
+    fs.writeFileSync(keyPath, encrypted('legacy-key'));
+    const fsImpl = Object.create(fs);
+    fsImpl.unlinkSync = (target) => {
+      if (target === keyPath) throw new Error('simulated stale-key deletion failure');
+      return fs.unlinkSync(target);
+    };
+
+    assert.strictEqual(markEncryptedKeyClearedAtomically({
+      fs: fsImpl,
+      path,
+      processId: 123,
+      now: 456,
+      keyPath,
+    }), true);
+    assert.strictEqual(fs.existsSync(keyPath), true, 'stale bytes reproduce failed deletion');
+    assert.strictEqual(isEncryptedKeyCleared({ fs, keyPath }), true);
+    assert.strictEqual(
+      legacyKeyMigrationAction({ cleared: true, legacyKey: 'legacy-key', storedKey: null }),
+      'remove-legacy',
+    );
+    assert.strictEqual(
+      legacyKeyMigrationAction({ cleared: true, legacyKey: 'legacy-key', storedKey: null }),
+      'remove-legacy',
+      'config refresh must retry deletion without restoring the key',
+    );
+  });
+});
+
+test('an encrypted replacement makes any surviving plaintext stale', () => {
+  assert.strictEqual(
+    legacyKeyMigrationAction({
+      cleared: false,
+      legacyKey: 'old-plaintext-key',
+      storedKey: 'explicit-replacement-key',
+    }),
+    'remove-legacy',
+  );
+});
+
+test('explicit replacement activates only after its encrypted readback succeeds', () => {
+  withKeyDirectory((keyPath) => {
+    markEncryptedKeyClearedAtomically({
+      fs,
+      path,
+      processId: 123,
+      now: 456,
+      keyPath,
+    });
+    assert.strictEqual(isEncryptedKeyCleared({ fs, keyPath }), true);
+
+    assert.strictEqual(save(keyPath, 'replacement-key'), true);
+    assert.strictEqual(isEncryptedKeyCleared({ fs, keyPath }), false);
+    assert.strictEqual(safeStorage().decryptString(fs.readFileSync(keyPath)), 'replacement-key');
+  });
+});
+
+test('failed replacement leaves the durable clear marker active', () => {
+  withKeyDirectory((keyPath) => {
+    markEncryptedKeyClearedAtomically({
+      fs,
+      path,
+      processId: 123,
+      now: 456,
+      keyPath,
+    });
+
+    assert.throws(() => save(
+      keyPath,
+      'replacement-key',
+      safeStorage({ decryptString: () => 'wrong-key' }),
+    ));
+    assert.strictEqual(isEncryptedKeyCleared({ fs, keyPath }), true);
+    assert.strictEqual(fs.existsSync(keyPath), false);
+  });
+});
+
+test('clear-marker removal failure rolls back before reactivating a key', () => {
+  withKeyDirectory((keyPath) => {
+    const previous = encrypted('stale-cleared-key');
+    fs.writeFileSync(keyPath, previous);
+    markEncryptedKeyClearedAtomically({
+      fs,
+      path,
+      processId: 123,
+      now: 456,
+      keyPath,
+    });
+    // Reproduce stale encrypted bytes that a previous physical deletion could
+    // not remove while the clear marker remains authoritative.
+    fs.writeFileSync(keyPath, previous);
+    const markerPath = `${keyPath}.cleared`;
+    const fsImpl = Object.create(fs);
+    fsImpl.unlinkSync = (target) => {
+      if (target === markerPath) throw new Error('marker locked');
+      return fs.unlinkSync(target);
+    };
+
+    assert.throws(() => save(keyPath, 'replacement-key', safeStorage(), fsImpl));
+    assert.strictEqual(isEncryptedKeyCleared({ fs, keyPath }), true);
+    assert.deepStrictEqual(fs.readFileSync(keyPath), previous);
+  });
+});
+
+test('main process consults durable clear state before load and legacy migration', () => {
+  assert.match(source, /if \(isOpenAiAsrKeyCleared\(\)\) return null;/);
+  assert.match(source, /const action = legacyKeyMigrationAction\(/);
+  assert.match(source, /if \(action === 'remove-legacy'\)/);
+  assert.match(source, /markOpenAiAsrKeyCleared\(\)/);
 });

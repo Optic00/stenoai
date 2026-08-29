@@ -167,6 +167,10 @@ OPENAI_ASR_CHUNK_THRESHOLD_BYTES = 24 * 1024 * 1024
 OPENAI_ASR_MAX_CHUNK_SECONDS = 600
 OPENAI_ASR_REQUEST_DEADLINE_SECONDS = 10 * 60
 OPENAI_ASR_SOCKET_TIMEOUT_SECONDS = 300
+# A verbose transcription response can be substantially larger than its text,
+# but it must still have a finite in-memory bound. Read one byte past the
+# limit so chunked responses and responses without Content-Length fail closed.
+OPENAI_ASR_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
 # Resolve a usable ffmpeg binary. Electron-spawned subprocesses don't inherit
 # the user's shell PATH (no /opt/homebrew/bin), so a bare `ffmpeg` string fails
@@ -1298,8 +1302,12 @@ def _open_openai_asr_response_with_deadline(opener, request, timeout: float, dea
     raise value
 
 
-def _read_openai_asr_response_with_deadline(response, deadline: float) -> bytes:
-    """Read a response without letting a trickling body evade the wall clock."""
+def _read_openai_asr_response_with_deadline(
+    response,
+    deadline: float,
+    max_bytes: int = OPENAI_ASR_MAX_RESPONSE_BYTES,
+) -> bytes:
+    """Read a bounded response without letting a trickling body evade the wall clock."""
     import queue
     import time
 
@@ -1307,7 +1315,7 @@ def _read_openai_asr_response_with_deadline(response, deadline: float) -> bytes:
 
     def read() -> None:
         try:
-            result.put((True, response.read()))
+            result.put((True, response.read(max_bytes + 1)))
         except BaseException as error:
             result.put((False, error))
 
@@ -1331,6 +1339,8 @@ def _read_openai_asr_response_with_deadline(response, deadline: float) -> bytes:
             pass
         raise TimeoutError("openai-asr request exceeded its total deadline")
     if ok:
+        if len(value) > max_bytes:
+            raise RuntimeError("openai-asr response exceeds safe size limit")
         return value
     raise value
 
@@ -1894,7 +1904,7 @@ class WhisperTranscriber:
             # time on a long recording, with zero other output in between --
             # without this, the terminal goes silent for that whole stretch
             # right after "Saved: ...", which reads as a hang.
-            logger.info(f"Pre-processing audio (highpass + loudnorm): {audio_filepath.name}...")
+            logger.info("Pre-processing audio (highpass + loudnorm)")
             result = subprocess.run(
                 [ffmpeg, '-y', '-i', str(audio_filepath),
                  '-af', _audio_filter_chain(),
@@ -1904,14 +1914,16 @@ class WhisperTranscriber:
                 timeout=AUDIO_PREPROCESS_TIMEOUT_S,
             )
             if result.returncode == 0 and temp_path.exists() and temp_path.stat().st_size > 0:
-                logger.info("Audio pre-processed (highpass + loudnorm): %s", temp_path.name)
+                logger.info("Audio pre-processed (highpass + loudnorm)")
                 return temp_path, True
             logger.warning(
-                "Audio pre-processing failed (rc=%s); using original audio: %s",
-                result.returncode, result.stderr.decode(errors='replace')[-300:],
+                "Audio pre-processing failed (rc=%s); using original audio",
+                result.returncode,
             )
-        except Exception as e:
-            logger.warning("Audio pre-processing error; using original audio: %s", e)
+        except Exception:
+            # ffmpeg and filesystem errors can contain the source path. The
+            # fallback is sufficient diagnostic context and remains local.
+            logger.warning("Audio pre-processing error; using original audio")
         # Clean up any partial output from the failed pass.
         try:
             if temp_path.exists():
@@ -1980,7 +1992,7 @@ class WhisperTranscriber:
         else:
             endpoint = api_url
 
-        logger.info("openai-asr: POST configured endpoint  model=%s  file=%s", model, audio_filepath.name)
+        logger.info("openai-asr: POST configured endpoint  model=%s", model)
 
         if not api_key:
             raise RuntimeError(
@@ -1990,17 +2002,24 @@ class WhisperTranscriber:
 
         boundary = uuid.uuid4().hex
 
+        def _multipart_parameter(value: str) -> str:
+            if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                raise RuntimeError("openai-asr multipart metadata is invalid")
+            return value.replace("\\", "\\\\").replace('"', '\\"')
+
         def _field(name: str, value: str) -> bytes:
             return (
                 f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f'Content-Disposition: form-data; name="{_multipart_parameter(name)}"\r\n\r\n'
                 f"{value}\r\n"
             ).encode()
 
         def _file_field_header(name: str, filename: str, ctype: str) -> bytes:
             return (
                 f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                "Content-Disposition: form-data; "
+                f'name="{_multipart_parameter(name)}"; '
+                f'filename="{_multipart_parameter(filename)}"\r\n'
                 f"Content-Type: {ctype}\r\n\r\n"
             ).encode()
 
@@ -2014,7 +2033,7 @@ class WhisperTranscriber:
                 if language and language != "auto":
                     self.prefix_parts.append(_field("language", language))
                 self.prefix_parts.append(
-                    _file_field_header("file", request_audio_path.name, mime_type)
+                    _file_field_header("file", "audio", mime_type)
                 )
 
                 self.prefix_bytes = b"".join(self.prefix_parts)
@@ -2128,8 +2147,26 @@ class WhisperTranscriber:
                             raise _HttpStatusError(status) from None
                         try:
                             content_type = resp.headers.get("Content-Type", "") or ""
+                            declared_length = resp.headers.get("Content-Length")
+                            if declared_length is not None:
+                                try:
+                                    parsed_length = int(declared_length)
+                                except (TypeError, ValueError):
+                                    raise RuntimeError(
+                                        "openai-asr response has invalid size metadata"
+                                    ) from None
+                                if parsed_length < 0:
+                                    raise RuntimeError(
+                                        "openai-asr response has invalid size metadata"
+                                    )
+                                if parsed_length > OPENAI_ASR_MAX_RESPONSE_BYTES:
+                                    raise RuntimeError(
+                                        "openai-asr response exceeds safe size limit"
+                                    )
                             body = _read_openai_asr_response_with_deadline(
-                                resp, request_deadline,
+                                resp,
+                                request_deadline,
+                                OPENAI_ASR_MAX_RESPONSE_BYTES,
                             )
                             return body, content_type
                         finally:
@@ -2202,23 +2239,39 @@ class WhisperTranscriber:
                         "'segments'"
                     )
                 raw_segs = data.get("segments") or []
-                if raw_text and not raw_segs:
-                    logger.info("openai-asr verbose_json response has text without segments")
-                    return _text_result(raw_text)
                 detected_lang = data.get("language") or (
                     None if language == "auto" else language
                 )
+                def _provider_time(value, *, default: float = 0.0) -> float:
+                    if value is None or value == "":
+                        value = default
+                    if isinstance(value, bool):
+                        raise ValueError("boolean is not a provider time")
+                    parsed = float(value)
+                    if not math.isfinite(parsed) or parsed < 0:
+                        raise ValueError("provider time must be finite and non-negative")
+                    return parsed
+
                 try:
-                    segments = [
-                        {
-                            "text": segment.get("text", "").strip(),
-                            "start": float(segment.get("start") or 0.0),
-                            "end": float(segment.get("end") or 0.0),
-                        }
-                        for segment in raw_segs
-                        if segment.get("text", "").strip()
-                    ]
-                    parsed_duration = float(data.get("duration") or 0) or None
+                    if not isinstance(raw_segs, list):
+                        raise TypeError("segments must be a list")
+                    duration = _provider_time(data.get("duration"))
+                    parsed_duration = duration or None
+                    segments = []
+                    for segment in raw_segs:
+                        if not isinstance(segment, dict):
+                            raise TypeError("segment must be an object")
+                        segment_text = segment.get("text", "")
+                        if not isinstance(segment_text, str):
+                            raise TypeError("segment text must be a string")
+                        segment_text = segment_text.strip()
+                        start = _provider_time(segment.get("start"))
+                        end = _provider_time(segment.get("end"))
+                        if end < start:
+                            raise ValueError("segment end precedes start")
+                        if not segment_text:
+                            continue
+                        segments.append({"text": segment_text, "start": start, "end": end})
                 except (AttributeError, TypeError, ValueError):
                     # Conversion errors include the offending provider value in
                     # their message. Replace them before the outer failure path
@@ -2226,6 +2279,9 @@ class WhisperTranscriber:
                     raise RuntimeError(
                         "openai-asr verbose_json response has invalid segment metadata"
                     ) from None
+                if raw_text and not raw_segs:
+                    logger.info("openai-asr verbose_json response has text without segments")
+                    return _text_result(raw_text)
                 logger.info(
                     "openai-asr verbose_json: %d chars, %d segments",
                     len(raw_text), len(segments),
@@ -2619,14 +2675,17 @@ class WhisperTranscriber:
         ffmpeg pass) so the mono pre-processing pass isn't applied twice.
         """
         if not audio_filepath.exists():
-            logger.error(f"Audio file not found: {audio_filepath}")
+            logger.error("Audio file not found")
             return None
 
         preprocess_temp: Optional[Path] = None
         try:
-            logger.info(f"Transcribing audio file: {audio_filepath}")
             file_size = audio_filepath.stat().st_size
-            logger.info(f"Audio file size: {file_size / 1024:.1f} KB")
+            logger.info(
+                "Transcription started: backend=%s audio_bytes=%d",
+                self.backend,
+                file_size,
+            )
 
             if file_size < 1000:  # Less than 1KB
                 logger.warning("Audio file appears to be too small for transcription")
