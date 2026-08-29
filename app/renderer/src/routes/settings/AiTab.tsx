@@ -116,7 +116,7 @@ function TranscriptionSection() {
       >
         {engine === 'openai-asr'
           ? 'Speech-to-text is sent to an OpenAI-compatible cloud endpoint. Unlike the on-device engines, your audio leaves your computer.'
-          : 'Speech-to-text always runs on your device — your audio never leaves your computer.'}
+          : 'Speech-to-text always runs on your device - your audio never leaves your computer.'}
       </p>
       <SettingRow
         label="Language"
@@ -191,7 +191,7 @@ export function SpeakerIdentificationSetting() {
 const ENGINE_TAGLINE: Record<TranscriptionEngine, string> = {
   parakeet: 'Fastest — English + European languages',
   whisper: 'Most accurate — 99 languages',
-  'openai-asr': 'Cloud API — sends audio to an OpenAI-compatible endpoint',
+  'openai-asr': 'Cloud API - sends audio to an OpenAI-compatible endpoint',
 };
 
 /**
@@ -288,7 +288,7 @@ function TranscriptionModelList() {
   const onValueChange = (next: string) => {
     if (next === activeEngine) return;
     if (next === 'openai-asr') {
-      // Switching to the cloud engine sends audio off-device — gate it behind
+      // Switching to the cloud engine sends audio off-device - gate it behind
       // an explicit privacy confirmation.
       setConfirmCloudAsr(true);
       return;
@@ -378,7 +378,7 @@ function TranscriptionModelList() {
 
 // Registry defaults, mirrored from src/config.py's _get_default_config. Clearing
 // a field resets to these rather than persisting a blank value (the backend
-// rejects a blank URL/model — see set_openai_asr_api_url / set_openai_asr_model).
+// rejects a blank URL/model - see set_openai_asr_api_url / set_openai_asr_model).
 const DEFAULT_OPENAI_ASR_URL = 'https://api.openai.com/v1';
 const DEFAULT_OPENAI_ASR_MODEL = 'whisper-1';
 
@@ -386,7 +386,7 @@ const DEFAULT_OPENAI_ASR_MODEL = 'whisper-1';
  * Config sub-panel shown when the OpenAI-compatible cloud ASR engine is
  * active. The API URL + model round-trip through config.json; the API key is
  * held encrypted by the main process (safeStorage) and only its set/not-set
- * state is ever surfaced (`api_key_set`) — the value is never read back.
+ * state is ever surfaced (`api_key_set`) - the value is never read back.
  */
 function OpenAiAsrConfig() {
   const config = useOpenAiAsrConfig();
@@ -456,7 +456,7 @@ function OpenAiAsrConfig() {
           placeholder="https://api.openai.com/v1"
           onBlur={() => {
             // A cleared (or whitespace-only) field resets to the default URL
-            // rather than trying to persist a blank the backend would reject —
+            // rather than trying to persist a blank the backend would reject -
             // otherwise the stale value would return on the next refresh.
             const next = apiUrl.trim() || DEFAULT_OPENAI_ASR_URL;
             if (next !== apiUrl) setApiUrl(next);
@@ -523,7 +523,7 @@ function OpenAiAsrConfig() {
         <div className="mt-1 text-[11.5px]" style={{ color: 'var(--fg-muted)' }}>
           {keySet
             ? 'A key is saved. Enter a new one to replace it, or clear it.'
-            : 'Stored encrypted on your device — never written to config or sent anywhere except your chosen endpoint.'}
+            : 'Stored encrypted on your device - never written to config or sent anywhere except your chosen endpoint.'}
         </div>
         {saveError && (
           <p role="alert" className="mt-1 text-[11.5px]" style={{ color: 'var(--danger, #b42318)' }}>

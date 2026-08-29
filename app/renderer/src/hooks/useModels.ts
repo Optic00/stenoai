@@ -620,7 +620,7 @@ export function useSetActiveTranscription() {
 //
 // The non-secret endpoint config (api_url, model) round-trips through the
 // backend config.json. `api_key_set` reflects the encrypted-on-disk key held
-// by the main process (safeStorage) — the key value itself is never returned.
+// by the main process (safeStorage) - the key value itself is never returned.
 // ---------------------------------------------------------------------------
 
 /** Query for the current OpenAI ASR endpoint config (url, api_key_set, model). */

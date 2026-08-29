@@ -8069,7 +8069,7 @@ ipcMain.handle('set-transcription-engine', async (event, engine) => {
 
 // OpenAI-compatible ASR: the NON-SECRET config (url/model) shells to the CLI
 // like set-cloud-api-url does. api_key_set is always overridden with the
-// safeStorage truth (hasOpenAiAsrKey) — the CLI only sees the env-var key,
+// safeStorage truth (hasOpenAiAsrKey) - the CLI only sees the env-var key,
 // which isn't injected on these calls, so its own api_key_set is unreliable.
 ipcMain.handle('get-openai-asr-config', async () => {
   try {

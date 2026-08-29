@@ -5,11 +5,11 @@ import { existsSync } from 'fs';
 import path from 'path';
 
 /**
- * T2 — OpenAI-compatible cloud ASR config. Drives the real backend's
+ * T2 - OpenAI-compatible cloud ASR config. Drives the real backend's
  * `openaiAsr` IPC and asserts both the get/set round-trip and the persisted
  * config.json keys. Model-free + deterministic: every call here is a local
  * config write or a local safeStorage encryption. No network, no real ASR
- * endpoint is ever contacted (that's the whole point — this is the security +
+ * endpoint is ever contacted (that's the whole point - this is the security +
  * wiring contract, not a transcription smoke).
  *
  * Security keystone: the API KEY must NEVER land in config.json. It is stored
@@ -94,7 +94,7 @@ test('openai-asr API key is stored encrypted (safeStorage), not in config.json',
   const { app, page } = await launchApp();
 
   // The key is persisted via safeStorage; on a headless runner with no usable
-  // keyring it is unavailable — skip LOUDLY rather than emit a misleading red
+  // keyring it is unavailable - skip LOUDLY rather than emit a misleading red
   // (mirrors ai-provider.t2's cloud-key guard).
   const encryptionAvailable = await app.evaluate(({ safeStorage }) =>
     safeStorage.isEncryptionAvailable(),
