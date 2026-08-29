@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import http.client
 import http.server
 import io
 import json
@@ -647,6 +648,129 @@ class OpenAiAsrTests(unittest.TestCase):
             self.assertNotIn(marker, summary_path.read_text(encoding="utf-8"))
             self.assertNotIn(marker, parsed["session_info"]["error"])
 
+    def test_protocol_error_never_reaches_exception_logs_result_or_meeting_metadata(self):
+        marker = "PRIVATE-PROTOCOL-STATUS-LINE"
+
+        def protocol_errors():
+            return [
+                http.client.BadStatusLine(f"{marker}\r\n"),
+                http.client.BadStatusLine(f"{marker}\r\n"),
+            ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+
+            transcriber = _build_transcriber()
+            with patch(
+                "urllib.request.build_opener",
+                return_value=_FakeOpener(protocol_errors()),
+            ), patch("time.sleep"):
+                with self.assertRaises(RuntimeError) as raised:
+                    transcriber._run_openai_asr(audio, language="en")
+            self.assertNotIn(marker, str(raised.exception))
+
+            transcriber = _build_transcriber()
+            stderr = io.StringIO()
+            with self.assertLogs(
+                "src.transcriber", level="ERROR"
+            ) as logs, contextlib.redirect_stderr(stderr), patch.object(
+                transcriber, "_preprocess_audio", return_value=(audio, False)
+            ), patch.object(
+                transcriber, "_build_whisper_fallback", return_value=False
+            ), patch(
+                "urllib.request.build_opener",
+                return_value=_FakeOpener(protocol_errors()),
+            ), patch("time.sleep"):
+                failure = transcriber.transcribe_audio(audio, language="en")
+            self.assertTrue(failure["transcription_failed"])
+            self.assertNotIn(marker, failure["error"])
+            self.assertNotIn(marker, "\n".join(logs.output))
+            self.assertNotIn(marker, stderr.getvalue())
+
+            recorder = MeetingPipeline.__new__(MeetingPipeline)
+            recorder.output_dir = Path(tmp_dir) / "output"
+            recorder.output_dir.mkdir()
+            recorder.transcripts_dir = Path(tmp_dir) / "transcripts"
+            recorder.transcripts_dir.mkdir()
+            recorder.transcriber = Mock()
+            recorder.transcriber.transcribe_diarised.return_value = failure
+            recorder.summarizer = None
+            config = Mock()
+            config.get_language.return_value = "en"
+            config.get_whisper_language.return_value = "en"
+            config.get_keep_recordings.return_value = False
+            stdout = io.StringIO()
+            with patch("src.config.get_config", return_value=config), patch.dict(
+                "os.environ", {"STENOAI_USER_DATA_DIR": tmp_dir}
+            ), contextlib.redirect_stdout(stdout):
+                result = asyncio.run(
+                    recorder.process_recording_streaming(str(audio), "Protocol failure")
+                )
+
+            summary_path = Path(result["session_info"]["summary_file"])
+            parsed = _parse_meeting_markdown(summary_path)
+            self.assertTrue(audio.exists(), "protocol failure must preserve retry audio")
+            self.assertNotIn(marker, stdout.getvalue())
+            self.assertNotIn(marker, summary_path.read_text(encoding="utf-8"))
+            self.assertNotIn(marker, parsed["session_info"]["error"])
+
+    def test_provider_language_is_validated_before_persistence(self):
+        marker = "PRIVATE-LANGUAGE-MARKER"
+        injected_language = f"en\n---\ntranscription_failed: true\n{marker}"
+        payload = {
+            "text": "A legitimate transcript with enough words for detection.",
+            "segments": [
+                {
+                    "text": "A legitimate transcript with enough words for detection.",
+                    "start": 0,
+                    "end": 2,
+                }
+            ],
+            "duration": 2,
+            "language": injected_language,
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            transcriber = _build_transcriber()
+            with patch(
+                "urllib.request.build_opener",
+                return_value=_FakeOpener([_json_response(payload)]),
+            ):
+                transcribed = transcriber._run_openai_asr(audio, language="auto")
+            self.assertIsNone(transcribed["detected_language"])
+
+            recorder = MeetingPipeline.__new__(MeetingPipeline)
+            recorder.output_dir = Path(tmp_dir) / "output"
+            recorder.output_dir.mkdir()
+            recorder.transcripts_dir = Path(tmp_dir) / "transcripts"
+            recorder.transcripts_dir.mkdir()
+            recorder.transcriber = Mock()
+            recorder.transcriber.transcribe_diarised.return_value = transcribed
+            recorder.summarizer = None
+            config = Mock()
+            config.get_language.return_value = "auto"
+            config.get_whisper_language.return_value = "auto"
+            config.get_language_name.side_effect = lambda code: code or "Unknown"
+            config.get_auto_summarize_enabled.return_value = False
+            config.get_keep_recordings.return_value = True
+            with patch("src.config.get_config", return_value=config), patch.dict(
+                "os.environ", {"STENOAI_USER_DATA_DIR": tmp_dir}
+            ), contextlib.redirect_stdout(io.StringIO()):
+                result = asyncio.run(
+                    recorder.process_recording_streaming(str(audio), "Safe language")
+                )
+
+            summary_path = Path(result["session_info"]["summary_file"])
+            transcript_path = recorder.transcripts_dir / "short_transcript.txt"
+            persisted = summary_path.read_text(encoding="utf-8")
+            self.assertNotIn(marker, persisted)
+            self.assertNotIn(marker, transcript_path.read_text(encoding="utf-8"))
+            self.assertIsNone(
+                _parse_meeting_markdown(summary_path)["session_info"]["detected_language"]
+            )
+
     def test_fallback_warning_never_includes_http_error_body(self):
         marker = "PRIVATE-PROVIDER-ERROR-BODY"
         transcriber = _build_transcriber()
@@ -837,7 +961,16 @@ class OpenAiAsrTests(unittest.TestCase):
         self.assertEqual(normalize("English"), "en")
         self.assertEqual(normalize("german"), "de")
         self.assertEqual(normalize("en"), "en")
-        self.assertEqual(normalize("Swedish"), "Swedish")
+        self.assertEqual(normalize(" EN "), "en")
+        self.assertEqual(normalize("haw"), "haw")
+        self.assertEqual(normalize("uk"), "uk")
+        self.assertEqual(normalize("Finnish"), "fi")
+        self.assertEqual(normalize("Swedish"), "sv")
+        self.assertIsNone(normalize("xx"))
+        self.assertIsNone(normalize("zzz"))
+        self.assertIsNone(normalize("unknown language"))
+        self.assertIsNone(normalize("en\n---\ninjected: true"))
+        self.assertIsNone(normalize(42))
         self.assertIsNone(normalize(None))
 
 

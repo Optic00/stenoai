@@ -28,6 +28,7 @@ anything; the model is the source of truth.
 """
 
 import contextlib
+import http.client
 import inspect
 import json
 import logging
@@ -167,25 +168,6 @@ OPENAI_ASR_MAX_CHUNK_SECONDS = 600
 OPENAI_ASR_REQUEST_DEADLINE_SECONDS = 10 * 60
 OPENAI_ASR_SOCKET_TIMEOUT_SECONDS = 300
 
-OPENAI_LANGUAGE_NAME_TO_CODE = {
-    "english": "en",
-    "german": "de",
-    "french": "fr",
-    "spanish": "es",
-    "italian": "it",
-    "portuguese": "pt",
-    "dutch": "nl",
-    "polish": "pl",
-    "russian": "ru",
-    "japanese": "ja",
-    "chinese": "zh",
-    "korean": "ko",
-    "arabic": "ar",
-    "hindi": "hi",
-    "turkish": "tr",
-}
-
-
 # Resolve a usable ffmpeg binary. Electron-spawned subprocesses don't inherit
 # the user's shell PATH (no /opt/homebrew/bin), so a bare `ffmpeg` string fails
 # silently and breaks the stereo-channel split downstream. Look in PyInstaller
@@ -197,13 +179,25 @@ _FFMPEG_PATH_LOCK = threading.Lock()
 
 
 def _normalize_openai_language(language: Optional[str]) -> Optional[str]:
-    """Convert common full language names from OpenAI to ISO codes."""
+    """Return a persistence-safe provider language code, or ``None``."""
     if not isinstance(language, str):
-        return language
-    key = language.lower()
-    if 1 <= len(key) <= 3:
-        return language
-    return OPENAI_LANGUAGE_NAME_TO_CODE.get(key, language)
+        return None
+    # Config owns the complete Whisper language table used by the rest of the
+    # app. Reuse it here so every supported code and full provider name remains
+    # compatible without widening persistence to arbitrary short strings.
+    from src.config import Config
+
+    key = language.strip().lower()
+    if key in Config._LANGUAGE_NAMES:
+        return key
+    return next(
+        (
+            code
+            for code, name in Config._LANGUAGE_NAMES.items()
+            if name.lower() == key
+        ),
+        None,
+    )
 
 
 def _resolve_ffmpeg() -> Optional[str]:
@@ -2143,12 +2137,15 @@ class WhisperTranscriber:
                                 resp.close()
                             except Exception:
                                 pass
-                except urllib.error.URLError:
+                except (urllib.error.URLError, http.client.HTTPException):
                     if attempt == 0:
                         time.sleep(min(2, max(0, request_deadline - time.monotonic())))
                         continue
-                    # urllib reasons may include proxy/provider-controlled text
-                    # or endpoint details. Keep returned errors and logs neutral.
+                    # urllib reasons and HTTP protocol errors may include proxy-
+                    # or provider-controlled text and endpoint details. Keep
+                    # returned errors and logs neutral. The narrow protocol
+                    # exception base deliberately excludes local programming
+                    # errors as well as KeyboardInterrupt and SystemExit.
                     raise RuntimeError("openai-asr transport request failed") from None
             raise RuntimeError("openai-asr request retry loop exhausted")
 
