@@ -73,6 +73,8 @@ const {
   buildTranscriptReadyBody,
   shouldSuppressNoteReadyNotification,
 } = require('./notification-copy');
+const { notificationsEnabledFromDisk } = require('./notification-settings');
+const { reserveReprocessObsidianForkNotification } = require('./reprocess-obsidian-fork-notification');
 const { makeLineReader } = require('./backend-stream');
 // Pure deep-link (stenoai://) parsing/sanitizing lives in ./shortcut-url
 // (unit-tested). The stateful side — window creation, IPC dispatch,
@@ -2959,12 +2961,17 @@ ipcMain.handle('clear-state', async () => {
   }
 });
 
-async function showObsidianForkNotification(result) {
+function showObsidianForkNotification(result) {
   if (!result || result.status !== 'forked') return { success: true, shown: false };
   const { summaryFile } = result;
   markObsidianForkNotificationPending(summaryFile);
   try {
-    if (!(await notificationsEnabled())) return { success: true, shown: false };
+    // This is on the reprocess completion path. Do not await the Python
+    // get-notifications request here: if it stalls, the completion event must
+    // still reach the renderer, which can own the unshown-fork fallback.
+    if (!notificationsEnabledFromDisk(path.join(getUserDataDir(), 'config.json'))) {
+      return { success: true, shown: false };
+    }
     const replacementName = path.basename(result.vaultRelPath || 'the new copy');
     const notif = new Notification({
       title: 'Obsidian edit preserved',
@@ -3105,7 +3112,7 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
         }
       });
 
-      proc.on('close', (code) => {
+      proc.on('close', async (code) => {
         watchdog.clear();
         if (code === 0) {
           console.log(`✅ Completed reprocessing: ${sessionName}`);
@@ -3123,6 +3130,24 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
           const obsidianFork = obsidianSyncResult?.status === 'forked'
             ? obsidianSyncResult
             : undefined;
+          // The fork is determined here in main, before the completion event
+          // crosses into the renderer. Schedule and await its notification so
+          // the renderer's ordinary note-ready path cannot race a pending
+          // custom toast and supersede the explanation for the extra vault
+          // file (most visibly on Windows CI).
+          // A transcript-only reprocess stays renderer-owned: it keeps the
+          // actionable "Summarise" toast in the background, or shows the
+          // preservation notice to a user who is already watching it finish.
+          const {
+            mainObsidianForkNotificationShown,
+            obsidianSync: completionObsidianSync,
+          } =
+            await reserveReprocessObsidianForkNotification({
+              obsidianFork,
+              summaryFile,
+              summarizationCompleted,
+              showObsidianForkNotification,
+            });
           // Look up the saved meeting so the completion event carries meetingData
           // with the note's CURRENT title — reprocess may have generated an LLM
           // title, so `sessionName` here can still be the 'Note' placeholder. The
@@ -3141,7 +3166,11 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
                   summaryFile,
                   meetingData: processedMeeting,
                   notesGenerated: summarizationCompleted,
-                  obsidianSync: obsidianFork,
+                  // Main already owns a note-ready fork notification. The
+                  // renderer only receives unreserved forks, where it chooses
+                  // between the background preservation notice and Summarise.
+                  mainObsidianForkNotificationShown,
+                  obsidianSync: completionObsidianSync,
                   message: 'Reprocessing completed successfully'
                 });
               }
@@ -3156,7 +3185,8 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
                   sessionName,
                   summaryFile,
                   notesGenerated: summarizationCompleted,
-                  obsidianSync: obsidianFork,
+                  mainObsidianForkNotificationShown,
+                  obsidianSync: completionObsidianSync,
                   message: 'Reprocessing completed successfully'
                 });
               }

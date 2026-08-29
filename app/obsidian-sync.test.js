@@ -127,6 +127,56 @@ test('sync writes a readable file under the folder subdir', () => {
   fs.rmSync(h.root, { recursive: true, force: true });
 });
 
+test('an unchanged vault note heals a stale index before checking for edits', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  const target = path.join(h.vault, 'Sales', '2026-07-15 Acme Q3 Planning.md');
+  const idx = h.eng.loadIndex();
+  const expectedHash = idx.notes.n1.lastWrittenHash;
+  idx.notes.n1.lastWrittenHash = 'stale-after-crash';
+  h.eng.saveIndex(idx);
+
+  const result = h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'), { onConflict: 'fork' });
+
+  assert.equal(result.status, 'synced');
+  assert.equal(h.eng.loadIndex().notes.n1.lastWrittenHash, expectedHash);
+  assert.equal(fs.readdirSync(path.join(h.vault, 'Sales')).length, 1, 'no replacement was forked');
+});
+
+test('a healthy destination is read once for an unchanged sync and an update', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  const target = path.join(h.vault, 'Sales', '2026-07-15 Acme Q3 Planning.md');
+  const readFileSync = fs.readFileSync;
+  let unchangedReads = 0;
+  let updateReads = 0;
+  let phase = 'unchanged';
+  fs.readFileSync = function patchedReadFileSync(filePath, ...args) {
+    if (filePath === target) {
+      if (phase === 'unchanged') unchangedReads += 1;
+      else updateReads += 1;
+    }
+    return readFileSync.call(this, filePath, ...args);
+  };
+  try {
+    assert.equal(h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md')).status, 'synced');
+    phase = 'update';
+    h.writeNote('n1', NOTE.replace('Ship the pricing page Friday.', 'Ship the pricing page Thursday.'));
+    assert.equal(h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md')).status, 'synced');
+  } finally {
+    fs.readFileSync = readFileSync;
+  }
+
+  assert.equal(unchangedReads, 1);
+  assert.equal(updateReads, 1);
+});
+
 test('backfillAll mirrors every existing note (one-time export on enable)', async () => {
   const h = harness();
   h.writeNote('n1', NOTE);
@@ -245,6 +295,122 @@ test('reprocess conflict preserves the Obsidian edit and writes a stable replace
     ).length,
     0,
     'launch reconciliation drops history after the preserved file is removed',
+  );
+});
+
+test('reprocess preserves a vault edit when Windows briefly locks the tracked file', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  const original = path.join(h.vault, 'Sales', '2026-07-15 Acme Q3 Planning.md');
+  fs.writeFileSync(original, 'HAND-EDITED IN OBSIDIAN');
+  h.writeNote('n1', NOTE.replace('Ship the pricing page Friday.', 'Ship the pricing page Thursday.'));
+
+  // Windows Defender or an indexer can momentarily make the tracked file
+  // unreadable. Two reads used to interpret that as both "not edited" and
+  // "not present", then overwrite the user's edit instead of forking it.
+  const readFileSync = fs.readFileSync;
+  let transientReadFailures = 2;
+  fs.readFileSync = function patchedReadFileSync(filePath, ...args) {
+    if (filePath === original && transientReadFailures > 0) {
+      transientReadFailures -= 1;
+      const error = new Error('temporarily locked');
+      error.code = 'EBUSY';
+      throw error;
+    }
+    return readFileSync.call(this, filePath, ...args);
+  };
+  let result;
+  try {
+    result = h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'), { onConflict: 'fork' });
+  } finally {
+    fs.readFileSync = readFileSync;
+  }
+
+  assert.equal(result.status, 'forked');
+  assert.equal(fs.readFileSync(original, 'utf8'), 'HAND-EDITED IN OBSIDIAN');
+  assert.match(
+    fs.readFileSync(path.join(h.vault, result.vaultRelPath), 'utf8'),
+    /Ship the pricing page Thursday\./,
+  );
+});
+
+test('a persistently locked vault read forks without a long retry', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  const original = path.join(h.vault, 'Sales', '2026-07-15 Acme Q3 Planning.md');
+  fs.writeFileSync(original, 'HAND-EDITED IN OBSIDIAN');
+  h.writeNote('n1', NOTE.replace('Ship the pricing page Friday.', 'Ship the pricing page Thursday.'));
+
+  const readFileSync = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function patchedReadFileSync(filePath, ...args) {
+    if (filePath === original) {
+      reads += 1;
+      const error = new Error('persistently locked');
+      error.code = 'EBUSY';
+      throw error;
+    }
+    return readFileSync.call(this, filePath, ...args);
+  };
+  let result;
+  const startedAt = Date.now();
+  try {
+    result = h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'), { onConflict: 'fork' });
+  } finally {
+    fs.readFileSync = readFileSync;
+  }
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.status, 'forked');
+  assert.ok(elapsedMs < 250, `persistent read lock blocked for ${elapsedMs}ms`);
+  assert.equal(reads, 3, 'one attempt plus the two bounded retries');
+  assert.equal(fs.readFileSync(original, 'utf8'), 'HAND-EDITED IN OBSIDIAN');
+  assert.match(
+    fs.readFileSync(path.join(h.vault, result.vaultRelPath), 'utf8'),
+    /Ship the pricing page Thursday\./,
+  );
+});
+
+test('an access-denied vault read forks without retrying', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  const original = path.join(h.vault, 'Sales', '2026-07-15 Acme Q3 Planning.md');
+  fs.writeFileSync(original, 'HAND-EDITED IN OBSIDIAN');
+  h.writeNote('n1', NOTE.replace('Ship the pricing page Friday.', 'Ship the pricing page Thursday.'));
+
+  const readFileSync = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function patchedReadFileSync(filePath, ...args) {
+    if (filePath === original) {
+      reads += 1;
+      const error = new Error('access denied');
+      error.code = 'EACCES';
+      throw error;
+    }
+    return readFileSync.call(this, filePath, ...args);
+  };
+  let result;
+  try {
+    result = h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'), { onConflict: 'fork' });
+  } finally {
+    fs.readFileSync = readFileSync;
+  }
+
+  assert.equal(result.status, 'forked');
+  assert.equal(reads, 1);
+  assert.equal(fs.readFileSync(original, 'utf8'), 'HAND-EDITED IN OBSIDIAN');
+  assert.match(
+    fs.readFileSync(path.join(h.vault, result.vaultRelPath), 'utf8'),
+    /Ship the pricing page Thursday\./,
   );
 });
 

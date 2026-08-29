@@ -570,12 +570,13 @@ export function useRecordingProcessingEffects() {
           kind,
           shouldNotify,
           obsidianForked: data.obsidianSync?.status === 'forked',
+          mainObsidianForkNotificationShown: data.mainObsidianForkNotificationShown === true,
         });
 
         if (notification === 'obsidian-fork' && data.obsidianSync) {
-          // A preservation notice replaces only the informational note-ready
-          // toast. The actionable transcript-ready prompt has higher priority.
-          // The main-side handler owns the notifications_enabled gate.
+          // The main process reserves summarized forks before emitting this
+          // event. This fallback covers transcript-only forks where Summarise
+          // is not actionable because the user is already watching it.
           void ipc()
             .settings.showObsidianForkNotification({
               ...data.obsidianSync,

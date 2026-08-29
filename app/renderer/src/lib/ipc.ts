@@ -876,13 +876,17 @@ export interface ProcessingCompleteEvent {
    *  off → SUMMARY_SKIPPED). Drives whether the renderer fires "Note ready" vs
    *  the "Transcript ready — generate notes?" prompt (#bug2/#bug3). */
   notesGenerated?: boolean;
-  /** A reprocess preserved an externally edited Obsidian file and wrote the
-   *  regenerated note to a separate tracked path. */
+  /** An unreserved reprocess fork. The renderer chooses its notification only
+   *  when main did not already reserve the note-ready preservation toast. */
   obsidianSync?: {
     status: 'forked';
     preservedVaultRelPath: string;
     vaultRelPath: string;
   };
+  /** Main successfully displayed the summarized-fork preservation toast before
+   *  this event. This persists after Electron closes that toast, so the renderer
+   *  can suppress its generic note-ready fallback exactly once. */
+  mainObsidianForkNotificationShown?: boolean;
 }
 export interface QueryChunkEvent {
   queryId: string;

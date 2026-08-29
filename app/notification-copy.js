@@ -47,8 +47,18 @@ function shouldSuppressNoteReadyNotification(activeOptions, summaryFile, forkPen
     ));
 }
 
+/**
+ * The main process reserves an Obsidian preservation toast before emitting the
+ * completion event. A transcript-only result deliberately leaves that event to
+ * the renderer so its actionable "Summarise" prompt keeps priority.
+ */
+function shouldReserveObsidianForkNotification(forked, summarizationCompleted) {
+  return Boolean(forked) && Boolean(summarizationCompleted);
+}
+
 module.exports = {
   buildNoteReadyNotificationOptions,
   buildTranscriptReadyBody,
   shouldSuppressNoteReadyNotification,
+  shouldReserveObsidianForkNotification,
 };

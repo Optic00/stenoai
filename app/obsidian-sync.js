@@ -65,6 +65,22 @@ function retryTransient(fn, tries = 8) {
     }
   }
 }
+
+// Reads happen in the backfill/reconcile loop, so they need a much tighter
+// budget than a rename or unlink. Two brief EBUSY pulses from an indexer are
+// common on Windows; a permanently unavailable vault must not freeze the main
+// process while we decide to preserve it. EACCES is fail-closed immediately.
+function retryTransientRead(fn) {
+  const delays = [20, 40];
+  for (let i = 0; ; i++) {
+    try { return fn(); }
+    catch (err) {
+      const transient = err && ['EPERM', 'EBUSY'].includes(err.code);
+      if (!transient || i >= delays.length) throw err;
+      sleepMs(delays[i]);
+    }
+  }
+}
 // Returns true if the path is gone after this call (removed or already absent),
 // false if it survived every retry (a persistently-locked file on Windows).
 function rmWithRetry(p) {
@@ -335,9 +351,14 @@ function registerObsidianSync({
   function isExternallyEdited(absVaultPath, entry) {
     if (!entry) return false;
     try {
-      const cur = sha256(fs.readFileSync(absVaultPath));
+      const cur = sha256(retryTransientRead(() => fs.readFileSync(absVaultPath)));
       return cur !== entry.lastWrittenHash;
-    } catch (_) { return false; } // gone → not a conflict, we'll recreate
+    } catch (err) {
+      // A missing file is safe to recreate. Any other read failure is not proof
+      // that the tracked file is unchanged: Windows search/AV can briefly lock
+      // a recently edited note. Preserve rather than risk clobbering it.
+      return !(err && err.code === 'ENOENT');
+    }
   }
 
   function recordConflict(idx, stem, vaultRelPath, reason, details = {}) {
@@ -498,7 +519,21 @@ function registerObsidianSync({
       }
 
       let destHash = null;
-      try { destHash = sha256(fs.readFileSync(absDest)); } catch (_) {}
+      try { destHash = sha256(retryTransientRead(() => fs.readFileSync(absDest))); }
+      catch (err) {
+        // ENOENT means no destination yet. A locked tracked destination is
+        // conservatively preserved. Do this from the same read as the normal
+        // hash path so a no-op needs only one vault read.
+        if (!err || err.code !== 'ENOENT') {
+          if (entry && entry.vaultRelPath === vaultRelPath) {
+            if (onConflict === 'fork') return forkExternallyEdited(vaultRelPath);
+            recordConflict(idx, stem, vaultRelPath, 'external-edit');
+            if (ownIdx) saveIndex(idx);
+            return { status: 'conflict' };
+          }
+          throw err;
+        }
+      }
 
       // Already in sync (identical bytes on disk): skip the write — no mtime
       // churn for cloud-synced vaults — and heal the index if a prior crash left
@@ -514,7 +549,8 @@ function registerObsidianSync({
 
       // Conflict: an existing, tracked destination was edited in Obsidian since
       // our last write. (destHash === null means no file there — safe to create.)
-      if (destHash !== null && isExternallyEdited(absDest, entry)) {
+      if (entry && entry.vaultRelPath === vaultRelPath &&
+          destHash !== null && destHash !== entry.lastWrittenHash) {
         if (onConflict === 'fork') return forkExternallyEdited(vaultRelPath);
         recordConflict(idx, stem, vaultRelPath, 'external-edit');
         if (ownIdx) saveIndex(idx);

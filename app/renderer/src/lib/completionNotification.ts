@@ -37,16 +37,20 @@ export function classifyCompletionNotification(input: {
 }
 
 /**
- * Pick the one custom notification a completion may show. The actionable
- * transcript-ready prompt wins when the user is not watching, because it is
- * the only route that can start note generation. Otherwise a fork notice wins
- * over the informational note-ready toast and explains the extra vault file.
+ * Pick the renderer-owned completion notification. A note-ready fork is
+ * reserved in main before this event arrives. Its explicit result remains true
+ * after Electron has closed the toast, so the generic note-ready fallback must
+ * stay suppressed. Unreserved forks are
+ * transcript-only, where Summarise wins in the background and the
+ * preservation notice remains visible when the user is actively watching.
  */
 export function chooseCompletionNotification(input: {
   kind: CompletionNotificationKind;
   shouldNotify: boolean;
   obsidianForked: boolean;
+  mainObsidianForkNotificationShown?: boolean;
 }): CompletionNotificationChoice {
+  if (input.mainObsidianForkNotificationShown) return null;
   if (input.shouldNotify && input.kind === 'transcript-ready') return 'transcript-ready';
   if (input.obsidianForked) return 'obsidian-fork';
   return input.shouldNotify ? input.kind : null;
