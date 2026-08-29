@@ -1,5 +1,6 @@
 import ast
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -347,6 +348,890 @@ class RuffRatchetTests(unittest.TestCase):
 
             self.assertNotEqual(before, after)
             self.assertTrue(ruff_ratchet.differences(before, after))
+
+    @unittest.skipUnless(sys.version_info >= (3, 10), "match requires Python 3.10+")
+    def test_control_flow_arms_have_distinct_finding_identities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def fingerprints(source: str) -> set[str]:
+                filename.write_text(source, encoding="utf-8")
+                results = set()
+                for row, line in enumerate(source.splitlines(), start=1):
+                    if "unused = 1" not in line:
+                        continue
+                    column = line.index("unused") + 1
+                    results.add(ruff_ratchet._finding_fingerprint(
+                        {
+                            "message": "Local variable `unused` is assigned to but never used",
+                            "location": {"row": row, "column": column},
+                            "end_location": {"row": row, "column": column + len("unused")},
+                        },
+                        filename="src/example.py",
+                        code="F841",
+                        root=root,
+                    ))
+                return results
+
+            try_source = (
+                "def f(value):\n"
+                "    try:\n"
+                "        unused = 1\n"
+                "    except ValueError as error:\n"
+                "        unused = 1\n"
+                "    else:\n"
+                "        unused = 1\n"
+                "    finally:\n"
+                "        unused = 1\n"
+            )
+            for_source = (
+                "def f(items):\n"
+                "    for item in items:\n"
+                "        unused = 1\n"
+                "    else:\n"
+                "        unused = 1\n"
+            )
+            while_source = (
+                "def f(ready):\n"
+                "    while ready:\n"
+                "        unused = 1\n"
+                "    else:\n"
+                "        unused = 1\n"
+            )
+            match_source = (
+                "def f(value):\n"
+                "    match value:\n"
+                "        case 1:\n"
+                "            unused = 1\n"
+                "        case _:\n"
+                "            unused = 1\n"
+            )
+
+            self.assertEqual(len(fingerprints(try_source)), 4)
+            self.assertEqual(len(fingerprints(for_source)), 2)
+            self.assertEqual(len(fingerprints(while_source)), 2)
+            self.assertEqual(len(fingerprints(match_source)), 2)
+
+    @unittest.skipUnless(sys.version_info >= (3, 10), "match requires Python 3.10+")
+    def test_except_and_match_header_bindings_keep_their_arm_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def fingerprints(source: str) -> set[str]:
+                filename.write_text(source, encoding="utf-8")
+                results = set()
+                for row, line in enumerate(source.splitlines(), start=1):
+                    if "unused" not in line:
+                        continue
+                    column = line.index("unused") + 1
+                    results.add(ruff_ratchet._finding_fingerprint(
+                        {
+                            "message": "Local variable `unused` is assigned to but never used",
+                            "location": {"row": row, "column": column},
+                            "end_location": {"row": row, "column": column + len("unused")},
+                        },
+                        filename="src/example.py",
+                        code="F841",
+                        root=root,
+                    ))
+                return results
+
+            except_source = (
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except ValueError as unused:\n"
+                "        pass\n"
+                "    except TypeError as unused:\n"
+                "        pass\n"
+            )
+            match_source = (
+                "def f(value):\n"
+                "    match value:\n"
+                "        case {'a': unused}:\n"
+                "            pass\n"
+                "        case {'b': unused}:\n"
+                "            pass\n"
+            )
+            loop_source = (
+                "def f(first, second):\n"
+                "    for unused in first:\n"
+                "        pass\n"
+                "    for unused in second:\n"
+                "        pass\n"
+            )
+            duplicate_except_source = (
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except ValueError as unused:\n"
+                "        pass\n"
+                "    except ValueError as unused:\n"
+                "        pass\n"
+            )
+            duplicate_match_source = (
+                "def f(value):\n"
+                "    match value:\n"
+                "        case {'a': unused}:\n"
+                "            pass\n"
+                "        case {'a': unused}:\n"
+                "            pass\n"
+            )
+
+            self.assertEqual(len(fingerprints(except_source)), 2)
+            self.assertEqual(len(fingerprints(match_source)), 2)
+            self.assertEqual(len(fingerprints(loop_source)), 2)
+            self.assertEqual(len(fingerprints(duplicate_except_source)), 2)
+            self.assertEqual(len(fingerprints(duplicate_match_source)), 2)
+
+    def test_identical_sibling_loops_keep_findings_in_their_own_occurrence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 9},
+                        "end_location": {"row": row, "column": 15},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f(items):\n"
+                "    for item in items:\n"
+                "        unused = 1\n"
+                "    for item in items:\n"
+                "        pass\n",
+                3,
+            )
+            after = finding(
+                "def f(items):\n"
+                "    for item in items:\n"
+                "        pass\n"
+                "    for item in items:\n"
+                "        unused = 1\n",
+                5,
+            )
+            shifted_after = finding(
+                "\n"
+                "def f(items):\n"
+                "    marker = 1\n"
+                "    for item in items:\n"
+                "        pass\n"
+                "\n"
+                "    for item in items:\n"
+                "        unused = 1\n",
+                8,
+            )
+
+            self.assertNotEqual(before, after)
+            self.assertEqual(after, shifted_after)
+
+    def test_try_handler_identity_ignores_an_inserted_unrelated_handler(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 26},
+                        "end_location": {"row": row, "column": 32},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except ValueError as unused:\n"
+                "        pass\n",
+                4,
+            )
+            after = finding(
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except KeyError:\n"
+                "        pass\n"
+                "    except ValueError as unused:\n"
+                "        pass\n",
+                6,
+            )
+            appended = finding(
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except ValueError as unused:\n"
+                "        pass\n"
+                "    except KeyError:\n"
+                "        pass\n",
+                4,
+            )
+
+            self.assertEqual(before, after)
+            self.assertEqual(before, appended)
+
+    def test_try_handler_identity_ignores_an_unrelated_try_body_statement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 26},
+                        "end_location": {"row": row, "column": 32},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f():\n"
+                "    try:\n"
+                "        work()\n"
+                "    except ValueError as unused:\n"
+                "        pass\n",
+                4,
+            )
+            after = finding(
+                "def f():\n"
+                "    try:\n"
+                "        log()\n"
+                "        work()\n"
+                "    except ValueError as unused:\n"
+                "        pass\n",
+                5,
+            )
+            appended = finding(
+                "def f():\n"
+                "    try:\n"
+                "        work()\n"
+                "        log()\n"
+                "    except ValueError as unused:\n"
+                "        pass\n",
+                5,
+            )
+
+            self.assertEqual(before, after)
+            self.assertEqual(before, appended)
+
+    def test_try_body_finding_ignores_exception_alias_rename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 9},
+                        "end_location": {"row": row, "column": 15},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f():\n"
+                "    try:\n"
+                "        unused = 1\n"
+                "    except ValueError as error:\n"
+                "        report(error)\n",
+                3,
+            )
+            after = finding(
+                "def f():\n"
+                "    try:\n"
+                "        unused = 1\n"
+                "    except ValueError as exc:\n"
+                "        report(exc)\n",
+                3,
+            )
+
+            self.assertEqual(before, after)
+
+    def test_handler_finding_ignores_exception_alias_rename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 9},
+                        "end_location": {"row": row, "column": 15},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except ValueError as error:\n"
+                "        report(error)\n"
+                "        unused = 1\n",
+                6,
+            )
+            after = finding(
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except ValueError as exc:\n"
+                "        report(exc)\n"
+                "        unused = 1\n",
+                6,
+            )
+
+            self.assertEqual(before, after)
+
+    @unittest.skipUnless(sys.version_info >= (3, 10), "match requires Python 3.10+")
+    def test_match_case_identity_ignores_an_inserted_unrelated_case(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 13},
+                        "end_location": {"row": row, "column": 19},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f(value):\n"
+                "    match value:\n"
+                "        case 1:\n"
+                "            unused = 1\n",
+                4,
+            )
+            after = finding(
+                "def f(value):\n"
+                "    match value:\n"
+                "        case 0:\n"
+                "            pass\n"
+                "        case 1:\n"
+                "            unused = 1\n",
+                6,
+            )
+            appended = finding(
+                "def f(value):\n"
+                "    match value:\n"
+                "        case 1:\n"
+                "            unused = 1\n"
+                "        case 0:\n"
+                "            pass\n",
+                4,
+            )
+
+            self.assertEqual(before, after)
+            self.assertEqual(before, appended)
+
+    def test_nonidentical_sibling_loop_insert_keeps_existing_occurrence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 9},
+                        "end_location": {"row": row, "column": 15},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f(items, other_items):\n"
+                "    for item in items:\n"
+                "        pass\n"
+                "    for item in items:\n"
+                "        unused = 1\n",
+                5,
+            )
+            after = finding(
+                "def f(items, other_items):\n"
+                "    for other in other_items:\n"
+                "        pass\n"
+                "    for item in items:\n"
+                "        pass\n"
+                "    for item in items:\n"
+                "        unused = 1\n",
+                7,
+            )
+
+            self.assertEqual(before, after)
+
+    def test_unrelated_try_insert_stable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 26},
+                        "end_location": {"row": row, "column": 32},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f():\n"
+                "    try:\n"
+                "        primary()\n"
+                "    except ValueError as unused:\n"
+                "        pass\n",
+                4,
+            )
+            after = finding(
+                "def f():\n"
+                "    try:\n"
+                "        secondary()\n"
+                "    except KeyError:\n"
+                "        pass\n"
+                "    try:\n"
+                "        primary()\n"
+                "    except ValueError as unused:\n"
+                "        pass\n",
+                8,
+            )
+
+            self.assertEqual(before, after)
+
+    def test_try_move_plus_reorder_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 26},
+                        "end_location": {"row": row, "column": 32},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f():\n"
+                "    try:\n"
+                "        first()\n"
+                "    except ValueError as unused:\n"
+                "        pass\n"
+                "    try:\n"
+                "        second()\n"
+                "    except ValueError as unused:\n"
+                "        pass\n",
+                4,
+            )
+            after = finding(
+                "def f():\n"
+                "    try:\n"
+                "        first()\n"
+                "    except ValueError as unused:\n"
+                "        pass\n"
+                "    try:\n"
+                "        second()\n"
+                "    except ValueError as unused:\n"
+                "        pass\n",
+                8,
+            )
+
+            self.assertNotEqual(before, after)
+
+    def test_try_body_move_between_same_handler_siblings_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 9},
+                        "end_location": {"row": row, "column": 15},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f():\n"
+                "    try:\n"
+                "        unused = 1\n"
+                "    except ValueError:\n"
+                "        pass\n"
+                "    try:\n"
+                "        pass\n"
+                "    except ValueError:\n"
+                "        pass\n",
+                3,
+            )
+            after = finding(
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except ValueError:\n"
+                "        pass\n"
+                "    try:\n"
+                "        unused = 1\n"
+                "    except ValueError:\n"
+                "        pass\n",
+                7,
+            )
+
+            self.assertNotEqual(before, after)
+
+    def test_unrelated_try_prepend_keeps_body_finding_stable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 9},
+                        "end_location": {"row": row, "column": 15},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f():\n"
+                "    try:\n"
+                "        unused = 1\n"
+                "    except ValueError:\n"
+                "        pass\n",
+                3,
+            )
+            after = finding(
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except KeyError:\n"
+                "        pass\n"
+                "    try:\n"
+                "        unused = 1\n"
+                "    except ValueError:\n"
+                "        pass\n",
+                7,
+            )
+
+            self.assertEqual(before, after)
+
+    def test_try_body_move_between_different_handler_structures_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 9},
+                        "end_location": {"row": row, "column": 15},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f():\n"
+                "    try:\n"
+                "        unused = 1\n"
+                "    except ValueError:\n"
+                "        pass\n"
+                "    try:\n"
+                "        pass\n"
+                "    except KeyError:\n"
+                "        pass\n",
+                3,
+            )
+            after = finding(
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except ValueError:\n"
+                "        pass\n"
+                "    try:\n"
+                "        unused = 1\n"
+                "    except KeyError:\n"
+                "        pass\n",
+                7,
+            )
+
+            self.assertNotEqual(before, after)
+
+    def test_absent_else_and_finally_arms_do_not_create_siblings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 9},
+                        "end_location": {"row": row, "column": 15},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except ValueError:\n"
+                "        pass\n"
+                "    else:\n"
+                "        unused = 1\n",
+                7,
+            )
+            after = finding(
+                "def f():\n"
+                "    try:\n"
+                "        pass\n"
+                "    except KeyError:\n"
+                "        pass\n"
+                "    try:\n"
+                "        pass\n"
+                "    except ValueError:\n"
+                "        pass\n"
+                "    else:\n"
+                "        unused = 1\n",
+                11,
+            )
+
+            self.assertEqual(before, after)
+
+        for source in (
+            "if ready:\n    pass\n",
+            "for item in items:\n    pass\n",
+            "while ready:\n    pass\n",
+        ):
+            node = ast.parse(source).body[0]
+            self.assertFalse(any(token.endswith(":else") for token in ruff_ratchet._control_flow_branch_tokens(node)))
+
+    @unittest.skipUnless(sys.version_info >= (3, 10), "match requires Python 3.10+")
+    def test_unrelated_match_insert_stable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 13},
+                        "end_location": {"row": row, "column": 19},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f(value):\n"
+                "    match value:\n"
+                "        case 1:\n"
+                "            unused = 1\n",
+                4,
+            )
+            after = finding(
+                "def f(value):\n"
+                "    match value:\n"
+                "        case 0:\n"
+                "            pass\n"
+                "    match value:\n"
+                "        case 1:\n"
+                "            unused = 1\n",
+                7,
+            )
+
+            self.assertEqual(before, after)
+
+    @unittest.skipUnless(sys.version_info >= (3, 10), "match requires Python 3.10+")
+    def test_match_moves_between_different_case_structures_are_distinct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 13},
+                        "end_location": {"row": row, "column": 19},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f(value):\n"
+                "    match value:\n"
+                "        case 1:\n"
+                "            unused = 1\n"
+                "    match value:\n"
+                "        case 2:\n"
+                "            pass\n",
+                4,
+            )
+            after = finding(
+                "def f(value):\n"
+                "    match value:\n"
+                "        case 2:\n"
+                "            unused = 1\n"
+                "    match value:\n"
+                "        case 1:\n"
+                "            pass\n",
+                4,
+            )
+
+            self.assertNotEqual(before, after)
+
+    @unittest.skipUnless(sys.version_info >= (3, 10), "match requires Python 3.10+")
+    def test_match_case_move_between_same_case_siblings_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def finding(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                return ruff_ratchet._finding_fingerprint(
+                    {
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 13},
+                        "end_location": {"row": row, "column": 19},
+                    },
+                    filename="src/example.py",
+                    code="F841",
+                    root=root,
+                )
+
+            before = finding(
+                "def f(value):\n"
+                "    match value:\n"
+                "        case 1:\n"
+                "            unused = 1\n"
+                "        case 2:\n"
+                "            pass\n"
+                "    match value:\n"
+                "        case 1:\n"
+                "            pass\n"
+                "        case 3:\n"
+                "            pass\n",
+                4,
+            )
+            after = finding(
+                "def f(value):\n"
+                "    match value:\n"
+                "        case 1:\n"
+                "            pass\n"
+                "        case 2:\n"
+                "            pass\n"
+                "    match value:\n"
+                "        case 1:\n"
+                "            unused = 1\n"
+                "        case 3:\n"
+                "            pass\n",
+                9,
+            )
+
+            self.assertNotEqual(before, after)
+
+    def test_scope_context_handles_ast_classes_absent_on_python_39(self):
+        missing = object()
+        try_star = getattr(ruff_ratchet.ast, "TryStar", missing)
+        match = getattr(ruff_ratchet.ast, "Match", missing)
+        try:
+            if try_star is not missing:
+                delattr(ruff_ratchet.ast, "TryStar")
+            if match is not missing:
+                delattr(ruff_ratchet.ast, "Match")
+            context = ruff_ratchet._scope_context(ast.parse("if ready:\n    unused = 1\n"), 2)
+            self.assertEqual(len(context), 2)
+            self.assertTrue(context[-1].endswith(":body"))
+        finally:
+            if try_star is not missing:
+                setattr(ruff_ratchet.ast, "TryStar", try_star)
+            if match is not missing:
+                setattr(ruff_ratchet.ast, "Match", match)
 
     def test_ast_serialization_is_independent_of_runtime_dump_defaults(self):
         def complete_dump(node: ast.AST) -> str:

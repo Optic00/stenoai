@@ -102,8 +102,225 @@ def _statements_contain_row(statements: list[ast.stmt], row: int) -> bool:
     )
 
 
+def _node_contains_row(node: ast.AST | None, row: int) -> bool:
+    if node is None:
+        return False
+    lineno = getattr(node, "lineno", None)
+    end_lineno = getattr(node, "end_lineno", None)
+    return (
+        isinstance(lineno, int)
+        and isinstance(end_lineno, int)
+        and lineno <= row <= end_lineno
+    )
+
+
+def _ast_values_identity(*values: ast.AST | str | None) -> str:
+    """Hash control-flow headers without depending on source coordinates."""
+    serialized = json.dumps(
+        [
+            _stable_ast_dump(value) if isinstance(value, ast.AST) else value
+            for value in values
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _optional_ast_type(name: str) -> type[ast.AST] | None:
+    """Return an optional AST node type without raising on older Python."""
+    candidate = getattr(ast, name, None)
+    return candidate if isinstance(candidate, type) and issubclass(candidate, ast.AST) else None
+
+
+def _control_flow_identity(node: ast.AST) -> str | None:
+    """Describe a control-flow statement header independently of its location."""
+    if isinstance(node, ast.If):
+        return f"if:{_ast_values_identity(node.test)}"
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        kind = "async-for" if isinstance(node, ast.AsyncFor) else "for"
+        return f"{kind}:{_ast_values_identity(node.target, node.iter)}"
+    if isinstance(node, ast.While):
+        return f"while:{_ast_values_identity(node.test)}"
+
+    try_star_type = _optional_ast_type("TryStar")
+    try_types = (ast.Try,) + ((try_star_type,) if try_star_type is not None else ())
+    if isinstance(node, try_types):
+        kind = "try-star" if try_star_type is not None and isinstance(node, try_star_type) else "try"
+        return kind
+
+    match_type = _optional_ast_type("Match")
+    if match_type is not None and isinstance(node, match_type):
+        return f"match:{_ast_values_identity(node.subject)}"
+    return None
+
+
+def _local_occurrence(identities: list[str], target_index: int) -> int:
+    """Return a direct sibling ordinal among equal local branch identities."""
+    target = identities[target_index]
+    return sum(identity == target for identity in identities[:target_index])
+
+
+def _try_kind(node: ast.AST) -> str:
+    try_star_type = _optional_ast_type("TryStar")
+    return "try-star" if try_star_type is not None and isinstance(node, try_star_type) else "try"
+
+
+def _try_handler_tokens(node: ast.AST) -> list[tuple[ast.AST, str]]:
+    kind = _try_kind(node)
+    # ``except ... as name`` only binds a local alias.  It does not alter the
+    # exception-control path, so alias renames must not churn findings in this
+    # handler or in the try body.  The exception type and local duplicate
+    # ordinal still distinguish materially different handler structure.
+    identities = [_ast_values_identity(handler.type) for handler in node.handlers]
+    return [
+        (handler, f"{kind}:handler:{identity}:local:{_local_occurrence(identities, index)}")
+        for index, (handler, identity) in enumerate(zip(node.handlers, identities))
+    ]
+
+
+def _try_body_token(node: ast.AST) -> str:
+    """Describe a try body by its ordered local exception-control structure.
+
+    Changing that structure deliberately changes body-finding identities: it
+    materially changes which exception paths own the body. The ratchet is
+    fail-closed for that case, while handler-finding tokens stay independent
+    of unrelated body statements and handlers.
+    """
+    kind = _try_kind(node)
+    handlers = [token for _handler, token in _try_handler_tokens(node)]
+    return f"{kind}:body:{_ast_values_identity(*handlers)}"
+
+
+def _match_case_tokens(node: ast.AST) -> list[tuple[ast.AST, str]]:
+    subject = _ast_values_identity(node.subject)
+    identities = [_ast_values_identity(case.pattern, case.guard) for case in node.cases]
+    return [
+        (case, f"match:{subject}:case:{identity}:local:{_local_occurrence(identities, index)}")
+        for index, (case, identity) in enumerate(zip(node.cases, identities))
+    ]
+
+
+def _control_flow_branch_tokens(node: ast.AST) -> list[str]:
+    """Return every local token a control-flow sibling can own."""
+    identity = _control_flow_identity(node)
+    if identity is None:
+        return []
+    if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+        tokens = [f"{identity}:body", f"{identity}:header"]
+        if node.orelse:
+            tokens.append(f"{identity}:else")
+        return tokens
+
+    try_star_type = _optional_ast_type("TryStar")
+    try_types = (ast.Try,) + ((try_star_type,) if try_star_type is not None else ())
+    if isinstance(node, try_types):
+        kind = _try_kind(node)
+        tokens = [_try_body_token(node), *(token for _handler, token in _try_handler_tokens(node))]
+        if node.orelse:
+            tokens.append(f"{kind}:else")
+        if node.finalbody:
+            tokens.append(f"{kind}:finally")
+        return tokens
+
+    match_type = _optional_ast_type("Match")
+    if match_type is not None and isinstance(node, match_type):
+        return [f"match:{_ast_values_identity(node.subject)}:header", *(
+            token for _case, token in _match_case_tokens(node)
+        )]
+    return []
+
+
+def _control_flow_branch_token(node: ast.AST, row: int) -> str | None:
+    """Return the local branch token that owns ``row``."""
+    identity = _control_flow_identity(node)
+    if identity is None:
+        return None
+    if isinstance(node, ast.If):
+        if _statements_contain_row(node.body, row):
+            return f"{identity}:body"
+        if _statements_contain_row(node.orelse, row):
+            return f"{identity}:else"
+        return f"{identity}:header" if _node_contains_row(node.test, row) else None
+
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        if _statements_contain_row(node.body, row):
+            return f"{identity}:body"
+        if _statements_contain_row(node.orelse, row):
+            return f"{identity}:else"
+        return (
+            f"{identity}:header"
+            if _node_contains_row(node.target, row) or _node_contains_row(node.iter, row)
+            else None
+        )
+
+    if isinstance(node, ast.While):
+        if _statements_contain_row(node.body, row):
+            return f"{identity}:body"
+        if _statements_contain_row(node.orelse, row):
+            return f"{identity}:else"
+        return f"{identity}:header" if _node_contains_row(node.test, row) else None
+
+    try_star_type = _optional_ast_type("TryStar")
+    try_types = (ast.Try,) + ((try_star_type,) if try_star_type is not None else ())
+    if isinstance(node, try_types):
+        kind = _try_kind(node)
+        if _statements_contain_row(node.body, row):
+            return _try_body_token(node)
+        for handler, token in _try_handler_tokens(node):
+            if _node_contains_row(handler, row):
+                return token
+        if _statements_contain_row(node.orelse, row):
+            return f"{kind}:else"
+        if _statements_contain_row(node.finalbody, row):
+            return f"{kind}:finally"
+        return None
+
+    match_type = _optional_ast_type("Match")
+    if match_type is not None and isinstance(node, match_type):
+        for case, token in _match_case_tokens(node):
+            if (
+                _statements_contain_row(case.body, row)
+                or _node_contains_row(case.pattern, row)
+                or _node_contains_row(case.guard, row)
+            ):
+                return token
+        return f"match:{_ast_values_identity(node.subject)}:header" if _node_contains_row(node.subject, row) else None
+
+    return None
+
+
+def _branch_sibling_occurrence(tree: ast.AST, node: ast.AST, token: str) -> int | None:
+    """Number equal branch tokens among direct control-flow siblings.
+
+    Inserting or removing a sibling with an equal token necessarily changes the
+    ordinal. This fail-closed churn is unavoidable without a persistent node
+    ID, while siblings with other branch tokens leave the finding stable.
+    """
+    for parent in ast.walk(tree):
+        for _field, value in ast.iter_fields(parent):
+            if not isinstance(value, list) or not any(sibling is node for sibling in value):
+                continue
+            matching = [
+                sibling
+                for sibling in value
+                if isinstance(sibling, ast.AST) and token in _control_flow_branch_tokens(sibling)
+            ]
+            return matching.index(node) if len(matching) > 1 else None
+    return None
+
+
+def _control_flow_branch_identity(tree: ast.AST, node: ast.AST, row: int) -> str | None:
+    token = _control_flow_branch_token(node, row)
+    if token is None:
+        return None
+    occurrence = _branch_sibling_occurrence(tree, node, token)
+    suffix = "" if occurrence is None else f":sibling:{occurrence}"
+    return f"{token}{suffix}"
+
+
 def _scope_context(tree: ast.AST, row: int) -> list[str]:
-    """Return stable definition and conditional-branch ownership for one row."""
+    """Return stable definition and control-flow ownership for one row."""
     contexts: list[tuple[int, int, int, str]] = []
     for node in ast.walk(tree):
         end_lineno = getattr(node, "end_lineno", None)
@@ -113,18 +330,12 @@ def _scope_context(tree: ast.AST, row: int) -> list[str]:
             contexts.append(
                 (node.lineno, node.col_offset, -end_lineno, _definition_identity(node))
             )
-        elif isinstance(node, ast.If):
-            if _statements_contain_row(node.body, row):
-                arm = "body"
-            elif _statements_contain_row(node.orelse, row):
-                arm = "else"
-            else:
+        else:
+            branch_identity = _control_flow_branch_identity(tree, node, row)
+            if branch_identity is None:
                 continue
-            test_identity = hashlib.sha256(
-                _stable_ast_dump(node.test).encode("utf-8")
-            ).hexdigest()
             contexts.append(
-                (node.lineno, node.col_offset, -end_lineno, f"if:{test_identity}:{arm}")
+                (node.lineno, node.col_offset, -end_lineno, branch_identity)
             )
     contexts.sort(key=lambda entry: entry[:3])
     return ["module", *(entry[3] for entry in contexts)]
