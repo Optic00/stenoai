@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -27,7 +29,8 @@ RUFF_ARGS = [
     "json",
 ]
 
-Baseline = dict[str, dict[str, int]]
+Baseline = dict[str, dict[str, dict[str, int]]]
+FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def _run(command: list[str], root: Path) -> subprocess.CompletedProcess[str]:
@@ -42,6 +45,64 @@ def _relative_posix_path(filename: str, root: Path) -> str:
         return candidate.resolve().relative_to(root.resolve()).as_posix()
     except ValueError as error:
         raise ValueError(f"Ruff reported a path outside the repository: {filename}") from error
+
+
+def _finding_fingerprint(
+    diagnostic: dict[str, Any],
+    *,
+    filename: str,
+    code: str,
+    root: Path,
+) -> str:
+    """Identify one finding without depending on its absolute line number."""
+    message = diagnostic.get("message")
+    location = diagnostic.get("location")
+    end_location = diagnostic.get("end_location")
+    if (
+        not isinstance(message, str)
+        or not message
+        or not isinstance(location, dict)
+        or not isinstance(end_location, dict)
+    ):
+        raise RuntimeError("Ruff returned a diagnostic without stable identity fields")
+
+    start_row = location.get("row")
+    end_row = end_location.get("row")
+    end_column = end_location.get("column")
+    if (
+        not isinstance(start_row, int)
+        or isinstance(start_row, bool)
+        or not isinstance(end_row, int)
+        or isinstance(end_row, bool)
+        or not isinstance(end_column, int)
+        or isinstance(end_column, bool)
+        or start_row < 1
+        or end_row < start_row
+        or end_column < 1
+    ):
+        raise RuntimeError("Ruff returned a diagnostic with invalid source coordinates")
+
+    # Ruff end locations are exclusive. A multi-line span ending at column 1
+    # therefore ends on the previous physical line; excluding that following
+    # line keeps the identity stable when unrelated lines move around it.
+    last_row = end_row - 1 if end_row > start_row and end_column == 1 else end_row
+    source_path = root / PurePosixPath(filename)
+    try:
+        source_lines = source_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise RuntimeError(f"Could not read Ruff source file {filename}") from error
+    if last_row > len(source_lines):
+        raise RuntimeError("Ruff returned a diagnostic outside its source file")
+    source_span = "\n".join(source_lines[start_row - 1:last_row]).strip()
+    if not source_span:
+        raise RuntimeError("Ruff returned a diagnostic without source text")
+
+    payload = json.dumps(
+        [code, message, source_span],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def ruff_findings(root: Path) -> Baseline:
@@ -59,15 +120,27 @@ def ruff_findings(root: Path) -> Baseline:
     except json.JSONDecodeError as error:
         raise RuntimeError("Ruff did not produce JSON diagnostics") from error
 
-    grouped: defaultdict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
+    grouped: defaultdict[str, defaultdict[str, defaultdict[str, int]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(int))
+    )
     for diagnostic in diagnostics:
         filename = diagnostic.get("filename")
         code = diagnostic.get("code")
         if not isinstance(filename, str) or not isinstance(code, str):
             raise RuntimeError("Ruff returned a diagnostic without filename or rule code")
-        grouped[_relative_posix_path(filename, root)][code] += 1
+        relative_filename = _relative_posix_path(filename, root)
+        fingerprint = _finding_fingerprint(
+            diagnostic,
+            filename=relative_filename,
+            code=code,
+            root=root,
+        )
+        grouped[relative_filename][code][fingerprint] += 1
     return {
-        filename: dict(sorted(rules.items()))
+        filename: {
+            code: dict(sorted(identities.items()))
+            for code, identities in sorted(rules.items())
+        }
         for filename, rules in sorted(grouped.items())
     }
 
@@ -93,11 +166,22 @@ def read_baseline(path: Path) -> Baseline:
             raise RuntimeError("Ruff baseline filenames must be POSIX relative paths")
         if not isinstance(rules, dict):
             raise RuntimeError(f"Ruff baseline rules for {filename} must be an object")
-        normalized: dict[str, int] = {}
-        for code, count in rules.items():
-            if not isinstance(code, str) or not isinstance(count, int) or count < 0:
+        normalized: dict[str, dict[str, int]] = {}
+        for code, identities in rules.items():
+            if not isinstance(code, str) or not isinstance(identities, dict):
                 raise RuntimeError(f"Invalid Ruff baseline entry for {filename}")
-            normalized[code] = count
+            normalized_identities: dict[str, int] = {}
+            for fingerprint, count in identities.items():
+                if (
+                    not isinstance(fingerprint, str)
+                    or FINGERPRINT_RE.fullmatch(fingerprint) is None
+                    or not isinstance(count, int)
+                    or isinstance(count, bool)
+                    or count < 1
+                ):
+                    raise RuntimeError(f"Invalid Ruff baseline entry for {filename}")
+                normalized_identities[fingerprint] = count
+            normalized[code] = normalized_identities
         baseline[filename] = normalized
     return baseline
 
@@ -108,30 +192,42 @@ def differences(expected: Baseline, actual: Baseline) -> list[str]:
         expected_rules = expected.get(filename, {})
         actual_rules = actual.get(filename, {})
         for code in sorted(set(expected_rules) | set(actual_rules)):
-            before = expected_rules.get(code, 0)
-            after = actual_rules.get(code, 0)
-            if before == after:
-                continue
-            direction = "increased" if after > before else "decreased"
-            messages.append(f"{filename} {code}: {direction} from {before} to {after}")
+            expected_identities = expected_rules.get(code, {})
+            actual_identities = actual_rules.get(code, {})
+            for fingerprint in sorted(set(expected_identities) | set(actual_identities)):
+                before = expected_identities.get(fingerprint, 0)
+                after = actual_identities.get(fingerprint, 0)
+                if before == after:
+                    continue
+                direction = "increased" if after > before else "decreased"
+                messages.append(
+                    f"{filename} {code} {fingerprint[:12]}: "
+                    f"{direction} from {before} to {after}"
+                )
     return messages
 
 
 def write_baseline(path: Path, baseline: Baseline) -> None:
-    stable = {filename: baseline[filename] for filename in sorted(baseline)}
+    stable = {
+        filename: {
+            code: dict(sorted(baseline[filename][code].items()))
+            for code in sorted(baseline[filename])
+        }
+        for filename in sorted(baseline)
+    }
     path.write_text(json.dumps(stable, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def check(*, baseline_path: Path, update: bool, root: Path = ROOT) -> int:
     actual = ruff_findings(root)
+    if update:
+        write_baseline(baseline_path, actual)
+        print("Updated Ruff baseline.")
+        return 0
     expected = read_baseline(baseline_path)
     changes = differences(expected, actual)
     if not changes:
         print("Ruff ratchet matches baseline.")
-        return 0
-    if update:
-        write_baseline(baseline_path, actual)
-        print("Updated Ruff baseline.")
         return 0
     print("Ruff findings differ from the baseline. Run with --update after reviewing the change:")
     print("\n".join(changes))

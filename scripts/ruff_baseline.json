@@ -1,26 +1,67 @@
 {
   "simple_recorder.py": {
-    "F401": 4,
-    "F541": 6,
-    "F841": 6
+    "F401": {
+      "35f3f093076441a16d34649cb86d15f2b78cec6fff541332d9a0adc88afed442": 1,
+      "59b4fe9223b9916b207935b160f0b71257f7ad3378bc4ca030dce9f474b7f334": 1,
+      "d64c7efddeaa9b52c28cd61c75a8d14763ec600b2700ee4b307b27827a3290e4": 1,
+      "efa535a3f223c7d2b868ff1f51ccac72ca32cd578cd31a6a3fc078da18a260d3": 1
+    },
+    "F541": {
+      "034797048e5ce4fa45e2d3ee10a38a423ab28535ddbf3ce7a8e26793564ecf7c": 1,
+      "3407b73047821a1f32571cd392e227e30373b0ff20c79a3ff268017ac89e55d8": 1,
+      "5d1cc5449aa601e6b0ded9ad2291746e1eecc1f7ad11607396930ec1354af441": 1,
+      "699cb3cda7135f2f72fe95f3331d812384512c54b8e030ea589a8e885b4edf3a": 1,
+      "7b1cef4f6697d5b6b02feb5d684fa015ce690a367e30772a5c6354eac580edb8": 1,
+      "f3d23e3467d0f1ab8af583e987d35e06ad37c39021c3eeb30ca420b2c7663970": 1
+    },
+    "F841": {
+      "73bc756f7f9e9443b86d71335f426fff1e05f20c832647b8ab1ba18d90049b3c": 1,
+      "9246892ee16439c6c36196639ccebe21615ea33ca3977516ff0580e8aa2fb782": 1,
+      "95a0beb15e905ac8e79c5357f1a174631ce09c92b4297bbb7b5ff568ffdb7891": 1,
+      "9c54c8835eeabcad93865601bd84fe4016c0b819574e32cfc59ba0a87d3b45e6": 1,
+      "be41cb0bb2bc76d04bc2288dd6a2f9c3fd97da5ef175bc63e17c8c8ad30ab36b": 1,
+      "e068845a7adbd456c68644da3a3b1ad22d95685d7ab4ec47ba0b0fe14fa63f72": 1
+    }
   },
   "tests/test_default_template_report.py": {
-    "E401": 1,
-    "F401": 2
+    "E401": {
+      "8da13cc0220d930b17adafad4bedd0e7464455b6fee1f37f80566e8ea8460a66": 1
+    },
+    "F401": {
+      "4b132267bc19a47ab1531f38c37283c955ff8151c2aff54eb4c43f83c162e7e6": 1,
+      "d9bba74b0b88fb67149bced5bd46b16bd5bdfafc27a1eb84060f500a1b012634": 1
+    }
   },
   "tests/test_report_store.py": {
-    "E401": 1
+    "E401": {
+      "8da13cc0220d930b17adafad4bedd0e7464455b6fee1f37f80566e8ea8460a66": 1
+    }
   },
   "tests/test_report_versions_cli.py": {
-    "E401": 1,
-    "E741": 1
+    "E401": {
+      "8da13cc0220d930b17adafad4bedd0e7464455b6fee1f37f80566e8ea8460a66": 1
+    },
+    "E741": {
+      "ac67baf0be5702718a48b9d532e9ffdca8366f21bb4d8dff5910c4708444059d": 1
+    }
   },
   "tests/test_reports.py": {
-    "E401": 1,
-    "F401": 1
+    "E401": {
+      "8da13cc0220d930b17adafad4bedd0e7464455b6fee1f37f80566e8ea8460a66": 1
+    },
+    "F401": {
+      "d9bba74b0b88fb67149bced5bd46b16bd5bdfafc27a1eb84060f500a1b012634": 1
+    }
   },
   "tests/test_summarizer_map_reduce.py": {
-    "F401": 3,
-    "F841": 2
+    "F401": {
+      "575240c9cc2d8d72ef67fb0423b7ae8ee24cab669ed0e969dcde1a443067a49b": 1,
+      "e9e2ca340e8527ac21c29755724113ff7b964bd5965b65212512907a22caed44": 1,
+      "ef8849ccafd7474537231bd97e3b0a331e4a1f75570e3a5fc248418f72f9b639": 1
+    },
+    "F841": {
+      "252b148c14b327d65b32da3cc95a84ff3b4b19af5e7e721ba84aee812f7b9ab1": 1,
+      "36a97881c219e1decf68d92c3ade5371e732e09c72d783032bd04d5f3f348e71": 1
+    }
   }
 }

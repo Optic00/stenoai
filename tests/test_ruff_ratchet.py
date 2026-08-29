@@ -8,6 +8,9 @@ from scripts import ruff_ratchet
 
 
 class RuffRatchetTests(unittest.TestCase):
+    FINDING_A = "a" * 64
+    FINDING_B = "b" * 64
+
     def _baseline(self, root: Path, content: dict) -> Path:
         path = root / "baseline.json"
         path.write_text(json.dumps(content), encoding="utf-8")
@@ -16,22 +19,25 @@ class RuffRatchetTests(unittest.TestCase):
     def test_matches_the_baseline(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            baseline = self._baseline(root, {"src/example.py": {"F401": 2}})
-            with patch.object(ruff_ratchet, "ruff_findings", return_value={"src/example.py": {"F401": 2}}):
+            findings = {"src/example.py": {"F401": {self.FINDING_A: 2}}}
+            baseline = self._baseline(root, findings)
+            with patch.object(ruff_ratchet, "ruff_findings", return_value=findings):
                 self.assertEqual(ruff_ratchet.check(baseline_path=baseline, update=False, root=root), 0)
 
     def test_new_finding_fails_without_update(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            baseline = self._baseline(root, {"src/example.py": {"F401": 1}})
-            with patch.object(ruff_ratchet, "ruff_findings", return_value={"src/example.py": {"F401": 2}}):
+            baseline = self._baseline(root, {"src/example.py": {"F401": {self.FINDING_A: 1}}})
+            findings = {"src/example.py": {"F401": {self.FINDING_A: 1, self.FINDING_B: 1}}}
+            with patch.object(ruff_ratchet, "ruff_findings", return_value=findings):
                 self.assertEqual(ruff_ratchet.check(baseline_path=baseline, update=False, root=root), 1)
 
     def test_burn_down_also_requires_an_explicit_update(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            baseline = self._baseline(root, {"src/example.py": {"F401": 2}})
-            with patch.object(ruff_ratchet, "ruff_findings", return_value={"src/example.py": {"F401": 1}}):
+            baseline = self._baseline(root, {"src/example.py": {"F401": {self.FINDING_A: 2}}})
+            findings = {"src/example.py": {"F401": {self.FINDING_A: 1}}}
+            with patch.object(ruff_ratchet, "ruff_findings", return_value=findings):
                 self.assertEqual(ruff_ratchet.check(baseline_path=baseline, update=False, root=root), 1)
 
     def test_update_writes_stably_sorted_current_findings(self):
@@ -39,14 +45,20 @@ class RuffRatchetTests(unittest.TestCase):
             root = Path(tmp)
             baseline = self._baseline(root, {})
             findings = {
-                "z.py": {"F841": 1},
-                "a.py": {"F401": 2, "E401": 1},
+                "z.py": {"F841": {self.FINDING_B: 1}},
+                "a.py": {
+                    "F401": {self.FINDING_B: 1, self.FINDING_A: 2},
+                    "E401": {self.FINDING_A: 1},
+                },
             }
             with patch.object(ruff_ratchet, "ruff_findings", return_value=findings):
                 self.assertEqual(ruff_ratchet.check(baseline_path=baseline, update=True, root=root), 0)
             self.assertEqual(json.loads(baseline.read_text(encoding="utf-8")), {
-                "a.py": {"E401": 1, "F401": 2},
-                "z.py": {"F841": 1},
+                "a.py": {
+                    "E401": {self.FINDING_A: 1},
+                    "F401": {self.FINDING_A: 2, self.FINDING_B: 1},
+                },
+                "z.py": {"F841": {self.FINDING_B: 1}},
             })
 
     def test_absolute_ruff_paths_are_normalized_to_posix_repo_paths(self):
@@ -58,11 +70,20 @@ class RuffRatchetTests(unittest.TestCase):
             version = unittest.mock.Mock(returncode=0, stdout="ruff 0.15.21\n", stderr="")
             diagnostics = unittest.mock.Mock(
                 returncode=1,
-                stdout=json.dumps([{"filename": str(filename), "code": "F401"}]),
+                stdout=json.dumps([{
+                    "filename": str(filename),
+                    "code": "F401",
+                    "message": "example finding",
+                    "location": {"row": 1, "column": 1},
+                    "end_location": {"row": 1, "column": 2},
+                }]),
                 stderr="",
             )
             with patch.object(ruff_ratchet, "_run", side_effect=[version, diagnostics]):
-                self.assertEqual(ruff_ratchet.ruff_findings(root), {"src/example.py": {"F401": 1}})
+                findings = ruff_ratchet.ruff_findings(root)
+            identities = findings["src/example.py"]["F401"]
+            self.assertEqual(sum(identities.values()), 1)
+            self.assertRegex(next(iter(identities)), r"^[0-9a-f]{64}$")
 
     def test_clean_ruff_exit_is_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -86,3 +107,69 @@ class RuffRatchetTests(unittest.TestCase):
             with patch.object(ruff_ratchet, "_run", return_value=bad_version):
                 with self.assertRaisesRegex(RuntimeError, "Expected ruff 0.15.21"):
                     ruff_ratchet.ruff_findings(root)
+
+    def test_same_count_with_a_different_concrete_finding_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def findings(source: str, message: str):
+                filename.write_text(source, encoding="utf-8")
+                version = unittest.mock.Mock(returncode=0, stdout="ruff 0.15.21\n", stderr="")
+                diagnostics = unittest.mock.Mock(
+                    returncode=1,
+                    stdout=json.dumps([{
+                        "filename": str(filename),
+                        "code": "F401",
+                        "message": message,
+                        "location": {"row": 1, "column": 8},
+                        "end_location": {"row": 1, "column": len(source)},
+                    }]),
+                    stderr="",
+                )
+                with patch.object(ruff_ratchet, "_run", side_effect=[version, diagnostics]):
+                    return ruff_ratchet.ruff_findings(root)
+
+            before = findings("import os\n", "`os` imported but unused")
+            after = findings("import sys\n", "`sys` imported but unused")
+
+            self.assertNotEqual(before, after)
+            self.assertTrue(ruff_ratchet.differences(before, after))
+
+    def test_pure_line_shift_keeps_the_same_concrete_finding_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def findings(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                version = unittest.mock.Mock(returncode=0, stdout="ruff 0.15.21\n", stderr="")
+                diagnostics = unittest.mock.Mock(
+                    returncode=1,
+                    stdout=json.dumps([{
+                        "filename": str(filename),
+                        "code": "F401",
+                        "message": "`os` imported but unused",
+                        "location": {"row": row, "column": 8},
+                        "end_location": {"row": row, "column": 10},
+                    }]),
+                    stderr="",
+                )
+                with patch.object(ruff_ratchet, "_run", side_effect=[version, diagnostics]):
+                    return ruff_ratchet.ruff_findings(root)
+
+            before = findings("import os\n", 1)
+            after = findings("\n\nimport os\n", 3)
+
+            self.assertEqual(before, after)
+            self.assertEqual(ruff_ratchet.differences(before, after), [])
+
+    def test_protected_t1_job_directly_runs_both_new_lint_gates(self):
+        workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "e2e.yml").read_text()
+        t1_body = workflow.split("  t1-renderer:\n", 1)[1].split("\n  lint-renderer:\n", 1)[0]
+
+        self.assertIn("npm run lint:main", t1_body)
+        self.assertIn("python scripts/ruff_ratchet.py", t1_body)
+        self.assertNotIn("continue-on-error:", t1_body)

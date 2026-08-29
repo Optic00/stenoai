@@ -5,7 +5,7 @@ name: e2e
 # The Windows T2 jobs remain advisory while their headless-runner behavior is
 # still being hardened.
 #
-#   t1-renderer (Ubuntu) — renderer-only with mock IPC, no Python bundle. Fast.
+#   t1-renderer (Ubuntu) - required privacy/lint ratchets plus renderer mock IPC.
 #   build-backend-macos   -> t2-macos / t2-pipeline-macos   (whisper, CPU)
 #   build-backend-windows -> t2-windows / t2-pipeline-windows (parakeet onnx, CPU)
 #     real bundled backend + mock org adapter; proves the keystone
@@ -71,6 +71,19 @@ jobs:
       - name: Scan tracked repository content for private fixtures
         run: python dev/scripts/repository_privacy_guard.py
 
+      - name: Setup Python for required lint gate
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-lint.txt
+
+      - name: Install Ruff
+        run: python -m pip install -r requirements-lint.txt
+
+      - name: Check Ruff ratchet
+        run: python scripts/ruff_ratchet.py
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -81,6 +94,10 @@ jobs:
       - name: Install Electron dependencies
         working-directory: app
         run: npm ci
+
+      - name: Lint main process
+        working-directory: app
+        run: npm run lint:main
 
       # Installs the shared libs Electron's Chromium needs on Linux, plus xvfb.
       - name: Install Linux system deps (+ xvfb)
@@ -133,10 +150,6 @@ jobs:
         working-directory: app
         run: npm run lint:renderer
 
-      - name: Lint main process
-        working-directory: app
-        run: npm run lint:main
-
       # The i18n gate. Runs as its own step so a failure names itself in the job log
       # rather than hiding inside a generic lint failure.
       #
@@ -151,13 +164,12 @@ jobs:
       - name: i18n copy inventory is current
         working-directory: app
         run: npm run i18n:inventory
-
   # ---------------------------------------------------------------------------
   # Deterministic backend/renderer gates (issue #376). These close the CI
   # enforcement gap: the backend unittest suite and the renderer tsc typecheck
   # previously ran only on the maintainer's machine, so a green PR page didn't
-  # mean the backend was green. They run on every PR but remain advisory; main
-  # branch protection currently requires T1 plus the macOS T2 and pipeline jobs.
+  # mean the backend was green. They run on every PR but remain advisory. The
+  # main-process lint and Ruff ratchet run unconditionally inside required T1.
   # ---------------------------------------------------------------------------
 
   # Runs on macos-latest (not ubuntu) on purpose: this is the platform the
@@ -188,28 +200,6 @@ jobs:
 
       - name: Run backend unit tests
         run: python -m unittest discover tests
-
-  # The ratchet is intentionally cheap: it installs only pinned Ruff and
-  # compares the selected legacy rules with the reviewed JSON baseline.
-  ruff-ratchet:
-    name: Lint (Ruff ratchet)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: requirements-lint.txt
-
-      - name: Install Ruff
-        run: python -m pip install -r requirements-lint.txt
-
-      - name: Check Ruff ratchet
-        run: python scripts/ruff_ratchet.py
 
   # tsc --noEmit over the renderer (the typecheck:renderer script already exists;
   # CI just never called it). Mirrors the lint-renderer job's node bootstrap.
