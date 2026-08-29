@@ -105,6 +105,7 @@ describe('buildTranscriptBundle conversation view', () => {
     '[1:02:60] [You] Invalid seconds in a long timestamp.',
     '[1:60:00] [You] Invalid minutes in a long timestamp.',
     'Imported preface that cannot be attributed.\n[00:00] [You] Actual turn.',
+    '[Intro: imported context]\n[00:00] [You] Actual turn.',
   ])(
     'falls back to the original transcript when a diarised source is not fully parseable',
     (body) => {
