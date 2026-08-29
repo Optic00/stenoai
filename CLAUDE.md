@@ -22,7 +22,9 @@ The app is a thin Electron shell over a PyInstaller-bundled Python CLI. There is
 - Build the bundled backend: `source venv/bin/activate && pyinstaller stenoai.spec --noconfirm`
 - Inspect CLI surface: `dist/stenoai/stenoai --help`
 - Most relevant CLI commands for debugging: `status`, `setup-check`, `list_failed`, `reprocess path/to/summary.json`, `query transcript.txt`, `pipeline filename.wav`
-- Lint: `ruff check .`
+- Ad-hoc Python lint: `ruff check .`
+- Enforced Python lint ratchet: `python -m pip install -r requirements-lint.txt && python scripts/ruff_ratchet.py`
+- Intentionally update the reviewed ratchet baseline: `python scripts/ruff_ratchet.py --update`
 - Run all tests: `python -m unittest discover tests`
 - Run a single test: `python -m unittest tests.test_config.ConfigStoragePathTests.test_set_storage_path_handles_permission_errors`
 
@@ -32,6 +34,7 @@ The app is a thin Electron shell over a PyInstaller-bundled Python CLI. There is
 - Renderer dev server (HMR, no Electron): `cd app && npm run dev:renderer`
 - Typecheck renderer: `cd app && npm run typecheck:renderer`
 - Lint renderer: `cd app && npm run lint:renderer`
+- Lint Electron main process: `cd app && npm run lint:main`
 - Format renderer: `cd app && npm run format:renderer`
 - Build DMG (local, for testing): `cd app && npm run build`
 

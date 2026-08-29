@@ -1,0 +1,26 @@
+{
+  "simple_recorder.py": {
+    "F401": 4,
+    "F541": 6,
+    "F841": 6
+  },
+  "tests/test_default_template_report.py": {
+    "E401": 1,
+    "F401": 2
+  },
+  "tests/test_report_store.py": {
+    "E401": 1
+  },
+  "tests/test_report_versions_cli.py": {
+    "E401": 1,
+    "E741": 1
+  },
+  "tests/test_reports.py": {
+    "E401": 1,
+    "F401": 1
+  },
+  "tests/test_summarizer_map_reduce.py": {
+    "F401": 3,
+    "F841": 2
+  }
+}
