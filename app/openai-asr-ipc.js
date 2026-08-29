@@ -14,7 +14,8 @@ function registerOpenAiAsrIpc({
 }) {
   ipcMain.handle('set-openai-asr-config', async (_event, cfg) => {
     const args = ['set-openai-asr-config'];
-    if (cfg && cfg.api_url !== undefined) {
+    const updatesEndpoint = cfg && cfg.api_url !== undefined;
+    if (updatesEndpoint) {
       const apiUrl = normalizeOpenAiAsrApiUrl(cfg.api_url);
       if (!apiUrl) {
         return { success: false, error: 'OpenAI ASR endpoint is invalid' };
@@ -24,7 +25,13 @@ function registerOpenAiAsrIpc({
     if (cfg && cfg.model !== undefined) args.push('--model', cfg.model);
 
     try {
-      await migrateLegacyOpenAiAsrApiKey();
+      const migrated = await migrateLegacyOpenAiAsrApiKey();
+      // A surviving plaintext snapshot is bound to its old endpoint. Do not
+      // commit a new endpoint while cleanup failed, or a later migration
+      // could associate that credential with the replacement origin.
+      if (updatesEndpoint && !migrated) {
+        return { success: false, error: 'OpenAI ASR credential migration is incomplete' };
+      }
       const result = await runPythonScript('simple_recorder.py', args, true);
       const jsonData = JSON.parse(result.trim());
       jsonData.api_key_set = hasOpenAiAsrKey();

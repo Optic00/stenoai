@@ -81,6 +81,7 @@ class _FakeOpener:
                 "file_size": stream.file_size,
                 "prefix": stream.prefix_bytes,
                 "timeout": timeout,
+                "url": request.full_url,
             }
         )
         response = next(self.responses)
@@ -212,13 +213,19 @@ def _write_stereo_burst_wav(path: Path, frame_count: int, burst_start: int, burs
 class OpenAiAsrTests(unittest.TestCase):
     def setUp(self):
         self._previous_origin = os.environ.get("STENOAI_OAI_API_ORIGIN")
+        self._previous_url = os.environ.get("STENOAI_OAI_API_URL")
         os.environ["STENOAI_OAI_API_ORIGIN"] = "https://api.example"
+        os.environ["STENOAI_OAI_API_URL"] = "https://api.example/v1"
 
     def tearDown(self):
         if self._previous_origin is None:
             os.environ.pop("STENOAI_OAI_API_ORIGIN", None)
         else:
             os.environ["STENOAI_OAI_API_ORIGIN"] = self._previous_origin
+        if self._previous_url is None:
+            os.environ.pop("STENOAI_OAI_API_URL", None)
+        else:
+            os.environ["STENOAI_OAI_API_URL"] = self._previous_url
 
     def test_loopback_http_upload_bypasses_a_configured_proxy(self):
         target_hits = []
@@ -263,7 +270,10 @@ class OpenAiAsrTests(unittest.TestCase):
                 _write_pcm_wav(audio, frame_count=16000)
                 with patch.dict(
                     os.environ,
-                    {"STENOAI_OAI_API_ORIGIN": f"http://127.0.0.1:{target.server_port}"},
+                    {
+                        "STENOAI_OAI_API_ORIGIN": f"http://127.0.0.1:{target.server_port}",
+                        "STENOAI_OAI_API_URL": f"http://127.0.0.1:{target.server_port}/v1",
+                    },
                 ), patch(
                     "urllib.request.getproxies",
                     return_value={"http": f"http://127.0.0.1:{proxy.server_port}"},
@@ -294,7 +304,8 @@ class OpenAiAsrTests(unittest.TestCase):
                     opener = _FakeOpener([_json_response({"text": "local", "segments": []})])
                     origin = endpoint.split("/v1", 1)[0]
                     with patch.dict(
-                        os.environ, {"STENOAI_OAI_API_ORIGIN": origin},
+                        os.environ,
+                        {"STENOAI_OAI_API_ORIGIN": origin, "STENOAI_OAI_API_URL": endpoint},
                     ), patch("urllib.request.build_opener", return_value=opener) as build:
                         transcriber._run_openai_asr(audio, language="en")
                     proxy_handlers = [
@@ -335,7 +346,9 @@ class OpenAiAsrTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             audio = Path(tmp_dir) / "short.wav"
             _write_pcm_wav(audio, frame_count=16000)
-            with patch("urllib.request.build_opener", return_value=opener):
+            with patch.dict(
+                os.environ, {"STENOAI_OAI_API_URL": "https://api.example/v1"},
+            ), patch("urllib.request.build_opener", return_value=opener):
                 result = transcriber._run_openai_asr(audio, language="en")
         self.assertEqual(result["text"], "safe")
         self.assertEqual(len(opener.requests), 1)
@@ -1941,9 +1954,38 @@ class OpenAiAsrTests(unittest.TestCase):
 
                 transcriber = _build_transcriber()
                 transcriber._openai_asr_api_url = unsafe_url
-                with patch("urllib.request.build_opener") as build_opener:
-                    with self.assertRaisesRegex(RuntimeError, "unsafe or invalid"):
+                with patch.dict(
+                    os.environ, {"STENOAI_OAI_API_URL": unsafe_url},
+                ), patch("urllib.request.build_opener") as build_opener:
+                    with self.assertRaisesRegex(RuntimeError, "endpoint snapshot is unsafe or invalid"):
                         transcriber._run_openai_asr(Path("unused.wav"), language="en")
+                build_opener.assert_not_called()
+
+    def test_node_canonical_punycode_snapshot_is_used_without_python_idna_rebinding(self):
+        transcriber = _build_transcriber()
+        # A stale Python config value would map this host using IDNA2003. The
+        # Node-owned snapshot is ASCII and must be the only request endpoint.
+        transcriber._openai_asr_api_url = "https://faß.de/v1"
+        opener = _FakeOpener([_json_response({"text": "safe", "segments": []})])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch.dict(os.environ, {
+                "STENOAI_OAI_API_URL": "https://xn--fa-hia.de/v1",
+                "STENOAI_OAI_API_ORIGIN": "https://xn--fa-hia.de",
+            }), patch("urllib.request.build_opener", return_value=opener):
+                result = transcriber._run_openai_asr(audio, language="en")
+        self.assertEqual(result["text"], "safe")
+        self.assertEqual(opener.requests[0]["url"], "https://xn--fa-hia.de/v1/audio/transcriptions")
+
+    def test_endpoint_snapshot_rejects_bare_query_or_fragment_before_network(self):
+        transcriber = _build_transcriber()
+        for endpoint in ("https://api.example/v1?", "https://api.example/v1#"):
+            with self.subTest(endpoint=endpoint), patch.dict(
+                os.environ, {"STENOAI_OAI_API_URL": endpoint},
+            ), patch("urllib.request.build_opener") as build_opener:
+                with self.assertRaisesRegex(RuntimeError, "endpoint snapshot is unsafe or invalid"):
+                    transcriber._run_openai_asr(Path("unused.wav"), language="en")
                 build_opener.assert_not_called()
 
     def test_language_normalization(self):

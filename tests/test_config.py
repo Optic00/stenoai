@@ -465,6 +465,8 @@ class ConfigOpenAiAsrTests(unittest.TestCase):
                 "?sig=secret",
                 "?unknown-provider-field=secret",
                 "#credential-fragment",
+                "?",
+                "#",
             ):
                 with self.subTest(suffix=suffix):
                     self.assertFalse(config.set_openai_asr_api_url(prior + suffix))

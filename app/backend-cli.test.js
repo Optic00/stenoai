@@ -79,6 +79,8 @@ test('spawn lets a caller override PYTHONUNBUFFERED itself', () => {
 test('case-insensitive stripping matches Windows environment semantics', () => {
   const variants = [
     'STENOAI_OAI_API_KEY',
+    'STENOAI_OAI_API_ORIGIN',
+    'STENOAI_OAI_API_URL',
     'stenoai_oai_api_key',
     'StEnOaI_OaI_ApI_KeY',
   ];
@@ -90,6 +92,10 @@ test('case-insensitive stripping matches Windows environment semantics', () => {
     const inherited = spawnCalls[0][2].env;
     assert.strictEqual(
       Object.keys(inherited).some((name) => name.toUpperCase() === 'STENOAI_OAI_API_KEY'),
+      false,
+    );
+    assert.strictEqual(
+      Object.keys(inherited).some((name) => name.toUpperCase() === 'STENOAI_OAI_API_URL'),
       false,
     );
 
@@ -109,10 +115,12 @@ test('environment helper strips lower and mixed-case keys without mutating input
     stenoai_oai_api_key: 'lower-secret',
     StEnOaI_OaI_ApI_KeY: 'mixed-secret',
     stenoai_oai_api_origin: 'https://provider.example',
+    StEnOaI_OaI_ApI_Url: 'https://provider.example/v1',
   };
   assert.deepStrictEqual(withoutOpenAiAsrKey(input), { PATH: '/bin' });
   assert.strictEqual(input.stenoai_oai_api_key, 'lower-secret');
   assert.strictEqual(input.stenoai_oai_api_origin, 'https://provider.example');
+  assert.strictEqual(input.StEnOaI_OaI_ApI_Url, 'https://provider.example/v1');
 });
 
 test('spawn handles the 2-arg (command, options) form', () => {

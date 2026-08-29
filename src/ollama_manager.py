@@ -119,6 +119,7 @@ def get_ollama_env() -> dict:
         if name.upper() not in {
             "STENOAI_OAI_API_KEY",
             "STENOAI_OAI_API_ORIGIN",
+            "STENOAI_OAI_API_URL",
         }
     }
     # The cloud-ASR credential is injected only so the short-lived backend can

@@ -4,12 +4,12 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const { registerOpenAiAsrIpc } = require('./openai-asr-ipc');
 
-function harness() {
+function harness({ migrationResult = true } = {}) {
   const handlers = {};
   const calls = { migrate: 0, python: [] };
   registerOpenAiAsrIpc({
     ipcMain: { handle: (channel, handler) => { handlers[channel] = handler; } },
-    migrateLegacyOpenAiAsrApiKey: async () => { calls.migrate += 1; },
+    migrateLegacyOpenAiAsrApiKey: async () => { calls.migrate += 1; return migrationResult; },
     runPythonScript: async (script, args, silent) => {
       calls.python.push({ script, args, silent });
       return '{"success":true}';
@@ -49,4 +49,31 @@ test('OpenAI ASR endpoint argv uses a safe canonical URL and retains /v1 paths',
       silent: true,
     }]);
   }
+});
+
+test('failed legacy cleanup blocks an endpoint change before config writer spawn', async () => {
+  const { handlers, calls } = harness({ migrationResult: false });
+  const result = await handlers['set-openai-asr-config']({}, {
+    api_url: 'https://replacement.example/v1',
+  });
+
+  assert.deepStrictEqual(result, {
+    success: false,
+    error: 'OpenAI ASR credential migration is incomplete',
+  });
+  assert.strictEqual(calls.migrate, 1);
+  assert.deepStrictEqual(calls.python, [],
+    'a later migration must not bind a surviving legacy key to the new origin');
+});
+
+test('failed legacy cleanup does not block a model-only configuration update', async () => {
+  const { handlers, calls } = harness({ migrationResult: false });
+  const result = await handlers['set-openai-asr-config']({}, { model: 'whisper-large-v3' });
+
+  assert.deepStrictEqual(result, { success: true, api_key_set: false });
+  assert.deepStrictEqual(calls.python, [{
+    script: 'simple_recorder.py',
+    args: ['set-openai-asr-config', '--model', 'whisper-large-v3'],
+    silent: true,
+  }]);
 });

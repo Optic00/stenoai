@@ -57,8 +57,9 @@ const {
   legacyKeyMigrationAction,
   loadEncryptedKeyForOrigin,
   markEncryptedKeyClearedAtomically,
-  normalizeOpenAiAsrOrigin,
   readLegacyCredentialSnapshot,
+  readOpenAiAsrConfigSnapshot,
+  readOpenAiAsrEndpointSnapshot,
   saveEncryptedKeyAtomically,
 } = require('./openai-asr-key-store');
 const { registerOpenAiAsrIpc } = require('./openai-asr-ipc');
@@ -8934,19 +8935,10 @@ function getOpenAiAsrKeyPath() {
 // default-port elision), so equivalent endpoints compare equal while a host,
 // scheme, or port change cannot reuse the old bearer token.
 function getOpenAiAsrEndpointOrigin() {
-  try {
-    const configPath = path.join(getUserDataDir(), 'config.json');
-    let apiUrl = 'https://api.openai.com/v1';
-    if (fs.existsSync(configPath)) {
-      const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-      if (cfg && Object.prototype.hasOwnProperty.call(cfg, 'openai_asr_api_url')) {
-        apiUrl = cfg.openai_asr_api_url;
-      }
-    }
-    return normalizeOpenAiAsrOrigin(apiUrl);
-  } catch (_) {
-    return null;
-  }
+  return readOpenAiAsrEndpointSnapshot({
+    fs,
+    configPath: path.join(getUserDataDir(), 'config.json'),
+  })?.origin || null;
 }
 
 function isOpenAiAsrKeyCleared() {
@@ -9012,8 +9004,7 @@ function readLegacyOpenAiAsrCredential() {
   });
 }
 
-function secureLegacyOpenAiAsrApiKey() {
-  const legacy = readLegacyOpenAiAsrCredential();
+function secureLegacyOpenAiAsrApiKey(legacy = readLegacyOpenAiAsrCredential()) {
   if (!legacy || !legacy.key || !legacy.origin) return false;
   const stored = loadOpenAiAsrKey(legacy.origin);
   const action = legacyKeyMigrationAction({
@@ -9031,8 +9022,7 @@ function secureLegacyOpenAiAsrApiKey() {
   }
 }
 
-async function migrateLegacyOpenAiAsrApiKey() {
-  const legacy = readLegacyOpenAiAsrCredential();
+async function migrateLegacyOpenAiAsrApiKey(legacy = readLegacyOpenAiAsrCredential()) {
   if (!legacy) return true;
   const removeLegacyKey = async () => {
     try {
@@ -9103,13 +9093,23 @@ function getTranscriptionEnv() {
   // A legacy plaintext key must be secured before this first cloud job. The
   // deletion itself is async (via the locked Python config writer), but this
   // sync path can safely use the encrypted copy immediately.
-  secureLegacyOpenAiAsrApiKey();
-  void migrateLegacyOpenAiAsrApiKey();
-  const origin = getOpenAiAsrEndpointOrigin();
-  const credential = origin ? loadOpenAiAsrCredential(origin) : null;
+  const configSnapshot = readOpenAiAsrConfigSnapshot({
+    fs,
+    configPath: path.join(getUserDataDir(), 'config.json'),
+  });
+  // Endpoint, origin, and any legacy credential come from one direct config
+  // read. Do not let the asynchronous cleanup read a replacement endpoint.
+  secureLegacyOpenAiAsrApiKey(configSnapshot?.legacy);
+  void migrateLegacyOpenAiAsrApiKey(configSnapshot?.legacy);
+  const endpoint = configSnapshot?.endpoint || null;
+  const credential = endpoint ? loadOpenAiAsrCredential(endpoint.origin) : null;
   if (credential) {
     env.STENOAI_OAI_API_KEY = credential.key;
     env.STENOAI_OAI_API_ORIGIN = credential.origin;
+    // This WHATWG-canonical ASCII URL and the origin above come from one
+    // config snapshot. Python validates it again without re-reading a mutable
+    // endpoint while the bearer credential is in scope.
+    env.STENOAI_OAI_API_URL = endpoint.apiUrl;
   }
   return env;
 }

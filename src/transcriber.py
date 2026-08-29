@@ -180,6 +180,7 @@ OPENAI_ASR_MAX_API_KEY_LENGTH = 4096
 _OPENAI_ASR_CREDENTIAL_ENV_NAMES = {
     "STENOAI_OAI_API_KEY",
     "STENOAI_OAI_API_ORIGIN",
+    "STENOAI_OAI_API_URL",
 }
 
 _OPENAI_ASR_UPLOAD_FORMATS = {
@@ -2191,15 +2192,23 @@ class WhisperTranscriber:
         import uuid
         import wave
 
-        api_url = getattr(self, "_openai_asr_api_url", "")
+        # Electron supplies one WHATWG-canonical ASCII URL together with the
+        # origin-bound key. Never re-read the mutable config endpoint here,
+        # otherwise a config TOCTOU could direct an already-decrypted bearer
+        # credential to a different origin. A non-ASCII value was not emitted
+        # by Node's URL serialiser and could trigger a different IDNA mapping.
+        api_url = os.environ.get("STENOAI_OAI_API_URL", "")
         api_key = getattr(self, "_openai_asr_api_key", "")
         model = getattr(self, "_openai_asr_model", "") or "whisper-1"
 
         from src.config import _normalise_openai_asr_api_url, _openai_asr_api_origin
 
-        api_url = _normalise_openai_asr_api_url(api_url)
-        if not api_url:
-            raise RuntimeError("openai-asr: configured endpoint is unsafe or invalid")
+        if not api_url or not api_url.isascii():
+            raise RuntimeError("openai-asr: endpoint snapshot is unsafe or invalid")
+        canonical_api_url = _normalise_openai_asr_api_url(api_url)
+        if not canonical_api_url or canonical_api_url != api_url:
+            raise RuntimeError("openai-asr: endpoint snapshot is unsafe or invalid")
+        api_url = canonical_api_url
         api_url = api_url.rstrip("/")
         endpoint_origin = _openai_asr_api_origin(api_url)
         credential_origin = os.environ.get("STENOAI_OAI_API_ORIGIN", "")
@@ -2218,9 +2227,6 @@ class WhisperTranscriber:
             )
         api_key = _validate_openai_asr_api_key(api_key)
         if not endpoint_origin or credential_origin != endpoint_origin:
-            # The config is deliberately re-read in this subprocess.  If it
-            # changed after Electron's safeStorage snapshot, never reuse the
-            # bearer token at this different endpoint.
             raise RuntimeError("openai-asr: credential origin does not match endpoint")
 
         boundary = uuid.uuid4().hex

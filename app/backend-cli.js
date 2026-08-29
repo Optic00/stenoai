@@ -21,12 +21,14 @@ const { spawn: _spawnRaw } = require('child_process');
 
 const OPENAI_ASR_KEY_ENV = 'STENOAI_OAI_API_KEY';
 const OPENAI_ASR_ORIGIN_ENV = 'STENOAI_OAI_API_ORIGIN';
+const OPENAI_ASR_URL_ENV = 'STENOAI_OAI_API_URL';
 
 function withoutOpenAiAsrKey(env) {
   return Object.fromEntries(
     Object.entries(env || {}).filter(([name]) => ![
       OPENAI_ASR_KEY_ENV,
       OPENAI_ASR_ORIGIN_ENV,
+      OPENAI_ASR_URL_ENV,
     ].includes(name.toUpperCase())),
   );
 }

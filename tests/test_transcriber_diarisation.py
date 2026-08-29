@@ -2001,6 +2001,7 @@ class RunStenoDiarizeTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "STENOAI_OAI_API_KEY": "parent-key",
             "stenoai_oai_api_origin": "https://parent.example",
+            "STENOAI_OAI_API_URL": "https://parent.example/v1",
         }), patch(
             "src.transcriber._resolve_steno_diarize",
             return_value="/fake/steno-diarize",
@@ -2017,7 +2018,7 @@ class RunStenoDiarizeTests(unittest.TestCase):
         env = popen.call_args.kwargs["env"]
         self.assertFalse(any(
             name.upper() in {
-                "STENOAI_OAI_API_KEY", "STENOAI_OAI_API_ORIGIN",
+                "STENOAI_OAI_API_KEY", "STENOAI_OAI_API_ORIGIN", "STENOAI_OAI_API_URL",
             }
             for name in env
         ))

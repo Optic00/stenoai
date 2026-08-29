@@ -14,6 +14,7 @@ class GetOllamaEnvMLXMetalPathTests(unittest.TestCase):
             {
                 "stenoai_oai_api_key": "private-asr-test-key",
                 "StenoAi_Oai_Api_Origin": "https://private-asr.example",
+                "STENOAI_OAI_API_URL": "https://private-asr.example/v1",
             },
             clear=False,
         ), patch(
@@ -24,6 +25,7 @@ class GetOllamaEnvMLXMetalPathTests(unittest.TestCase):
         names = {name.upper() for name in env}
         self.assertNotIn("STENOAI_OAI_API_KEY", names)
         self.assertNotIn("STENOAI_OAI_API_ORIGIN", names)
+        self.assertNotIn("STENOAI_OAI_API_URL", names)
 
     def test_does_not_set_stale_flat_mlx_metal_path_on_macos(self):
         # The bundled Ollama (v0.31.1+) ships its Metal library under

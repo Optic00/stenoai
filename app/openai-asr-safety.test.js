@@ -14,6 +14,8 @@ const {
   markEncryptedKeyClearedAtomically,
   normalizeOpenAiAsrApiUrl,
   readLegacyCredentialSnapshot,
+  readOpenAiAsrConfigSnapshot,
+  readOpenAiAsrEndpointSnapshot,
   saveEncryptedKeyAtomically,
 } = require('./openai-asr-key-store');
 
@@ -36,6 +38,7 @@ test('transcription launches pass the credential origin alongside the key', () =
   );
   assert.match(launch, /STENOAI_OAI_API_KEY/);
   assert.match(launch, /STENOAI_OAI_API_ORIGIN/);
+  assert.match(launch, /STENOAI_OAI_API_URL/);
   assert.match(launch, /loadOpenAiAsrCredential/);
 });
 
@@ -127,14 +130,71 @@ test('OpenAI ASR URL canonicalisation rejects secret-bearing URLs before a CLI a
     normalizeOpenAiAsrApiUrl('http://[::1]:9000/v1/'),
     'http://[::1]:9000/v1',
   );
+  assert.strictEqual(
+    normalizeOpenAiAsrApiUrl('https://faß.de/v1'),
+    'https://xn--fa-hia.de/v1',
+  );
   for (const unsafe of [
     'https://user:secret@provider.example/v1',
     'https://provider.example/v1?sig=secret',
     'https://provider.example/v1#secret',
+    'https://provider.example/v1?',
+    'https://provider.example/v1#',
     'http://provider.example/v1',
   ]) {
     assert.strictEqual(normalizeOpenAiAsrApiUrl(unsafe), null);
   }
+});
+
+test('transcription endpoint snapshot derives canonical URL and origin from one read', () => {
+  const configPath = '/config.json';
+  let reads = 0;
+  const fsImpl = {
+    existsSync: (target) => target === configPath,
+    readFileSync: () => {
+      reads += 1;
+      return JSON.stringify(reads === 1 ? {
+        openai_asr_api_url: 'https://faß.de/v1',
+      } : {
+        openai_asr_api_url: 'https://replacement.example/v1',
+      });
+    },
+  };
+  assert.deepStrictEqual(readOpenAiAsrEndpointSnapshot({ fs: fsImpl, configPath }), {
+    apiUrl: 'https://xn--fa-hia.de/v1',
+    origin: 'https://xn--fa-hia.de',
+  });
+  assert.strictEqual(reads, 1);
+});
+
+test('transcription takes its legacy cleanup and endpoint from one config snapshot', () => {
+  const configPath = '/config.json';
+  let reads = 0;
+  const fsImpl = {
+    existsSync: (target) => target === configPath,
+    readFileSync: () => {
+      reads += 1;
+      return JSON.stringify(reads === 1 ? {
+        openai_asr_api_key: 'legacy-key',
+        openai_asr_api_url: 'https://faß.de/v1',
+      } : {
+        openai_asr_api_key: 'replacement-key',
+        openai_asr_api_url: 'https://replacement.example/v1',
+      });
+    },
+  };
+  assert.deepStrictEqual(readOpenAiAsrConfigSnapshot({ fs: fsImpl, configPath }), {
+    endpoint: {
+      apiUrl: 'https://xn--fa-hia.de/v1',
+      origin: 'https://xn--fa-hia.de',
+    },
+    legacy: {
+      key: 'legacy-key',
+      origin: 'https://xn--fa-hia.de',
+      snapshotDigest: legacyCredentialSnapshotDigest('legacy-key', 'https://faß.de/v1'),
+    },
+  });
+  assert.strictEqual(reads, 1);
 });
 
 test('legacy snapshot digest preserves the raw URL value across migration edge cases', () => {
@@ -186,7 +246,7 @@ test('legacy snapshots digest raw keys but expose only valid normalized credenti
 
 test('main sends only the legacy snapshot digest to the cleanup CLI', () => {
   const migration = source.slice(
-    source.indexOf('async function migrateLegacyOpenAiAsrApiKey()'),
+    source.indexOf('async function migrateLegacyOpenAiAsrApiKey('),
     source.indexOf('// Build the env additions a Python AI-driven subprocess needs.'),
   );
   assert.match(migration, /STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST: legacy\.snapshotDigest/);

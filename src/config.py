@@ -98,8 +98,15 @@ def _normalise_openai_asr_api_url(value: object) -> Optional[str]:
     """Return a safe endpoint or None; legacy config must fail closed."""
     if not isinstance(value, str) or not value.strip():
         return None
+    # urlsplit() represents a bare trailing '?' or '#' exactly like no query
+    # or fragment at all. Electron rejects those delimiters before argv is
+    # built, so reject them here as well rather than accepting a divergent
+    # direct-CLI configuration path.
+    raw_value = value.strip()
+    if "?" in raw_value or "#" in raw_value:
+        return None
     try:
-        parsed = urllib.parse.urlsplit(value.strip())
+        parsed = urllib.parse.urlsplit(raw_value)
     except ValueError:
         return None
     scheme = parsed.scheme.lower()

@@ -45,6 +45,44 @@ function normalizeOpenAiAsrOrigin(apiUrl) {
   return normalized ? new URL(normalized).origin : null;
 }
 
+/**
+ * Read one config-file snapshot and derive the exact endpoint pair that a
+ * transcription job may use. Keep the canonical URL and origin together:
+ * reading them separately would let a config change bind an origin-scoped
+ * credential to the wrong request URL.
+ */
+function readOpenAiAsrConfigSnapshot({ fs, configPath }) {
+  try {
+    let apiUrl = OPENAI_ASR_DEFAULT_URL;
+    let config = null;
+    if (fs.existsSync(configPath)) {
+      config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      if (config && Object.prototype.hasOwnProperty.call(config, 'openai_asr_api_url')) {
+        apiUrl = config.openai_asr_api_url;
+      }
+    }
+    const canonicalUrl = normalizeOpenAiAsrApiUrl(apiUrl);
+    const endpoint = canonicalUrl
+      ? { apiUrl: canonicalUrl, origin: new URL(canonicalUrl).origin }
+      : null;
+    const rawKey = config && typeof config.openai_asr_api_key === 'string'
+      ? config.openai_asr_api_key
+      : null;
+    const legacy = rawKey === null || rawKey.length === 0 ? null : {
+      key: isValidOpenAiAsrApiKey(rawKey.trim()) ? rawKey.trim() : null,
+      origin: endpoint?.origin || null,
+      snapshotDigest: legacyCredentialSnapshotDigest(rawKey, apiUrl),
+    };
+    return { endpoint, legacy };
+  } catch (_) {
+    return null;
+  }
+}
+
+function readOpenAiAsrEndpointSnapshot({ fs, configPath }) {
+  return readOpenAiAsrConfigSnapshot({ fs, configPath })?.endpoint || null;
+}
+
 function legacyCredentialSnapshotDigest(rawKey, apiUrl) {
   // Match src.config._legacy_openai_asr_snapshot_digest exactly. The digest
   // covers the raw on-disk values, while ``key`` below is separately
@@ -77,32 +115,7 @@ function legacyCredentialSnapshotDigest(rawKey, apiUrl) {
 }
 
 function readLegacyCredentialSnapshot({ fs, configPath }) {
-  try {
-    if (!fs.existsSync(configPath)) return null;
-    // This single read is the authority for both fields. A later endpoint
-    // change must never bind this snapshot's plaintext key to another origin.
-    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    const rawKey = config && typeof config.openai_asr_api_key === 'string'
-      ? config.openai_asr_api_key
-      : null;
-    // Every non-empty raw string gets a CAS snapshot so invalid legacy
-    // plaintext can still be removed. Only the separately normalised and
-    // printable-ASCII value may ever reach safeStorage.
-    if (rawKey === null || rawKey.length === 0) return null;
-    const normalisedKey = rawKey.trim();
-    const key = isValidOpenAiAsrApiKey(normalisedKey) ? normalisedKey : null;
-    const apiUrl = config && Object.prototype.hasOwnProperty.call(config, 'openai_asr_api_url')
-      ? config.openai_asr_api_url
-      : OPENAI_ASR_DEFAULT_URL;
-    const origin = normalizeOpenAiAsrOrigin(apiUrl);
-    return {
-      key,
-      origin,
-      snapshotDigest: legacyCredentialSnapshotDigest(rawKey, apiUrl),
-    };
-  } catch (_) {
-    return null;
-  }
+  return readOpenAiAsrConfigSnapshot({ fs, configPath })?.legacy || null;
 }
 
 function clearedMarkerPath(keyPath) {
@@ -298,6 +311,8 @@ module.exports = {
   markEncryptedKeyClearedAtomically,
   normalizeOpenAiAsrApiUrl,
   normalizeOpenAiAsrOrigin,
+  readOpenAiAsrConfigSnapshot,
+  readOpenAiAsrEndpointSnapshot,
   readLegacyCredentialSnapshot,
   saveEncryptedKeyAtomically,
 };

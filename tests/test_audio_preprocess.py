@@ -66,6 +66,7 @@ class PreprocessAudioTests(unittest.TestCase):
             with patch.dict(os.environ, {
                 "stenoai_oai_api_key": "private-key",
                 "StEnOaI_OaI_ApI_OrIgIn": "https://private.example",
+                "STENOAI_OAI_API_URL": "https://private.example/v1",
             }), patch.object(
                 transcriber_mod, "_resolve_ffmpeg", return_value="/fake/ffmpeg"
             ), patch.object(
@@ -77,7 +78,7 @@ class PreprocessAudioTests(unittest.TestCase):
 
         self.assertFalse(any(
             name.upper() in {
-                "STENOAI_OAI_API_KEY", "STENOAI_OAI_API_ORIGIN",
+                "STENOAI_OAI_API_KEY", "STENOAI_OAI_API_ORIGIN", "STENOAI_OAI_API_URL",
             }
             for name in captured_env
         ))
