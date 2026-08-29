@@ -48,6 +48,16 @@ def _relative_posix_path(filename: str, root: Path) -> str:
         raise ValueError(f"Ruff reported a path outside the repository: {filename}") from error
 
 
+def _stable_ast_dump(node: ast.AST) -> str:
+    """Serialize an AST identically on Python 3.11 and newer runtimes."""
+    try:
+        return ast.dump(node, include_attributes=False, show_empty=True)
+    except TypeError:
+        # Python 3.11 and 3.12 always include empty fields. Python 3.13 added
+        # show_empty and changed the default to false.
+        return ast.dump(node, include_attributes=False)
+
+
 def _semantic_source_identity(source_span: str) -> str:
     """Normalize parseable Ruff spans without erasing their Python semantics."""
     for mode in ("eval", "exec"):
@@ -55,7 +65,7 @@ def _semantic_source_identity(source_span: str) -> str:
             tree = ast.parse(source_span, mode=mode)
         except (SyntaxError, ValueError):
             continue
-        return f"ast:{ast.dump(tree, include_attributes=False)}"
+        return f"ast:{_stable_ast_dump(tree)}"
     return f"text:{source_span}"
 
 
@@ -71,8 +81,8 @@ def _definition_identity(
         header = [node.args, node.decorator_list, node.returns, node.type_comment]
     serialized = json.dumps(
         [
-            ast.dump(value, include_attributes=False) if isinstance(value, ast.AST)
-            else [ast.dump(item, include_attributes=False) for item in value]
+            _stable_ast_dump(value) if isinstance(value, ast.AST)
+            else [_stable_ast_dump(item) for item in value]
             if isinstance(value, list)
             else value
             for value in header
@@ -111,7 +121,7 @@ def _scope_context(tree: ast.AST, row: int) -> list[str]:
             else:
                 continue
             test_identity = hashlib.sha256(
-                ast.dump(node.test, include_attributes=False).encode("utf-8")
+                _stable_ast_dump(node.test).encode("utf-8")
             ).hexdigest()
             contexts.append(
                 (node.lineno, node.col_offset, -end_lineno, f"if:{test_identity}:{arm}")

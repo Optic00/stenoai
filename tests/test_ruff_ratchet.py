@@ -1,3 +1,4 @@
+import ast
 import json
 import tempfile
 import unittest
@@ -346,6 +347,24 @@ class RuffRatchetTests(unittest.TestCase):
 
             self.assertNotEqual(before, after)
             self.assertTrue(ruff_ratchet.differences(before, after))
+
+    def test_ast_serialization_is_independent_of_runtime_dump_defaults(self):
+        def complete_dump(node: ast.AST) -> str:
+            try:
+                return ast.dump(node, include_attributes=False, show_empty=True)
+            except TypeError:
+                # Python 3.11 and 3.12 always include empty fields and do not
+                # expose the show_empty switch added in Python 3.13.
+                return ast.dump(node, include_attributes=False)
+
+        module = ast.parse("import os, sys")
+        function_args = ast.parse("def example():\n    pass\n").body[0].args
+
+        self.assertEqual(ruff_ratchet._stable_ast_dump(module), complete_dump(module))
+        self.assertEqual(
+            ruff_ratchet._stable_ast_dump(function_args),
+            complete_dump(function_args),
+        )
 
     def test_protected_t1_job_directly_runs_both_new_lint_gates(self):
         workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "e2e.yml").read_text()
