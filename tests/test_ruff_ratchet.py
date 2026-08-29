@@ -236,6 +236,117 @@ class RuffRatchetTests(unittest.TestCase):
             self.assertEqual(before, after)
             self.assertEqual(ruff_ratchet.differences(before, after), [])
 
+    def test_spacing_change_inside_e401_span_keeps_the_same_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def findings(source: str):
+                filename.write_text(source, encoding="utf-8")
+                line = source.rstrip("\n")
+                version = unittest.mock.Mock(returncode=0, stdout="ruff 0.15.21\n", stderr="")
+                diagnostics = unittest.mock.Mock(
+                    returncode=1,
+                    stdout=json.dumps([{
+                        "filename": str(filename),
+                        "code": "E401",
+                        "message": "Multiple imports on one line",
+                        "location": {"row": 1, "column": 1},
+                        "end_location": {"row": 1, "column": len(line) + 1},
+                    }]),
+                    stderr="",
+                )
+                with patch.object(ruff_ratchet, "_run", side_effect=[version, diagnostics]):
+                    return ruff_ratchet.ruff_findings(root)
+
+            before = findings("import os,sys\n")
+            after = findings("import os, sys\n")
+
+            self.assertEqual(before, after)
+            self.assertEqual(ruff_ratchet.differences(before, after), [])
+
+    def test_quote_change_inside_f541_span_keeps_the_same_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def findings(source: str):
+                filename.write_text(source, encoding="utf-8")
+                line = source.splitlines()[1]
+                version = unittest.mock.Mock(returncode=0, stdout="ruff 0.15.21\n", stderr="")
+                diagnostics = unittest.mock.Mock(
+                    returncode=1,
+                    stdout=json.dumps([{
+                        "filename": str(filename),
+                        "code": "F541",
+                        "message": "f-string without any placeholders",
+                        "location": {"row": 2, "column": line.index("f") + 1},
+                        "end_location": {"row": 2, "column": line.rindex(")") + 1},
+                    }]),
+                    stderr="",
+                )
+                with patch.object(ruff_ratchet, "_run", side_effect=[version, diagnostics]):
+                    return ruff_ratchet.ruff_findings(root)
+
+            before = findings('def f():\n    print(f"constant")\n')
+            after = findings("def f():\n    print(f'constant')\n")
+
+            self.assertEqual(before, after)
+            self.assertEqual(ruff_ratchet.differences(before, after), [])
+
+    def test_same_named_platform_scopes_have_distinct_identities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def findings(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                version = unittest.mock.Mock(returncode=0, stdout="ruff 0.15.21\n", stderr="")
+                diagnostics = unittest.mock.Mock(
+                    returncode=1,
+                    stdout=json.dumps([{
+                        "filename": str(filename),
+                        "code": "F841",
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 13},
+                        "end_location": {"row": row, "column": 19},
+                    }]),
+                    stderr="",
+                )
+                with patch.object(ruff_ratchet, "_run", side_effect=[version, diagnostics]):
+                    return ruff_ratchet.ruff_findings(root)
+
+            before = findings(
+                "import sys\n"
+                "if sys.platform == 'win32':\n"
+                "    class Backend:\n"
+                "        def start(self):\n"
+                "            unused = 1\n"
+                "else:\n"
+                "    class Backend:\n"
+                "        def start(self):\n"
+                "            return 1\n",
+                5,
+            )
+            after = findings(
+                "import sys\n"
+                "if sys.platform == 'win32':\n"
+                "    class Backend:\n"
+                "        def start(self):\n"
+                "            return 1\n"
+                "else:\n"
+                "    class Backend:\n"
+                "        def start(self):\n"
+                "            unused = 1\n",
+                9,
+            )
+
+            self.assertNotEqual(before, after)
+            self.assertTrue(ruff_ratchet.differences(before, after))
+
     def test_protected_t1_job_directly_runs_both_new_lint_gates(self):
         workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "e2e.yml").read_text()
         t1_body = workflow.split("  t1-renderer:\n", 1)[1].split("\n  lint-renderer:\n", 1)[0]

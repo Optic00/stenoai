@@ -48,6 +48,78 @@ def _relative_posix_path(filename: str, root: Path) -> str:
         raise ValueError(f"Ruff reported a path outside the repository: {filename}") from error
 
 
+def _semantic_source_identity(source_span: str) -> str:
+    """Normalize parseable Ruff spans without erasing their Python semantics."""
+    for mode in ("eval", "exec"):
+        try:
+            tree = ast.parse(source_span, mode=mode)
+        except (SyntaxError, ValueError):
+            continue
+        return f"ast:{ast.dump(tree, include_attributes=False)}"
+    return f"text:{source_span}"
+
+
+def _definition_identity(
+    node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+) -> str:
+    """Describe a definition header independently of whitespace and line numbers."""
+    if isinstance(node, ast.ClassDef):
+        kind = "class"
+        header = [node.bases, node.keywords, node.decorator_list]
+    else:
+        kind = "async-function" if isinstance(node, ast.AsyncFunctionDef) else "function"
+        header = [node.args, node.decorator_list, node.returns, node.type_comment]
+    serialized = json.dumps(
+        [
+            ast.dump(value, include_attributes=False) if isinstance(value, ast.AST)
+            else [ast.dump(item, include_attributes=False) for item in value]
+            if isinstance(value, list)
+            else value
+            for value in header
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    discriminator = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return f"{kind}:{node.name}:{discriminator}"
+
+
+def _statements_contain_row(statements: list[ast.stmt], row: int) -> bool:
+    return any(
+        statement.lineno <= row <= end_lineno
+        for statement in statements
+        if isinstance((end_lineno := getattr(statement, "end_lineno", None)), int)
+    )
+
+
+def _scope_context(tree: ast.AST, row: int) -> list[str]:
+    """Return stable definition and conditional-branch ownership for one row."""
+    contexts: list[tuple[int, int, int, str]] = []
+    for node in ast.walk(tree):
+        end_lineno = getattr(node, "end_lineno", None)
+        if not isinstance(end_lineno, int) or not node.lineno <= row <= end_lineno:
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            contexts.append(
+                (node.lineno, node.col_offset, -end_lineno, _definition_identity(node))
+            )
+        elif isinstance(node, ast.If):
+            if _statements_contain_row(node.body, row):
+                arm = "body"
+            elif _statements_contain_row(node.orelse, row):
+                arm = "else"
+            else:
+                continue
+            test_identity = hashlib.sha256(
+                ast.dump(node.test, include_attributes=False).encode("utf-8")
+            ).hexdigest()
+            contexts.append(
+                (node.lineno, node.col_offset, -end_lineno, f"if:{test_identity}:{arm}")
+            )
+    contexts.sort(key=lambda entry: entry[:3])
+    return ["module", *(entry[3] for entry in contexts)]
+
+
 def _finding_fingerprint(
     diagnostic: dict[str, Any],
     *,
@@ -120,20 +192,10 @@ def _finding_fingerprint(
         # module context still lets the ratchet report the new E9 finding.
         tree = None
     if tree is not None:
-        scopes: list[ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef] = []
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                continue
-            end_lineno = getattr(node, "end_lineno", None)
-            if isinstance(end_lineno, int) and node.lineno <= start_row <= end_lineno:
-                scopes.append(node)
-        scopes.sort(key=lambda node: (node.lineno, node.col_offset, -(node.end_lineno or node.lineno)))
-        for scope in scopes:
-            kind = "class" if isinstance(scope, ast.ClassDef) else "function"
-            scope_context.append(f"{kind}:{scope.name}")
+        scope_context = _scope_context(tree, start_row)
 
     payload = json.dumps(
-        [code, message, source_span, scope_context],
+        [code, message, _semantic_source_identity(source_span), scope_context],
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
