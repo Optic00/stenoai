@@ -141,6 +141,10 @@ function conversationSpeaker(raw: string | null): string {
   return label ? label : 'Unknown';
 }
 
+function normalizeConversationText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
 function timestampToSeconds(ts: string | undefined): number | null {
   if (!ts) return null;
   const parts = ts.split(':').map(Number);
@@ -153,35 +157,44 @@ function timestampToSeconds(ts: string | undefined): number | null {
 function coalesceConversation(body: string): string | null {
   const segs = parseTranscript(body, true);
   if (segs.length === 0) return null;
+  const timedSegments: Array<{ speaker: string; text: string; start: number }> = [];
+  for (const seg of segs) {
+    const start = timestampToSeconds(seg.timestamp);
+    if (start == null) return null;
+    timedSegments.push({
+      speaker: conversationSpeaker(seg.speaker),
+      text: normalizeConversationText(seg.text),
+      start,
+    });
+  }
   type Row = {
     speaker: string;
     text: string;
-    rowStart: number | null;
-    lastStart: number | null;
+    rowStart: number;
+    lastStart: number;
   };
   const rows: Row[] = [];
-  for (const seg of segs) {
-    const speaker = conversationSpeaker(seg.speaker);
-    const start = timestampToSeconds(seg.timestamp);
+  for (const { speaker, text, start } of timedSegments) {
     const last = rows[rows.length - 1];
+    const gap = last == null ? null : start - last.lastStart;
+    const span = last == null ? null : start - last.rowStart;
     const gapOk =
       last != null &&
       last.speaker === speaker &&
-      last.lastStart != null &&
-      start != null &&
-      start - last.lastStart <= COALESCE_MAX_GAP_S;
+      gap != null &&
+      gap >= 0 &&
+      gap <= COALESCE_MAX_GAP_S;
     const spanOk =
       last != null &&
-      last.rowStart != null &&
-      start != null &&
-      start - last.rowStart <= COALESCE_MAX_SPAN_S;
-    const charsOk =
-      last != null && last.text.length + 1 + seg.text.length <= COALESCE_MAX_CHARS;
+      span != null &&
+      span >= 0 &&
+      span <= COALESCE_MAX_SPAN_S;
+    const charsOk = last != null && last.text.length + 1 + text.length <= COALESCE_MAX_CHARS;
     if (last && gapOk && spanOk && charsOk) {
-      last.text = `${last.text} ${seg.text}`.replace(/\s+/g, ' ').trim();
+      last.text = `${last.text} ${text}`;
       last.lastStart = start;
     } else {
-      rows.push({ speaker, text: seg.text, rowStart: start, lastStart: start });
+      rows.push({ speaker, text, rowStart: start, lastStart: start });
     }
   }
   return rows.map((r) => `${r.speaker}: ${r.text}`).join('\n\n');
