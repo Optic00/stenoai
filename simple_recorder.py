@@ -1741,12 +1741,24 @@ def set_openai_asr_config_cmd(api_url, model):
     config = get_config()
     errors = []
 
-    if api_url is not None:
-        if not config.set_openai_asr_api_url(api_url):
-            errors.append("Failed to save api_url")
-    if model is not None:
-        if not config.set_openai_asr_model(model):
-            errors.append("Failed to save model")
+    if not config.begin_transaction():
+        errors.append("Failed to start config transaction")
+    else:
+        try:
+            if api_url is not None:
+                if not config.set_openai_asr_api_url(api_url):
+                    errors.append("Failed to save api_url")
+            if model is not None:
+                if not config.set_openai_asr_model(model):
+                    errors.append("Failed to save model")
+
+            if errors:
+                config.rollback_transaction()
+            elif not config.commit_transaction():
+                errors.append("Failed to save config")
+        except Exception:
+            config.rollback_transaction()
+            raise
 
     if errors:
         print(json.dumps({"success": False, "error": "; ".join(errors)}))

@@ -946,6 +946,16 @@ class OpenAiAsrTests(unittest.TestCase):
             payload(1, start=float("inf")),
             payload(1, start=-0.1),
             payload(1, start=0.8, end=0.7),
+            {
+                "text": "provider transcript",
+                "segments": [{"text": "provider transcript", "start": 0}],
+                "duration": 1,
+            },
+            {
+                "text": "provider transcript",
+                "segments": [{"text": "provider transcript", "end": 1}],
+                "duration": 1,
+            },
             {"text": "provider transcript", "segments": [], "duration": "1e999"},
             payload(1, start="1e999", segment_text=""),
         )
@@ -1063,6 +1073,60 @@ class OpenAiAsrTests(unittest.TestCase):
             "text": "whole-channel response", "start": 0.0, "end": 0.0,
             "has_timestamps": False,
         }])
+
+    def test_verbose_json_partial_segments_fall_back_to_complete_untimed_text(self):
+        transcriber = _build_transcriber()
+        opener = _FakeOpener([_json_response({
+            "text": "complete sentence one. complete sentence two.",
+            "segments": [{
+                "text": "complete sentence one.", "start": 0.0, "end": 1.0,
+            }],
+        })])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch("urllib.request.build_opener", return_value=opener):
+                result = transcriber._run_openai_asr(audio, language="en")
+
+        self.assertEqual(
+            result["text"], "complete sentence one. complete sentence two."
+        )
+        self.assertEqual(result["segments"], [{
+            "text": "complete sentence one. complete sentence two.",
+            "start": 0.0,
+            "end": 0.0,
+            "has_timestamps": False,
+        }])
+
+    def test_chunked_segments_without_times_remain_untimed(self):
+        transcriber = _build_transcriber()
+        opener = _FakeOpener([
+            _json_response({"text": "first", "segments": [{"text": "first"}]}),
+            _json_response({"text": "second", "segments": [{"text": "second"}]}),
+        ])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "two-seconds.wav"
+            _write_pcm_wav(audio, frame_count=16000 * 2)
+            with patch(
+                "src.transcriber.OPENAI_ASR_CHUNK_THRESHOLD_BYTES", 1
+            ), patch(
+                "src.transcriber.OPENAI_ASR_MAX_CHUNK_SECONDS", 1
+            ), patch(
+                "urllib.request.build_opener", return_value=opener
+            ):
+                result = transcriber._run_openai_asr(audio, language="en")
+
+        self.assertEqual(result["text"], "first second")
+        self.assertEqual(result["segments"], [
+            {
+                "text": "first", "start": 0.0, "end": 0.0,
+                "has_timestamps": False,
+            },
+            {
+                "text": "second", "start": 0.0, "end": 0.0,
+                "has_timestamps": False,
+            },
+        ])
 
     def test_429_is_retried_once_then_succeeds(self):
         transcriber = _build_transcriber()

@@ -114,6 +114,10 @@ def get_ollama_env() -> dict:
         Dictionary of environment variables
     """
     env = os.environ.copy()
+    # The cloud-ASR credential is injected only so the short-lived backend can
+    # upload audio. Ollama is unrelated to transcription and may outlive that
+    # backend process, so never copy the credential into its server or runners.
+    env.pop("STENOAI_OAI_API_KEY", None)
 
     bundled_dir = get_bundled_ollama_dir()
     if bundled_dir:

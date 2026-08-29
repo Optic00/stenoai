@@ -2265,13 +2265,33 @@ class WhisperTranscriber:
                         if not isinstance(segment_text, str):
                             raise TypeError("segment text must be a string")
                         segment_text = segment_text.strip()
-                        start = _provider_time(segment.get("start"))
-                        end = _provider_time(segment.get("end"))
+                        start_value = segment.get("start")
+                        end_value = segment.get("end")
+                        has_start = start_value is not None and start_value != ""
+                        has_end = end_value is not None and end_value != ""
+                        if has_start != has_end:
+                            raise ValueError(
+                                "segment has incomplete timestamp metadata"
+                            )
+                        has_timestamps = has_start and has_end
+                        start = (
+                            _provider_time(start_value) if has_timestamps else 0.0
+                        )
+                        end = (
+                            _provider_time(end_value) if has_timestamps else 0.0
+                        )
                         if end < start:
                             raise ValueError("segment end precedes start")
                         if not segment_text:
                             continue
-                        segments.append({"text": segment_text, "start": start, "end": end})
+                        parsed_segment = {
+                            "text": segment_text,
+                            "start": start,
+                            "end": end,
+                        }
+                        if not has_timestamps:
+                            parsed_segment["has_timestamps"] = False
+                        segments.append(parsed_segment)
                 except (AttributeError, TypeError, ValueError):
                     # Conversion errors include the offending provider value in
                     # their message. Replace them before the outer failure path
@@ -2279,8 +2299,18 @@ class WhisperTranscriber:
                     raise RuntimeError(
                         "openai-asr verbose_json response has invalid segment metadata"
                     ) from None
-                if raw_text and not raw_segs:
+                if raw_text and not segments:
                     logger.info("openai-asr verbose_json response has text without segments")
+                    return _text_result(raw_text)
+                compact_text = "".join(raw_text.split())
+                compact_segments = "".join(
+                    "".join(segment["text"].split()) for segment in segments
+                )
+                if raw_text and compact_segments != compact_text:
+                    logger.warning(
+                        "openai-asr verbose_json segments do not cover the full text; "
+                        "preserving complete text without timestamps"
+                    )
                     return _text_result(raw_text)
                 logger.info(
                     "openai-asr verbose_json: %d chars, %d segments",

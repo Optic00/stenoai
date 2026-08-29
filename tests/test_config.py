@@ -4,6 +4,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from click.testing import CliRunner
+
+import simple_recorder
 from src.config import Config
 
 
@@ -222,6 +225,56 @@ class ConfigWhisperModelTests(unittest.TestCase):
 
 
 class ConfigOpenAiAsrTests(unittest.TestCase):
+    def test_multi_field_cli_update_commits_both_fields(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            config = Config(config_path=path)
+
+            with patch("src.config.get_config", return_value=config):
+                result = CliRunner().invoke(
+                    simple_recorder.set_openai_asr_config_cmd,
+                    [
+                        "--api-url", "https://replacement.example/v1",
+                        "--model", "replacement-model",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertTrue(json.loads(result.output)["success"])
+            reloaded = Config(config_path=path)
+            self.assertEqual(
+                reloaded.get_openai_asr_api_url(), "https://replacement.example/v1"
+            )
+            self.assertEqual(
+                reloaded.get_openai_asr_model(), "replacement-model"
+            )
+
+    def test_multi_field_cli_update_rolls_back_when_one_field_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            config = Config(config_path=path)
+            self.assertTrue(
+                config.set_openai_asr_api_url("https://original.example/v1")
+            )
+            self.assertTrue(config.set_openai_asr_model("whisper-1"))
+
+            with patch("src.config.get_config", return_value=config):
+                result = CliRunner().invoke(
+                    simple_recorder.set_openai_asr_config_cmd,
+                    [
+                        "--api-url", "https://replacement.example/v1",
+                        "--model", "",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertFalse(json.loads(result.output)["success"])
+            reloaded = Config(config_path=path)
+            self.assertEqual(
+                reloaded.get_openai_asr_api_url(), "https://original.example/v1"
+            )
+            self.assertEqual(reloaded.get_openai_asr_model(), "whisper-1")
+
     def test_defaults_on_fresh_config(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = Config(config_path=Path(tmp_dir) / "config.json")
