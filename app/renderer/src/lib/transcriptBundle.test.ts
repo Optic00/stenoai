@@ -100,6 +100,22 @@ describe('buildTranscriptBundle conversation view', () => {
     expect(bundle).not.toContain('Me: Older first fragment.');
   });
 
+  test.each([
+    '[00:60] [You] Invalid seconds.',
+    '[1:02:60] [You] Invalid seconds in a long timestamp.',
+    '[1:60:00] [You] Invalid minutes in a long timestamp.',
+    'Imported preface that cannot be attributed.\n[00:00] [You] Actual turn.',
+  ])(
+    'falls back to the original transcript when a diarised source is not fully parseable',
+    (body) => {
+      const bundle = buildTranscriptBundle(meeting({ diarised_text: body }));
+
+      expect(bundle).toContain(`## Transcript\n${body}`);
+      expect(bundle).not.toContain('## Timestamped transcript');
+      expect(bundle).not.toContain('Me:');
+    },
+  );
+
   test('enforces the exact gap and combined-span boundaries', () => {
     const atGap = buildTranscriptBundle(
       meeting({ diarised_text: '[00:00.0] [You] One.\n[00:02.5] [You] Two.' }),

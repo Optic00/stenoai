@@ -103,7 +103,9 @@ test('Copy transcript includes a readable diarised view and the timestamped sour
 
   await page.getByRole('button', { name: 'Copy transcript' }).click();
 
-  const [bundle] = await clipboardWrites(page);
+  const writes = await clipboardWrites(page);
+  expect(writes).toHaveLength(1);
+  const bundle = writes[0];
   expect(bundle).toContain(
     '## Transcript\nMe: We should ship Friday. I will prepare the release.\n\nOthers: Sounds good.',
   );
