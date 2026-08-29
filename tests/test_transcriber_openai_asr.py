@@ -10,6 +10,7 @@ import wave
 from pathlib import Path
 from unittest.mock import patch
 
+import src.config as config_mod
 import src.transcriber as transcriber_mod
 from src.config import Config
 from src.transcriber import WhisperTranscriber
@@ -31,6 +32,21 @@ class _FakeResponse:
 
     def read(self):
         return self._body
+
+
+class _TricklingResponse(_FakeResponse):
+    """A body that never completes until close() proves the wall-clock cap."""
+    def __init__(self):
+        super().__init__(b"")
+        import threading
+        self.released = threading.Event()
+
+    def read(self):
+        self.released.wait()
+        return b""
+
+    def close(self):
+        self.released.set()
 
 
 class _FakeOpener:
@@ -177,6 +193,15 @@ class OpenAiAsrTests(unittest.TestCase):
                 transcriber._run_openai_asr(audio, language="en")
 
         heartbeat.assert_called_once_with("openai-asr-request")
+
+    def test_total_deadline_closes_a_trickling_response(self):
+        import time
+        response = _TricklingResponse()
+        with self.assertRaisesRegex(TimeoutError, "total deadline"):
+            transcriber_mod._read_openai_asr_response_with_deadline(
+                response, time.monotonic() + 0.01
+            )
+        self.assertTrue(response.released.is_set())
 
     def test_oversized_non_wav_names_25_mb_limit(self):
         transcriber = _build_transcriber()
@@ -377,12 +402,38 @@ class OpenAiAsrTests(unittest.TestCase):
         self.assertIn("token=[redacted]", message)
         self.assertIn("api_key=[redacted]", message)
 
+    def test_error_redacts_url_userinfo_and_query_credentials(self):
+        redacted = transcriber_mod._redact_openai_asr_error(
+            "https://user:password@example.test/v1?api-key=secret-value"
+        )
+        self.assertNotIn("user:password", redacted)
+        self.assertNotIn("secret-value", redacted)
+        self.assertIn("https://[redacted]@example.test", redacted)
+
+    def test_config_diagnostic_redacts_userinfo_and_query_credentials(self):
+        redacted = config_mod._redact_url_credentials(
+            "http://user:password@evil.example/v1?access_token=secret-value"
+        )
+        self.assertNotIn("user:password", redacted)
+        self.assertNotIn("secret-value", redacted)
+        self.assertIn("http://[redacted]@evil.example", redacted)
+
     def test_url_guard_rejects_remote_http_and_accepts_loopback_or_https(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = Config(config_path=Path(tmp_dir) / "config.json")
             self.assertFalse(config.set_openai_asr_api_url("http://evil.example/v1"))
             self.assertTrue(config.set_openai_asr_api_url("http://127.0.0.1:9000/v1"))
             self.assertTrue(config.set_openai_asr_api_url("https://safe.example/v1"))
+
+    def test_legacy_unsafe_url_fails_closed_and_never_reaches_the_transcriber(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            config_path.write_text(json.dumps({
+                "openai_asr_api_url": "http://user:password@evil.example/v1"
+            }))
+            config = Config(config_path=config_path)
+            self.assertEqual(config.get_openai_asr_api_url(), "")
+            self.assertFalse(config.set_openai_asr_api_url("https://user:password@safe.example/v1"))
 
     def test_language_normalization(self):
         normalize = getattr(transcriber_mod, "_normalize_openai_language")

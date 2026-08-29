@@ -42,6 +42,39 @@ logger = logging.getLogger(__name__)
 # and would accept visually-similar non-ASCII digits (e.g. Arabic-Indic "١").
 BEDROCK_REGION_RE = re.compile(r"[a-z]{2}(-gov)?-[a-z]+-[0-9]{1,2}")
 
+OPENAI_ASR_DEFAULT_URL = "https://api.openai.com/v1"
+
+
+def _redact_url_credentials(value: object) -> str:
+    """Keep malformed legacy endpoint diagnostics from exposing credentials."""
+    text = str(value)
+    text = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[redacted]@", text)
+    return re.sub(
+        r"(?i)([?&](?:api[_-]?key|access[_-]?token|token|password|secret)=)[^&#\s]*",
+        r"\1[redacted]",
+        text,
+    )
+
+
+def _normalise_openai_asr_api_url(value: object) -> Optional[str]:
+    """Return a safe endpoint or None; legacy config must fail closed."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value.strip())
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if not hostname or parsed.username is not None or parsed.password is not None:
+        return None
+    if scheme == "http" and hostname in {"localhost", "127.0.0.1", "::1"}:
+        pass
+    elif scheme != "https":
+        return None
+    # URL fragments are never sent in HTTP and can accidentally carry secrets.
+    return urllib.parse.urlunsplit((scheme, parsed.netloc, parsed.path.rstrip("/"), parsed.query, ""))
+
 
 def _atomic_write(path: Path, render, encoding: str = 'utf-8') -> None:
     """Durably replace `path` with whatever `render(fh)` writes.
@@ -933,13 +966,13 @@ class Config:
             "transcription_engine": "parakeet",
             # OpenAI-compatible ASR endpoint settings.
             # api_url: base URL of any OpenAI Speech-to-Text compatible server
-            #   (e.g. https://api.openai.com/v1, Groq, Azure, etc.).
+            #   (e.g. https://api.openai.com/v1 or Groq).
             # model: model name passed in the multipart form (e.g. whisper-1).
             # The API key is NOT stored here -- it is held encrypted by the
             # Electron main process (safeStorage) and injected into the
             # transcription subprocess env as STENOAI_OAI_API_KEY, exactly like
             # the cloud summariser key. See get_openai_asr_api_key().
-            "openai_asr_api_url": "https://api.openai.com/v1",
+            "openai_asr_api_url": OPENAI_ASR_DEFAULT_URL,
             "openai_asr_model": "whisper-1",
             "version": "1.0"
         }
@@ -2121,10 +2154,18 @@ class Config:
         """Base URL of the OpenAI-compatible STT endpoint.
 
         Defaults to the official OpenAI endpoint. Users can override with
-        any compatible server: Groq, Azure OpenAI, local llama.cpp, etc.
+        any OpenAI-compatible server, including HTTPS providers and a local
+        loopback development server.
         The transcriber appends ``/audio/transcriptions`` to this URL.
         """
-        return self._config.get("openai_asr_api_url", "https://api.openai.com/v1")
+        if "openai_asr_api_url" not in self._config:
+            return OPENAI_ASR_DEFAULT_URL
+        configured = self._config.get("openai_asr_api_url")
+        safe_url = _normalise_openai_asr_api_url(configured)
+        if safe_url is None:
+            logger.warning("Ignoring unsafe legacy openai_asr_api_url: %s", _redact_url_credentials(configured))
+            return ""
+        return safe_url
 
     def set_openai_asr_api_url(self, url: str) -> bool:
         """Set the base URL for the OpenAI-compatible STT endpoint.
@@ -2135,28 +2176,9 @@ class Config:
         if not url or not url.strip():
             logger.error("openai_asr_api_url must not be empty")
             return False
-        clean_url = url.strip()
-        try:
-            parsed = urllib.parse.urlsplit(clean_url)
-            scheme = parsed.scheme.lower()
-            hostname = (parsed.hostname or "").lower()
-        except ValueError as error:
-            logger.error("openai_asr_api_url is not a valid URL: %s", error)
-            return False
-        if not hostname:
-            logger.error("openai_asr_api_url must include a hostname")
-            return False
-        if parsed.username is not None or parsed.password is not None:
-            logger.error("openai_asr_api_url must not embed credentials")
-            return False
-        is_loopback_http = (
-            scheme == "http"
-            and hostname in {"localhost", "127.0.0.1", "::1"}
-        )
-        if scheme != "https" and not is_loopback_http:
-            logger.error(
-                "openai_asr_api_url requires HTTPS except for localhost or loopback hosts"
-            )
+        clean_url = _normalise_openai_asr_api_url(url)
+        if clean_url is None:
+            logger.error("openai_asr_api_url URL must be HTTPS (or loopback HTTP) without embedded credentials: %s", _redact_url_credentials(url))
             return False
         self._config["openai_asr_api_url"] = clean_url
         return self._save()

@@ -1992,6 +1992,12 @@ if (!gotSingleInstanceLock) {
       console.warn('processing-log init failed (non-fatal):', e?.message);
     }
 
+    // Migrate the pre-safeStorage plaintext ASR credential on every launch,
+    // independent of the active engine or whether Settings is opened. The
+    // helper encrypts, verifies a decrypt/readback, then asks the backend to
+    // remove plaintext only after that succeeds.
+    void migrateLegacyOpenAiAsrApiKey();
+
     // Application menu. macOS uses the global menu bar with mac-only roles
     // (services/hide/unhide). Windows/Linux get a slimmer, platform-correct
     // menu — kept (editing accelerators, Settings, Help) but hidden by default
@@ -2976,9 +2982,7 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
     const reprocessSecrets = retranscribe
       ? { ...getAiEnv(), ...getTranscriptionEnv() }
       : getAiEnv();
-    const reprocessEnv = Object.keys(reprocessSecrets).length > 0
-      ? { ...require('process').env, ...reprocessSecrets }
-      : undefined;
+    const reprocessEnv = getBackendEnv(reprocessSecrets);
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), args, {
@@ -3190,7 +3194,7 @@ ipcMain.handle('generate-report-meeting', async (event, summaryFile, templateId)
     activeReprocessJobs.set(summaryFile, { summaryFile, sessionName });
 
     const aiEnv = getAiEnv();
-    const reportEnv = Object.keys(aiEnv).length > 0 ? { ...require('process').env, ...aiEnv } : undefined;
+    const reportEnv = getBackendEnv(aiEnv);
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), args, {
@@ -3349,7 +3353,7 @@ ipcMain.handle('regen-meeting-title', async (event, summaryFile, sessionName) =>
     activeReprocessJobs.set(summaryFile, { summaryFile, sessionName: sessionName || null });
 
     const aiEnv = getAiEnv();
-    const regenEnv = Object.keys(aiEnv).length > 0 ? { ...require('process').env, ...aiEnv } : undefined;
+    const regenEnv = getBackendEnv(aiEnv);
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), ['regen-title', realPath], {
@@ -3492,7 +3496,7 @@ ipcMain.on('query-cancel', (_event, queryId) => {
 ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, question) => {
   console.log(`[QUERY] IPC received: question="${question.substring(0, 50)}" file="${summaryFile}"`);
   sendDebugLog(`🤖 Streaming query (${String(question || '').length} chars)`);
-  const env = { ...process.env, ...getAiEnv() };
+  const env = getBackendEnv(getAiEnv());
 
   // chat_message_sent restores visibility into single-meeting chat (dormant
   // since the old bare-ping ai_query_used stopped being reachable once chat
@@ -3681,7 +3685,7 @@ ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, questi
 // fewer recent notes instead of overflowing. No retrieval (RAG) yet.
 ipcMain.on('chat-global-stream', (event, queryId, question, folderId) => {
   sendDebugLog(`💬 Global chat query (${String(question || '').length} chars, folder: ${folderId || 'all'})`);
-  const env = { ...process.env, ...getAiEnv() };
+  const env = getBackendEnv(getAiEnv());
 
   const args = ['chat-global-streaming', '-q', question];
   if (folderId && typeof folderId === 'string' && folderId !== 'all') {
@@ -4792,9 +4796,7 @@ function spawnLiveTranscribe(sessionName) {
     liveTranscribeStdoutBuf = '';
   }
   const aiEnv = { ...getAiEnv(), ...getTranscriptionEnv() };
-  const env = Object.keys(aiEnv).length > 0
-    ? { ...require('process').env, ...aiEnv }
-    : undefined;
+  const env = getBackendEnv(aiEnv);
   parakeetLoadStartedAt = Date.now();
   liveTranscribeProcess = spawn(getBackendPath(), ['transcribe-stream'], {
     cwd: getBackendCwd(),
@@ -5505,7 +5507,7 @@ async function processNextInQueue() {
     // process-streaming does BOTH transcription (needs the ASR key) and
     // summarization (needs the AI env), so merge both.
     const queueAiEnv = { ...getAiEnv(), ...getTranscriptionEnv() };
-    const queueEnv = Object.keys(queueAiEnv).length > 0 ? { ...require('process').env, ...queueAiEnv } : undefined;
+    const queueEnv = getBackendEnv(queueAiEnv);
     const processArgs = ['process-streaming', currentProcessingJob.audioFile, '--name', currentProcessingJob.sessionName];
     if (currentProcessingJob.notesFile && fs.existsSync(currentProcessingJob.notesFile)) {
       processArgs.push('--notes', currentProcessingJob.notesFile);
@@ -8919,17 +8921,38 @@ function getOpenAiAsrKeyPath() {
 }
 
 function saveOpenAiAsrKey(key) {
+  const keyPath = getOpenAiAsrKeyPath();
+  const tempPath = `${keyPath}.${process.pid}.${Date.now()}.tmp`;
+  let previous = null;
   try {
-    const keyDir = path.dirname(getOpenAiAsrKeyPath());
+    const keyDir = path.dirname(keyPath);
     if (!fs.existsSync(keyDir)) {
       fs.mkdirSync(keyDir, { recursive: true });
     }
     const encrypted = getSafeStorage().encryptString(key);
-    fs.writeFileSync(getOpenAiAsrKeyPath(), encrypted);
+    previous = fs.existsSync(keyPath) ? fs.readFileSync(keyPath) : null;
+    fs.writeFileSync(tempPath, encrypted, { mode: 0o600 });
+    fs.renameSync(tempPath, keyPath);
+    if (loadOpenAiAsrKey() !== key) throw new Error('safeStorage readback did not match saved key');
     return true;
   } catch (error) {
-    console.error('Failed to save OpenAI ASR API key:', error.message);
-    throw error;
+    let rollbackError = null;
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      if (previous) {
+        fs.writeFileSync(tempPath, previous, { mode: 0o600 });
+        fs.renameSync(tempPath, keyPath);
+      } else if (fs.existsSync(keyPath)) {
+        fs.unlinkSync(keyPath);
+      }
+    } catch (rollbackFailure) {
+      rollbackError = rollbackFailure;
+    }
+    const detail = rollbackError
+      ? `; rollback also failed: ${rollbackError.message}`
+      : '; prior credential state restored';
+    console.error(`Failed to save OpenAI ASR API key${detail}`);
+    throw new Error(`OpenAI ASR API key was not saved${detail}`);
   }
 }
 
@@ -8970,7 +8993,7 @@ function secureLegacyOpenAiAsrApiKey() {
   const legacyKey = readLegacyOpenAiAsrApiKey();
   if (!legacyKey) return false;
   const stored = loadOpenAiAsrKey();
-  if (stored) return true;
+  if (stored) return stored === legacyKey;
   try {
     // Do not remove config.json's value unless encrypt + decrypt both work.
     return saveOpenAiAsrKey(legacyKey) && Boolean(loadOpenAiAsrKey());
@@ -9008,6 +9031,11 @@ function getAiEnv() {
     env.STENOAI_ADAPTER_TOKEN = session.token;
   }
   return env;
+}
+
+function getBackendEnv(extra = {}) {
+  const { STENOAI_OAI_API_KEY, ...env } = require('process').env;
+  return { ...env, ...extra };
 }
 
 // Env additions a transcription subprocess needs. Only when openai-asr is the
@@ -9970,7 +9998,7 @@ function getOllamaEnv() {
   } else {
     ollamaDir = path.join(__dirname, '..', 'bin');
   }
-  const env = { ...process.env };
+  const env = getBackendEnv();
   if (process.platform === 'darwin') {
     const existing = env.DYLD_LIBRARY_PATH || '';
     env.DYLD_LIBRARY_PATH = existing ? `${ollamaDir}:${existing}` : ollamaDir;

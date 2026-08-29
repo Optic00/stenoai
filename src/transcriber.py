@@ -164,6 +164,8 @@ SILENCE_SENTINEL = "No speech detected in audio"
 # 24 MiB to leave headroom for the multipart fields and boundary bytes.
 OPENAI_ASR_CHUNK_THRESHOLD_BYTES = 24 * 1024 * 1024
 OPENAI_ASR_MAX_CHUNK_SECONDS = 600
+OPENAI_ASR_REQUEST_DEADLINE_SECONDS = 10 * 60
+OPENAI_ASR_SOCKET_TIMEOUT_SECONDS = 300
 
 OPENAI_LANGUAGE_NAME_TO_CODE = {
     "english": "en",
@@ -1265,7 +1267,45 @@ def _redact_openai_asr_error(message: object, api_key: str = "") -> str:
         r"\1[redacted]",
         redacted,
     )
+    redacted = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[redacted]@", redacted)
     return re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}", "[redacted]", redacted)
+
+
+def _read_openai_asr_response_with_deadline(response, deadline: float) -> bytes:
+    """Read a response without letting a trickling body evade the wall clock."""
+    import queue
+    import time
+
+    result = queue.Queue(maxsize=1)
+
+    def read() -> None:
+        try:
+            result.put((True, response.read()))
+        except BaseException as error:
+            result.put((False, error))
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        remaining = 0
+    try:
+        ok, value = result.get(timeout=remaining)
+    except queue.Empty as error:
+        try:
+            response.close()
+        except Exception:
+            pass
+        raise TimeoutError("openai-asr request exceeded its total deadline") from error
+    if time.monotonic() > deadline:
+        try:
+            response.close()
+        except Exception:
+            pass
+        raise TimeoutError("openai-asr request exceeded its total deadline")
+    if ok:
+        return value
+    raise value
 
 
 def _tag_channel_segments(
@@ -1897,9 +1937,13 @@ class WhisperTranscriber:
         import uuid
         import wave
 
-        api_url = (getattr(self, "_openai_asr_api_url", "") or "https://api.openai.com/v1").rstrip("/")
+        api_url = getattr(self, "_openai_asr_api_url", "")
         api_key = getattr(self, "_openai_asr_api_key", "")
         model = getattr(self, "_openai_asr_model", "") or "whisper-1"
+
+        if not api_url:
+            raise RuntimeError("openai-asr: configured endpoint is unsafe or invalid")
+        api_url = api_url.rstrip("/")
 
         if "/audio/transcriptions" not in api_url:
             if "?" in api_url:
@@ -1998,8 +2042,13 @@ class WhisperTranscriber:
                 )
         opener = urllib.request.build_opener(NoRedirectHandler)
 
+        request_deadline = time.monotonic() + OPENAI_ASR_REQUEST_DEADLINE_SECONDS
+
         def _do_request(response_format: str, request_audio_path: Path) -> tuple[bytes, str]:
             for attempt in range(2):
+                remaining = request_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("openai-asr request exceeded its total deadline")
                 stream = _MultipartStream(response_format, request_audio_path)
                 req = urllib.request.Request(
                     endpoint,
@@ -2012,14 +2061,17 @@ class WhisperTranscriber:
                     # blocked. Keep the parent watchdog alive during each
                     # bounded request; the context joins its daemon helper on
                     # every completion and error path.
-                    with _heartbeat_while_waiting("openai-asr-request"), opener.open(req, timeout=300) as resp:
+                    # The heartbeat protects Electron's inactivity watchdog, but must
+                    # never extend this request's hard total wall-clock deadline.
+                    timeout = min(OPENAI_ASR_SOCKET_TIMEOUT_SECONDS, max(1, remaining))
+                    with _heartbeat_while_waiting("openai-asr-request"), opener.open(req, timeout=timeout) as resp:
                         content_type = resp.headers.get("Content-Type", "") or ""
-                        return resp.read(), content_type
+                        return _read_openai_asr_response_with_deadline(resp, request_deadline), content_type
                 except urllib.error.HTTPError as e:
                     retryable = e.code == 429 or 500 <= e.code <= 599
                     if attempt == 0 and retryable:
                         e.close()
-                        time.sleep(2)
+                        time.sleep(min(2, max(0, request_deadline - time.monotonic())))
                         continue
                     err_body = e.read().decode(errors="replace")
                     e.close()
@@ -2029,7 +2081,7 @@ class WhisperTranscriber:
                     ) from e
                 except urllib.error.URLError as error:
                     if attempt == 0:
-                        time.sleep(2)
+                        time.sleep(min(2, max(0, request_deadline - time.monotonic())))
                         continue
                     raise RuntimeError(
                         "openai-asr request failed: "

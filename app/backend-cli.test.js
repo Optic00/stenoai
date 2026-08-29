@@ -71,6 +71,21 @@ test('spawn lets a caller override PYTHONUNBUFFERED itself', () => {
   assert.strictEqual(spawnCalls[0][2].env.PYTHONUNBUFFERED, '0');
 });
 
+test('spawn strips an ambient ASR key unless a caller supplies it explicitly', () => {
+  const prior = process.env.STENOAI_OAI_API_KEY;
+  process.env.STENOAI_OAI_API_KEY = 'ambient-secret';
+  try {
+    spawn('backend', ['status']);
+    assert.strictEqual(spawnCalls[0][2].env.STENOAI_OAI_API_KEY, undefined);
+
+    spawn('backend', ['process-streaming'], { env: { STENOAI_OAI_API_KEY: 'explicit-secret' } });
+    assert.strictEqual(spawnCalls[1][2].env.STENOAI_OAI_API_KEY, 'explicit-secret');
+  } finally {
+    if (prior === undefined) delete process.env.STENOAI_OAI_API_KEY;
+    else process.env.STENOAI_OAI_API_KEY = prior;
+  }
+});
+
 test('spawn handles the 2-arg (command, options) form', () => {
   spawn('backend', { cwd: '/y' });
   // Collapsed to the options-object overload; windowsHide defaulted in.

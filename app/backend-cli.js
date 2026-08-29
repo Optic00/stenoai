@@ -37,7 +37,12 @@ const { spawn: _spawnRaw } = require('child_process');
 // Callers can still override either by passing an explicit windowsHide/env.
 function spawn(command, args, options) {
   const unbufferedEnv = (existingEnv) => ({
-    ...require('process').env,
+    // Never inherit an ambient ASR credential into arbitrary backend jobs.
+    // The transcription path supplies it explicitly only for openai-asr.
+    ...(() => {
+      const { STENOAI_OAI_API_KEY, ...env } = require('process').env;
+      return env;
+    })(),
     PYTHONUNBUFFERED: '1',
     ...(existingEnv || {}),
   });
@@ -132,7 +137,9 @@ function createBackendCli({
 
       const process = spawn(backendPath, args, {
         cwd: getBackendCwd(),
-        env: Object.keys(extraEnv).length > 0 ? { ...require('process').env, ...extraEnv } : undefined
+        // spawn() supplies the sanitized inherited environment; extraEnv is
+        // intentionally the only way a caller can add a secret to this job.
+        env: Object.keys(extraEnv).length > 0 ? extraEnv : undefined
       });
 
       // Opt-in persistent capture for the legacy process-recording path only.
