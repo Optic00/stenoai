@@ -2226,15 +2226,27 @@ class WhisperTranscriber:
         boundary = uuid.uuid4().hex
 
         def _multipart_parameter(value: str) -> str:
-            if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            if not isinstance(value, str) or any(
+                ord(char) < 32 or ord(char) == 127 for char in value
+            ):
                 raise RuntimeError("openai-asr multipart metadata is invalid")
             return value.replace("\\", "\\\\").replace('"', '\\"')
+
+        def _multipart_field_value(value: str) -> str:
+            # Field values are user-controlled config (most notably ``model``)
+            # and are emitted verbatim between multipart delimiters. Reject
+            # controls rather than allowing CR/LF to inject another part.
+            if not isinstance(value, str) or any(
+                ord(char) < 32 or ord(char) == 127 for char in value
+            ):
+                raise RuntimeError("openai-asr multipart metadata is invalid")
+            return value
 
         def _field(name: str, value: str) -> bytes:
             return (
                 f"--{boundary}\r\n"
                 f'Content-Disposition: form-data; name="{_multipart_parameter(name)}"\r\n\r\n'
-                f"{value}\r\n"
+                f"{_multipart_field_value(value)}\r\n"
             ).encode()
 
         def _file_field_header(name: str, filename: str, ctype: str) -> bytes:
@@ -2307,6 +2319,19 @@ class WhisperTranscriber:
 
             def __len__(self):
                 return self.total_size
+
+        # Providers may accept many audio container formats, but response
+        # validation only has a safe timing/silence proof for complete PCM WAV
+        # input. Do that proof before constructing an opener, so an imported
+        # MP3 or truncated WAV is never uploaded just to be rejected later.
+        source_analysis = _openai_asr_analyse_canonical_wav(audio_filepath)
+        if source_analysis is None:
+            raise RuntimeError(
+                "openai-asr input must be a canonical WAV before upload"
+            )
+        _multipart_field_value(model)
+        if language and language != "auto":
+            _multipart_field_value(language)
 
         headers = {
             "Content-Type": f"multipart/form-data; boundary={boundary}",
@@ -2736,9 +2761,6 @@ class WhisperTranscriber:
             "openai-asr audio exceeds the 25 MB upload limit and is not a "
             "readable 16 kHz mono PCM WAV; cannot split it safely"
         )
-        source_analysis = _openai_asr_analyse_canonical_wav(audio_filepath)
-        if source_analysis is None:
-            raise RuntimeError(limit_error)
         try:
             source_wav = wave.open(str(audio_filepath), "rb")
         except (EOFError, OSError, wave.Error) as error:
@@ -3272,10 +3294,7 @@ class WhisperTranscriber:
 
         def _discard_channel_temps() -> None:
             for temp_path in (mic_path, system_path):
-                try:
-                    temp_path.unlink()
-                except OSError:
-                    pass
+                _unlink_temporary_audio(temp_path, "stereo channel")
 
         # Scale the decode timeout to the recording length — a fixed 120 s
         # silently timed out on multi-hour files and lost speaker separation.
@@ -3610,11 +3629,8 @@ class WhisperTranscriber:
         finally:
             # Clean up temp channel files
             for p in (mic_path, system_path):
-                if p and p.exists():
-                    try:
-                        p.unlink()
-                    except Exception:
-                        pass
+                if p:
+                    _unlink_temporary_audio(p, "stereo channel")
 
     def _transcribe_diarised_mono(self, audio_filepath: Path, language: str) -> Optional[dict]:
         """Diarise a mono recording (no channel split to lean on).

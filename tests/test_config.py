@@ -7,10 +7,31 @@ from unittest.mock import patch
 from click.testing import CliRunner
 
 import simple_recorder
+import src.config as config_mod
 from src.config import Config
 
 
 class OpenAiAsrCredentialMigrationTests(unittest.TestCase):
+    def test_snapshot_digest_matches_node_for_raw_url_edge_cases(self):
+        # These are SHA-256 vectors produced by
+        # app/openai-asr-key-store.js's JSON.stringify([key, apiUrl]) form.
+        # The raw value, not a normalised origin, makes a concurrent endpoint
+        # replacement fail the CLI's compare-and-delete.
+        cases = (
+            ({}, "d57807b16ec55d7997156550640a33efad503cc8ccb26183638a5f11b41cad9a"),
+            ({"openai_asr_api_url": ""}, "01cc88e9c6d1714d089017816bb5edc1ce27bc81789833bfbedff2435188a10f"),
+            ({"openai_asr_api_url": 42}, "bc014f8501b79187463391288983100365e7d3723d3a397d0dd323445fe5a97f"),
+            ({"openai_asr_api_url": "  https://api.example/v1  "}, "3e07ed0ad794fc7bf7fc674dc1b06832d3ebc5f0cc04cadde8d963f77cfab3b6"),
+        )
+        for config, expected_digest in cases:
+            with self.subTest(config=config):
+                self.assertEqual(
+                    config_mod._legacy_openai_asr_snapshot_digest({
+                        "openai_asr_api_key": "legacy-key", **config,
+                    }),
+                    expected_digest,
+                )
+
     def test_removes_plaintext_legacy_asr_key_after_safe_storage_migration(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = Path(tmp_dir) / "config.json"
@@ -30,6 +51,69 @@ class OpenAiAsrCredentialMigrationTests(unittest.TestCase):
                 self.assertFalse(config.remove_legacy_openai_asr_api_key())
 
             self.assertEqual(config._config["openai_asr_api_key"], "legacy-test-value")
+
+    def test_cli_removes_invalid_endpoint_legacy_key_when_snapshot_matches(self):
+        """Cleanup must not depend on an endpoint being safe to migrate."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            contents = {
+                "openai_asr_api_key": "legacy-test-value",
+                "openai_asr_api_url": "http://untrusted.example/v1",
+            }
+            config_path.write_text(json.dumps(contents))
+            config = Config(config_path=config_path)
+            digest = config_mod._legacy_openai_asr_snapshot_digest(contents)
+
+            with patch("src.config.get_config", return_value=config):
+                result = CliRunner().invoke(
+                    simple_recorder.remove_legacy_openai_asr_api_key_cmd,
+                    env={"STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST": digest},
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertTrue(json.loads(result.output)["success"])
+            self.assertNotIn("openai_asr_api_key", json.loads(config_path.read_text()))
+
+    def test_cli_removes_valid_migrated_key_only_with_its_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            contents = {
+                "openai_asr_api_key": "legacy-test-value",
+                "openai_asr_api_url": "https://api.example/v1",
+            }
+            config_path.write_text(json.dumps(contents))
+            config = Config(config_path=config_path)
+            digest = config_mod._legacy_openai_asr_snapshot_digest(contents)
+
+            with patch("src.config.get_config", return_value=config):
+                result = CliRunner().invoke(
+                    simple_recorder.remove_legacy_openai_asr_api_key_cmd,
+                    env={"STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST": digest},
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertTrue(json.loads(result.output)["success"])
+            self.assertNotIn("openai_asr_api_key", json.loads(config_path.read_text()))
+
+    def test_digest_bound_removal_keeps_a_concurrent_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            original = {
+                "openai_asr_api_key": "old-legacy-key",
+                "openai_asr_api_url": "https://old.example/v1",
+            }
+            replacement = {
+                "openai_asr_api_key": "replacement-key",
+                "openai_asr_api_url": "https://replacement.example/v1",
+            }
+            config_path.write_text(json.dumps(original))
+            config = Config(config_path=config_path)
+            digest = config_mod._legacy_openai_asr_snapshot_digest(original)
+
+            # Model Electron's read occurring before another settings write.
+            config_path.write_text(json.dumps(replacement))
+            self.assertFalse(config.remove_legacy_openai_asr_api_key(digest))
+            self.assertEqual(json.loads(config_path.read_text()), replacement)
 
 
 class ConfigStoragePathTests(unittest.TestCase):

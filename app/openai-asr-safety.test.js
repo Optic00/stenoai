@@ -8,6 +8,7 @@ const path = require('path');
 const {
   isEncryptedKeyCleared,
   isValidOpenAiAsrApiKey,
+  legacyCredentialSnapshotDigest,
   legacyKeyMigrationAction,
   loadEncryptedKeyForOrigin,
   markEncryptedKeyClearedAtomically,
@@ -83,6 +84,7 @@ test('legacy key and origin come from one immutable config snapshot', () => {
     assert.deepStrictEqual(snapshot, {
       key: 'key-for-a',
       origin: 'https://a.example',
+      snapshotDigest: legacyCredentialSnapshotDigest('key-for-a', 'https://a.example/v1'),
     });
     assert.strictEqual(reads, 1);
 
@@ -94,6 +96,58 @@ test('legacy key and origin come from one immutable config snapshot', () => {
       safeStorage: safeStorage(),
     }), null, 'an endpoint change must not activate A\'s snapshot at B');
   });
+});
+
+test('an invalid legacy endpoint still yields a digest-bound cleanup snapshot', () => {
+  withKeyDirectory((keyPath) => {
+    const configPath = path.join(path.dirname(keyPath), 'config.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      openai_asr_api_key: 'legacy-key',
+      openai_asr_api_url: 'http://untrusted.example/v1',
+    }));
+
+    const snapshot = readLegacyCredentialSnapshot({ fs, configPath });
+    assert.deepStrictEqual(snapshot, {
+      key: 'legacy-key',
+      origin: null,
+      snapshotDigest: legacyCredentialSnapshotDigest(
+        'legacy-key', 'http://untrusted.example/v1',
+      ),
+    });
+  });
+});
+
+test('legacy snapshot digest preserves the raw URL value across migration edge cases', () => {
+  const cases = [
+    { config: {}, apiUrl: 'https://api.openai.com/v1', origin: 'https://api.openai.com' },
+    { config: { openai_asr_api_url: '' }, apiUrl: '', origin: null },
+    { config: { openai_asr_api_url: 42 }, apiUrl: 42, origin: null },
+    { config: { openai_asr_api_url: '  https://api.example/v1  ' }, apiUrl: '  https://api.example/v1  ', origin: 'https://api.example' },
+  ];
+  withKeyDirectory((keyPath) => {
+    const configPath = path.join(path.dirname(keyPath), 'config.json');
+    for (const { config, apiUrl, origin } of cases) {
+      fs.writeFileSync(configPath, JSON.stringify({
+        openai_asr_api_key: 'legacy-key',
+        ...config,
+      }));
+      const snapshot = readLegacyCredentialSnapshot({ fs, configPath });
+      assert.strictEqual(snapshot.origin, origin);
+      assert.strictEqual(
+        snapshot.snapshotDigest,
+        legacyCredentialSnapshotDigest('legacy-key', apiUrl),
+      );
+    }
+  });
+});
+
+test('main sends only the legacy snapshot digest to the cleanup CLI', () => {
+  const migration = source.slice(
+    source.indexOf('async function migrateLegacyOpenAiAsrApiKey()'),
+    source.indexOf('// Build the env additions a Python AI-driven subprocess needs.'),
+  );
+  assert.match(migration, /STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST: legacy\.snapshotDigest/);
+  assert.doesNotMatch(migration, /\['remove-legacy-openai-asr-api-key',\s*legacy\.key\]/);
 });
 
 test('API key validation rejects controls, whitespace, non-ASCII, and oversized values', () => {

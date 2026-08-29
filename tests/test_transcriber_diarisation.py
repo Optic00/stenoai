@@ -24,6 +24,7 @@ import wave
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import src.transcriber as transcriber_mod
 from src.transcriber import (
     BLEED_JACCARD_THRESHOLD,
     CHANNEL_DOMINANCE_THRESHOLD,
@@ -139,6 +140,43 @@ class TranscribeDiarisedTimestampTests(unittest.TestCase):
         # The plain text field stays timestamp- and label-free.
         self.assertNotIn("[00:0", result["text"])
         self.assertNotIn("[You]", result["text"])
+
+    def test_final_stereo_cleanup_retries_transient_windows_locks(self):
+        self.transcriber.transcribe_audio = Mock(side_effect=[
+            {"text": "Mic", "segments": [
+                {"text": "Mic", "start": 0.0, "end": 0.5},
+            ]},
+            {"text": "System", "segments": [
+                {"text": "System", "start": 1.0, "end": 1.5},
+            ]},
+        ])
+        real_unlink = Path.unlink
+        attempts = {self.mic_path: 0, self.system_path: 0}
+
+        def windows_transient_unlink(path, *args, **kwargs):
+            if path in attempts:
+                attempts[path] += 1
+                if attempts[path] < 3:
+                    raise PermissionError("Windows indexing holds the WAV briefly")
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", new=windows_transient_unlink), patch(
+            "src.transcriber.time.sleep"
+        ) as sleep, patch.object(
+            transcriber_mod,
+            "_unlink_temporary_audio",
+            wraps=transcriber_mod._unlink_temporary_audio,
+        ) as cleanup:
+            self.transcriber.transcribe_diarised(self.audio_path)
+
+        self.assertEqual(attempts, {self.mic_path: 3, self.system_path: 3})
+        self.assertEqual(sleep.call_count, 4)
+        self.assertFalse(self.mic_path.exists())
+        self.assertFalse(self.system_path.exists())
+        self.assertEqual(cleanup.call_count, 2)
+        self.assertTrue(all(
+            call.args[1] == "stereo channel" for call in cleanup.call_args_list
+        ))
 
     def test_single_source_is_not_timestamped_or_diarised(self):
         self.transcriber.transcribe_audio = Mock(side_effect=[

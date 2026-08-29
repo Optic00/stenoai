@@ -518,6 +518,22 @@ class OpenAiAsrTests(unittest.TestCase):
         self.assertEqual(result["segments"][0]["start"], 0.5)
         self.assertEqual(result["detected_language"], "en")
 
+    def test_canonical_wav_gate_runs_once_before_network_then_rechecks_response(self):
+        transcriber = _build_transcriber()
+        opener = _FakeOpener([_json_response({"text": "short", "segments": []})])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch(
+                "src.transcriber._openai_asr_analyse_canonical_wav",
+                wraps=transcriber_mod._openai_asr_analyse_canonical_wav,
+            ) as analyse, patch("urllib.request.build_opener", return_value=opener):
+                transcriber._run_openai_asr(audio, language="en")
+
+        # First call gates the opener/upload. The second is deliberate
+        # post-response validation of the bytes whose result is accepted.
+        self.assertEqual(analyse.call_count, 2)
+
     def test_request_wait_is_guarded_by_a_heartbeat_context(self):
         transcriber = _build_transcriber()
         opener = _FakeOpener([_json_response({"text": "short", "segments": []})])
@@ -773,14 +789,16 @@ class OpenAiAsrTests(unittest.TestCase):
         self.assertLess(opener.calls, 3, "deadline must prevent the third-format success")
         self.assertLess(time.monotonic() - started, 1.0)
 
-    def test_oversized_non_wav_names_25_mb_limit(self):
+    def test_oversized_non_wav_fails_before_any_upload(self):
         transcriber = _build_transcriber()
         with tempfile.TemporaryDirectory() as tmp_dir:
             audio = Path(tmp_dir) / "invalid.wav"
             with audio.open("wb") as fh:
                 fh.truncate(OPENAI_ASR_CHUNK_THRESHOLD_BYTES + 1)
-            with self.assertRaisesRegex(RuntimeError, "25 MB"):
-                transcriber._run_openai_asr(audio, language="en")
+            with patch("urllib.request.build_opener") as build_opener:
+                with self.assertRaisesRegex(RuntimeError, "canonical WAV"):
+                    transcriber._run_openai_asr(audio, language="en")
+            build_opener.assert_not_called()
 
     def test_verbose_json_missing_text_raises(self):
         transcriber = _build_transcriber()
@@ -1347,23 +1365,26 @@ class OpenAiAsrTests(unittest.TestCase):
             self.assertFalse(result.get("transcription_failed"))
             self.assertEqual(result["text"], transcriber_mod.SILENCE_SENTINEL)
 
-    def test_empty_or_timestamped_noncanonical_audio_response_fails_closed(self):
+    def test_noncanonical_audio_fails_closed_before_any_network_interaction(self):
         transcriber = _build_transcriber()
         with tempfile.TemporaryDirectory() as tmp_dir:
             audio = Path(tmp_dir) / "unverified.mp3"
-            audio.write_bytes(b"not a wav")
-            for response in (
-                {"text": "", "segments": []},
-                {"text": "unbounded", "segments": [
-                    {"text": "unbounded", "start": 99.0, "end": 100.0},
-                ]},
-            ):
-                with self.subTest(response=response), patch(
-                    "urllib.request.build_opener",
-                    return_value=_FakeOpener([_json_response(response)]),
-                ):
-                    with self.assertRaisesRegex(RuntimeError, "canonical WAV"):
-                        transcriber._run_openai_asr(audio, language="en")
+            audio.write_bytes(b"not a wav" * 200)
+            with patch("urllib.request.build_opener") as build_opener:
+                with self.assertRaisesRegex(RuntimeError, "canonical WAV"):
+                    transcriber._run_openai_asr(audio, language="en")
+            build_opener.assert_not_called()
+
+    def test_malicious_model_metadata_fails_before_network_interaction(self):
+        transcriber = _build_transcriber()
+        transcriber._openai_asr_model = "whisper-1\r\nInjected: yes"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch("urllib.request.build_opener") as build_opener:
+                with self.assertRaisesRegex(RuntimeError, "multipart metadata"):
+                    transcriber._run_openai_asr(audio, language="en")
+            build_opener.assert_not_called()
 
     def test_sub_1kb_cloud_inputs_fail_and_pipeline_preserves_recording(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

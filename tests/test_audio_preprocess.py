@@ -125,6 +125,37 @@ class PreprocessAudioTests(unittest.TestCase):
             for temp_path in [prep_one, prep_two, converted_one, converted_two, mic, system]:
                 temp_path.unlink()
 
+    def test_failed_stereo_split_uses_retrying_private_temp_cleanup(self):
+        transcriber = _build_transcriber()
+
+        def fake_run(cmd, **_kwargs):
+            if "-t" in cmd:
+                return SimpleNamespace(
+                    returncode=0,
+                    stderr="Audio: pcm_s16le, stereo\nDuration: 00:00:10.00",
+                    stdout="",
+                )
+            return SimpleNamespace(returncode=1, stderr=b"split failed")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source = _make_audio_file(tmp_dir)
+            with patch.object(transcriber_mod, "_resolve_ffmpeg", return_value="/fake/ffmpeg"), \
+                 patch.object(transcriber_mod.subprocess, "run", side_effect=fake_run), \
+                 patch.object(
+                     transcriber_mod,
+                     "_unlink_temporary_audio",
+                     wraps=transcriber_mod._unlink_temporary_audio,
+                 ) as cleanup:
+                self.assertEqual(
+                    transcriber._split_stereo_to_channels(source),
+                    (None, None, None),
+                )
+
+        self.assertEqual(cleanup.call_count, 2)
+        self.assertTrue(all(
+            call.args[1] == "stereo channel" for call in cleanup.call_args_list
+        ))
+
     def test_falls_back_when_ffmpeg_missing(self):
         transcriber = _build_transcriber()
         with tempfile.TemporaryDirectory() as tmp_dir:

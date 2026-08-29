@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('crypto');
+
 const OPENAI_ASR_DEFAULT_URL = 'https://api.openai.com/v1';
 const OPENAI_ASR_MAX_KEY_LENGTH = 4096;
 
@@ -24,6 +26,14 @@ function normalizeOpenAiAsrOrigin(apiUrl) {
   }
 }
 
+function legacyCredentialSnapshotDigest(key, apiUrl) {
+  // Match src.config._legacy_openai_asr_snapshot_digest exactly. The digest
+  // is a compare-and-delete capability, never a substitute credential.
+  return crypto.createHash('sha256')
+    .update(JSON.stringify([key, typeof apiUrl === 'string' ? apiUrl : null]), 'utf8')
+    .digest('hex');
+}
+
 function readLegacyCredentialSnapshot({ fs, configPath }) {
   try {
     if (!fs.existsSync(configPath)) return null;
@@ -38,7 +48,11 @@ function readLegacyCredentialSnapshot({ fs, configPath }) {
       ? config.openai_asr_api_url
       : OPENAI_ASR_DEFAULT_URL;
     const origin = normalizeOpenAiAsrOrigin(apiUrl);
-    return origin ? { key, origin } : null;
+    return {
+      key,
+      origin,
+      snapshotDigest: legacyCredentialSnapshotDigest(key, apiUrl),
+    };
   } catch (_) {
     return null;
   }
@@ -231,6 +245,7 @@ function saveEncryptedKeyAtomically({ fs, path, processId, now, keyPath, key, or
 module.exports = {
   isEncryptedKeyCleared,
   isValidOpenAiAsrApiKey,
+  legacyCredentialSnapshotDigest,
   legacyKeyMigrationAction,
   loadEncryptedKeyForOrigin,
   markEncryptedKeyClearedAtomically,

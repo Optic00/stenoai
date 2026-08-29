@@ -1776,14 +1776,21 @@ def remove_legacy_openai_asr_api_key_cmd():
     """Remove a plaintext legacy ASR key after safeStorage migration.
 
     The value is never accepted, printed, or logged by this CLI. Electron has
-    already encrypted and read it back before invoking this command.
+    already encrypted and read it back before invoking this command. Its
+    SHA-256 snapshot digest reaches this command only through a targeted env
+    variable, so a concurrent replacement cannot be deleted by mistake.
     """
+    import os
+
     from src.config import get_config
     config = get_config()
-    if config.remove_legacy_openai_asr_api_key():
+    expected_snapshot_digest = os.environ.get(
+        "STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST", ""
+    )
+    if config.remove_legacy_openai_asr_api_key(expected_snapshot_digest):
         print(json.dumps({"success": True}))
     else:
-        print(json.dumps({"success": False, "error": "Failed to remove legacy ASR key"}))
+        print(json.dumps({"success": False, "error": "Legacy ASR key changed or was not removed"}))
 
 
 @cli.command(name='onnx-selftest')

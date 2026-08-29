@@ -5,6 +5,8 @@ Handles storing and loading user preferences like model selection.
 """
 
 import copy
+import hashlib
+import hmac
 import json
 import logging
 import math
@@ -43,6 +45,29 @@ logger = logging.getLogger(__name__)
 BEDROCK_REGION_RE = re.compile(r"[a-z]{2}(-gov)?-[a-z]+-[0-9]{1,2}")
 
 OPENAI_ASR_DEFAULT_URL = "https://api.openai.com/v1"
+
+
+def _legacy_openai_asr_snapshot_digest(config: Dict[str, Any]) -> Optional[str]:
+    """Digest the exact legacy credential snapshot without exposing its key.
+
+    Electron reads the same two fields once before invoking the cleanup CLI.
+    The digest lets the CLI prove that neither the plaintext key nor its
+    endpoint value changed in the intervening time, without putting the key in
+    argv, stdout, or logs. Keep this compact JSON shape aligned with
+    ``legacyCredentialSnapshotDigest`` in app/openai-asr-key-store.js.
+    """
+    legacy_key = config.get("openai_asr_api_key")
+    if not isinstance(legacy_key, str) or not legacy_key.strip():
+        return None
+    api_url = config.get("openai_asr_api_url", OPENAI_ASR_DEFAULT_URL)
+    if not isinstance(api_url, str):
+        api_url = None
+    canonical = json.dumps(
+        [legacy_key.strip(), api_url],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _redact_url_credentials(value: object) -> str:
@@ -2232,20 +2257,49 @@ class Config:
         import os
         return os.environ.get("STENOAI_OAI_API_KEY", "")
 
-    def remove_legacy_openai_asr_api_key(self) -> bool:
-        """Remove a plaintext pre-safeStorage ASR key after Electron migrated it.
+    def remove_legacy_openai_asr_api_key(
+        self, expected_snapshot_digest: Optional[str] = None,
+    ) -> bool:
+        """Remove a plaintext legacy ASR key, optionally via locked CAS.
 
-        Electron calls this only after it has encrypted and read back the
-        credential through safeStorage.  Keep the old value in memory when a
-        disk write fails so a retry cannot silently discard the only copy.
+        The migration CLI always supplies a SHA-256 digest of Electron's
+        single-read legacy snapshot.  Re-reading under the config lock avoids
+        deleting a replacement entered after Electron read the old plaintext.
+        Direct in-process callers retain the historical no-digest behaviour.
         """
-        if "openai_asr_api_key" not in self._config:
-            return True
-        legacy_key = self._config.pop("openai_asr_api_key")
-        if self._save():
-            return True
-        self._config["openai_asr_api_key"] = legacy_key
-        return False
+        if expected_snapshot_digest is None:
+            if "openai_asr_api_key" not in self._config:
+                return True
+            legacy_key = self._config.pop("openai_asr_api_key")
+            if self._save():
+                return True
+            self._config["openai_asr_api_key"] = legacy_key
+            return False
+
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_snapshot_digest):
+            return False
+
+        lock_path = str(self.config_path) + ".lock"
+        try:
+            with filelock.FileLock(lock_path, timeout=self._SAVE_LOCK_TIMEOUT):
+                current = self._read_disk_for_merge()
+                if current is None:
+                    return False
+                current_digest = _legacy_openai_asr_snapshot_digest(current)
+                if current_digest is None:
+                    # Another writer already removed the key. Nothing remains
+                    # to delete, and crucially no replacement was discarded.
+                    return "openai_asr_api_key" not in current
+                if not hmac.compare_digest(current_digest, expected_snapshot_digest):
+                    return False
+                current.pop("openai_asr_api_key")
+                _atomic_write_json(self.config_path, current)
+                self._config = current
+                self._snapshot = copy.deepcopy(current)
+                logger.info("Removed migrated legacy OpenAI ASR credential")
+                return True
+        except (filelock.Timeout, OSError, ValueError):
+            return False
 
     def get_openai_asr_model(self) -> str:
         """Model name passed to the OpenAI-compatible STT endpoint.

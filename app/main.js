@@ -9019,7 +9019,7 @@ function readLegacyOpenAiAsrCredential() {
 
 function secureLegacyOpenAiAsrApiKey() {
   const legacy = readLegacyOpenAiAsrCredential();
-  if (!legacy) return false;
+  if (!legacy || !legacy.origin) return false;
   const stored = loadOpenAiAsrKey(legacy.origin);
   const action = legacyKeyMigrationAction({
     cleared: isOpenAiAsrKeyCleared(),
@@ -9039,7 +9039,7 @@ function secureLegacyOpenAiAsrApiKey() {
 async function migrateLegacyOpenAiAsrApiKey() {
   const legacy = readLegacyOpenAiAsrCredential();
   if (!legacy) return true;
-  let stored = loadOpenAiAsrKey(legacy.origin);
+  let stored = legacy.origin ? loadOpenAiAsrKey(legacy.origin) : null;
   const action = legacyKeyMigrationAction({
     cleared: isOpenAiAsrKeyCleared(),
     legacyKey: legacy.key,
@@ -9050,6 +9050,7 @@ async function migrateLegacyOpenAiAsrApiKey() {
     try {
       const raw = await runPythonScript(
         'simple_recorder.py', ['remove-legacy-openai-asr-api-key'], true,
+        { STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST: legacy.snapshotDigest },
       );
       return JSON.parse(raw.trim()).success === true;
     } catch (_) {
@@ -9058,6 +9059,10 @@ async function migrateLegacyOpenAiAsrApiKey() {
       return false;
     }
   };
+  // An invalid legacy endpoint cannot safely receive a migrated credential.
+  // Its plaintext nevertheless must not survive forever; the digest-bound
+  // CLI cleanup removes only the exact snapshot we read above.
+  if (!legacy.origin) return removeLegacyKey();
   if (action === 'remove-legacy') return removeLegacyKey();
   if (action === 'secure') {
     try {
