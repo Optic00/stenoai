@@ -160,6 +160,29 @@ CHANNEL_DOMINANCE_MIN_AVG_TURN_SECONDS = SUGGESTION_MIN_AVG_TURN_SECONDS
 # can detect it exactly.
 SILENCE_SENTINEL = "No speech detected in audio"
 
+# OpenAI documents a 25 MB transcription upload limit. Start chunking at
+# 24 MiB to leave headroom for the multipart fields and boundary bytes.
+OPENAI_ASR_CHUNK_THRESHOLD_BYTES = 24 * 1024 * 1024
+OPENAI_ASR_MAX_CHUNK_SECONDS = 600
+
+OPENAI_LANGUAGE_NAME_TO_CODE = {
+    "english": "en",
+    "german": "de",
+    "french": "fr",
+    "spanish": "es",
+    "italian": "it",
+    "portuguese": "pt",
+    "dutch": "nl",
+    "polish": "pl",
+    "russian": "ru",
+    "japanese": "ja",
+    "chinese": "zh",
+    "korean": "ko",
+    "arabic": "ar",
+    "hindi": "hi",
+    "turkish": "tr",
+}
+
 
 # Resolve a usable ffmpeg binary. Electron-spawned subprocesses don't inherit
 # the user's shell PATH (no /opt/homebrew/bin), so a bare `ffmpeg` string fails
@@ -169,6 +192,16 @@ SILENCE_SENTINEL = "No speech detected in audio"
 # calls from multiple transcription threads.
 _FFMPEG_PATH_CACHE: Optional[str] = None
 _FFMPEG_PATH_LOCK = threading.Lock()
+
+
+def _normalize_openai_language(language: Optional[str]) -> Optional[str]:
+    """Convert common full language names from OpenAI to ISO codes."""
+    if not isinstance(language, str):
+        return language
+    key = language.lower()
+    if 1 <= len(key) <= 3:
+        return language
+    return OPENAI_LANGUAGE_NAME_TO_CODE.get(key, language)
 
 
 def _resolve_ffmpeg() -> Optional[str]:
@@ -1800,16 +1833,16 @@ class WhisperTranscriber:
     def _run_openai_asr(self, audio_filepath: Path, language: str) -> dict:
         """POST audio to an OpenAI-compatible /audio/transcriptions endpoint.
 
-        Uses only Python stdlib (urllib + email) -- no new runtime dependency.
+        Uses only Python stdlib (urllib + wave) -- no runtime dependency.
 
         Return shape is identical to ``_run_parakeet`` / ``_run_whisper_cpp``
         so the rest of the pipeline is unchanged.
 
-        Two-pass strategy:
+        Response negotiation:
         1. Try ``response_format=verbose_json`` to get per-segment timestamps.
-        2. If the endpoint returns a non-200 or malformed response, fall back
-           to ``response_format=text`` and synthesise a single full-text
-           segment with no timestamps.
+        2. Fall back to ``response_format=json``.
+        3. Fall back to ``response_format=text`` and synthesise a single
+           full-text segment with no timestamps.
 
         Errors surface as a raised exception so ``transcribe_audio``'s outer
         try/except records them as ``transcription_failed`` (audio preserved,
@@ -1818,10 +1851,12 @@ class WhisperTranscriber:
         import json as _json
         import mimetypes
         import os
+        import time
         import urllib.error
         import urllib.parse
         import urllib.request
         import uuid
+        import wave
 
         api_url = (getattr(self, "_openai_asr_api_url", "") or "https://api.openai.com/v1").rstrip("/")
         api_key = getattr(self, "_openai_asr_api_key", "")
@@ -1849,7 +1884,6 @@ class WhisperTranscriber:
             )
 
         boundary = uuid.uuid4().hex
-        mime_type = mimetypes.guess_type(str(audio_filepath))[0] or "audio/wav"
 
         def _field(name: str, value: str) -> bytes:
             return (
@@ -1866,24 +1900,28 @@ class WhisperTranscriber:
             ).encode()
 
         class _MultipartStream:
-            def __init__(self, response_format: str):
+            def __init__(self, response_format: str, request_audio_path: Path):
+                mime_type = mimetypes.guess_type(str(request_audio_path))[0] or "audio/wav"
                 self.prefix_parts = [
                     _field("model", model),
                     _field("response_format", response_format),
                 ]
                 if language and language != "auto":
                     self.prefix_parts.append(_field("language", language))
-                self.prefix_parts.append(_file_field_header("file", audio_filepath.name, mime_type))
+                self.prefix_parts.append(
+                    _file_field_header("file", request_audio_path.name, mime_type)
+                )
 
                 self.prefix_bytes = b"".join(self.prefix_parts)
                 self.suffix_bytes = f"\r\n--{boundary}--\r\n".encode()
 
-                self.file_size = os.path.getsize(audio_filepath)
+                self.audio_path = request_audio_path
+                self.file_size = os.path.getsize(request_audio_path)
                 self.total_size = len(self.prefix_bytes) + self.file_size + len(self.suffix_bytes)
 
             def __iter__(self):
                 yield self.prefix_bytes
-                with open(audio_filepath, "rb") as fh:
+                with open(self.audio_path, "rb") as fh:
                     while True:
                         chunk = fh.read(8192 * 8)
                         if not chunk:
@@ -1921,76 +1959,249 @@ class WhisperTranscriber:
                 )
         opener = urllib.request.build_opener(NoRedirectHandler)
 
-        def _do_request(response_format: str) -> bytes:
-            stream = _MultipartStream(response_format)
-            req = urllib.request.Request(
-                endpoint,
-                data=stream,
-                headers={**headers, "Content-Length": str(len(stream))},
-                method="POST",
-            )
-            try:
-                with opener.open(req, timeout=300) as resp:
-                    return resp.read()
-            except urllib.error.HTTPError as e:
-                err_body = e.read().decode(errors="replace")[:500]
-                raise RuntimeError(
-                    f"openai-asr HTTP {e.code}: {err_body}"
-                ) from e
+        def _do_request(response_format: str, request_audio_path: Path) -> tuple[bytes, str]:
+            for attempt in range(2):
+                stream = _MultipartStream(response_format, request_audio_path)
+                req = urllib.request.Request(
+                    endpoint,
+                    data=stream,
+                    headers={**headers, "Content-Length": str(len(stream))},
+                    method="POST",
+                )
+                try:
+                    with opener.open(req, timeout=300) as resp:
+                        content_type = resp.headers.get("Content-Type", "") or ""
+                        return resp.read(), content_type
+                except urllib.error.HTTPError as e:
+                    retryable = e.code == 429 or 500 <= e.code <= 599
+                    if attempt == 0 and retryable:
+                        e.close()
+                        time.sleep(2)
+                        continue
+                    err_body = e.read().decode(errors="replace")
+                    e.close()
+                    err_body = re.sub(r"Bearer\s+\S+", "Bearer [redacted]", err_body)
+                    err_body = re.sub(
+                        r"sk-[A-Za-z0-9_\-]{8,}", "[redacted]", err_body
+                    )[:500]
+                    raise RuntimeError(
+                        f"openai-asr HTTP {e.code}: {err_body}"
+                    ) from e
+                except urllib.error.URLError:
+                    if attempt == 0:
+                        time.sleep(2)
+                        continue
+                    raise
+            raise RuntimeError("openai-asr request retry loop exhausted")
 
-        # --- Pass 1: verbose_json (segments + timestamps) ---------------
-        try:
-            raw = _do_request("verbose_json")
-            data = _json.loads(raw.decode())
-            # verbose_json shape: {"text": "...", "segments": [...], ...}
-            raw_text = (data.get("text") or "").strip()
-            raw_segs = data.get("segments") or []
-            detected_lang = data.get("language") or (None if language == "auto" else language)
-            segments = [
-                {
-                    "text": s.get("text", "").strip(),
-                    "start": float(s.get("start") or 0.0),
-                    "end": float(s.get("end") or 0.0),
-                }
-                for s in raw_segs
-                if s.get("text", "").strip()
-            ]
-            logger.info(
-                "openai-asr verbose_json: %d chars, %d segments",
-                len(raw_text), len(segments),
+        def _can_fallback(error: Exception) -> bool:
+            if isinstance(error, _json.JSONDecodeError):
+                return True
+            return (
+                isinstance(error, RuntimeError)
+                and getattr(error.__cause__, "code", None) in (400, 422, 501)
             )
+
+        def _text_result(text: str) -> dict:
+            detected_lang = None if language == "auto" else language
             return {
-                "text": raw_text or None,
-                "segments": segments,
-                "duration_seconds": float(data.get("duration") or 0) or None,
+                "text": text or None,
+                "segments": (
+                    [{"text": text, "start": 0.0, "end": 0.0}] if text else []
+                ),
+                "duration_seconds": None,
                 "detected_language": detected_lang,
                 "detected_language_probability": None,
             }
-        except Exception as primary_err:
-            fallback = False
-            if isinstance(primary_err, _json.JSONDecodeError):
-                fallback = True
-            elif isinstance(primary_err, RuntimeError) and getattr(primary_err.__cause__, "code", None) in (400, 422, 501):
-                fallback = True
 
-            if not fallback:
-                raise
+        def _transcribe_one(request_audio_path: Path) -> dict:
+            # --- Pass 1: verbose_json (segments + timestamps) -----------
+            try:
+                raw, _content_type = _do_request(
+                    "verbose_json", request_audio_path
+                )
+                data = _json.loads(raw.decode())
+                if not isinstance(data, dict) or "text" not in data:
+                    raise RuntimeError(
+                        "openai-asr verbose_json response must be a JSON object "
+                        "containing 'text'"
+                    )
+                if not isinstance(data["text"], str):
+                    raise RuntimeError(
+                        "openai-asr verbose_json response 'text' must be a string"
+                    )
+                raw_text = data["text"].strip()
+                if not raw_text and data.get("segments") != []:
+                    raise RuntimeError(
+                        "openai-asr verbose_json empty 'text' requires present-and-empty "
+                        "'segments'"
+                    )
+                raw_segs = data.get("segments") or []
+                detected_lang = data.get("language") or (
+                    None if language == "auto" else language
+                )
+                segments = [
+                    {
+                        "text": segment.get("text", "").strip(),
+                        "start": float(segment.get("start") or 0.0),
+                        "end": float(segment.get("end") or 0.0),
+                    }
+                    for segment in raw_segs
+                    if segment.get("text", "").strip()
+                ]
+                logger.info(
+                    "openai-asr verbose_json: %d chars, %d segments",
+                    len(raw_text), len(segments),
+                )
+                return {
+                    "text": raw_text or None,
+                    "segments": segments,
+                    "duration_seconds": (
+                        float(data.get("duration") or 0) or None
+                    ),
+                    "detected_language": _normalize_openai_language(
+                        detected_lang
+                    ),
+                    "detected_language_probability": None,
+                }
+            except Exception as verbose_error:
+                if not _can_fallback(verbose_error):
+                    raise
+                logger.warning(
+                    "openai-asr verbose_json failed (%s); falling back to json format",
+                    verbose_error,
+                )
 
-            logger.warning(
-                "openai-asr verbose_json failed (%s); falling back to text format",
-                primary_err,
+            # --- Pass 2: json (full text, no timestamps) ----------------
+            try:
+                raw, _content_type = _do_request("json", request_audio_path)
+                data = _json.loads(raw.decode())
+                if not isinstance(data, dict) or "text" not in data:
+                    raise RuntimeError(
+                        "openai-asr json response must be a JSON object containing 'text'"
+                    )
+                if not isinstance(data["text"], str):
+                    raise RuntimeError(
+                        "openai-asr json response 'text' must be a string"
+                    )
+                text = data["text"].strip()
+                logger.info("openai-asr json fallback: %d chars", len(text))
+                return _text_result(text)
+            except Exception as json_error:
+                if not _can_fallback(json_error):
+                    raise
+                logger.warning(
+                    "openai-asr json failed (%s); falling back to text format",
+                    json_error,
+                )
+
+            # --- Pass 3: plain text fallback ----------------------------
+            raw, content_type = _do_request("text", request_audio_path)
+            text = raw.decode(errors="replace").strip()
+            leading = text.lstrip().lower()
+            if (
+                "text/html" in content_type.lower()
+                or leading.startswith("<!doctype")
+                or leading.startswith("<html")
+            ):
+                raise RuntimeError(
+                    "openai-asr text response looks like HTML from a likely "
+                    "misconfigured endpoint"
+                )
+            logger.info("openai-asr text fallback: %d chars", len(text))
+            return _text_result(text)
+
+        if audio_filepath.stat().st_size <= OPENAI_ASR_CHUNK_THRESHOLD_BYTES:
+            return _transcribe_one(audio_filepath)
+
+        limit_error = (
+            "openai-asr audio exceeds the 25 MB upload limit and is not a "
+            "readable 16 kHz mono PCM WAV; cannot split it safely"
+        )
+        try:
+            source_wav = wave.open(str(audio_filepath), "rb")
+        except (EOFError, OSError, wave.Error) as error:
+            raise RuntimeError(limit_error) from error
+
+        with source_wav:
+            if (
+                source_wav.getframerate() != 16000
+                or source_wav.getnchannels() != 1
+                or source_wav.getsampwidth() != 2
+                or source_wav.getcomptype() != "NONE"
+            ):
+                raise RuntimeError(limit_error)
+
+            frames_per_chunk = (
+                source_wav.getframerate() * OPENAI_ASR_MAX_CHUNK_SECONDS
             )
+            total_frames = source_wav.getnframes()
+            total_chunks = math.ceil(total_frames / frames_per_chunk)
+            if total_chunks < 1:
+                raise RuntimeError(limit_error)
 
-        # --- Pass 2: plain text fallback --------------------------------
-        raw = _do_request("text")
-        text = raw.decode(errors="replace").strip()
-        detected_lang = None if language == "auto" else language
-        logger.info("openai-asr text fallback: %d chars", len(text))
+            texts = []
+            segments = []
+            detected_language = None
+            duration_seconds = 0.0
+            has_duration = False
+
+            for chunk_index in range(total_chunks):
+                chunk_start_frames = chunk_index * frames_per_chunk
+                chunk_start_seconds = (
+                    chunk_start_frames / source_wav.getframerate()
+                )
+                chunk_frames = source_wav.readframes(frames_per_chunk)
+                if not chunk_frames:
+                    raise RuntimeError(limit_error)
+
+                fd, chunk_name = tempfile.mkstemp(
+                    prefix=f"stenoai_oai_{audio_filepath.stem}_",
+                    suffix=".wav",
+                )
+                os.close(fd)
+                chunk_path = Path(chunk_name)
+                try:
+                    with wave.open(str(chunk_path), "wb") as chunk_wav:
+                        chunk_wav.setnchannels(1)
+                        chunk_wav.setsampwidth(2)
+                        chunk_wav.setframerate(16000)
+                        chunk_wav.writeframes(chunk_frames)
+
+                    chunk_result = _transcribe_one(chunk_path)
+                finally:
+                    try:
+                        chunk_path.unlink()
+                    except OSError:
+                        pass
+
+                chunk_text = (chunk_result.get("text") or "").strip()
+                if chunk_text:
+                    texts.append(chunk_text)
+                for segment in chunk_result.get("segments") or []:
+                    segments.append(
+                        {
+                            "text": segment["text"],
+                            "start": float(segment["start"]) + chunk_start_seconds,
+                            "end": float(segment["end"]) + chunk_start_seconds,
+                        }
+                    )
+                if (
+                    detected_language is None
+                    and chunk_result.get("detected_language")
+                ):
+                    detected_language = chunk_result["detected_language"]
+                chunk_duration = chunk_result.get("duration_seconds")
+                if chunk_duration is not None:
+                    duration_seconds += float(chunk_duration)
+                    has_duration = True
+                _emit_heartbeat(chunk_index + 1, total_chunks)
+
         return {
-            "text": text or None,
-            "segments": [{"text": text, "start": 0.0, "end": 0.0}] if text else [],
-            "duration_seconds": None,
-            "detected_language": detected_lang,
+            "text": " ".join(texts) or None,
+            "segments": segments,
+            "duration_seconds": duration_seconds if has_duration else None,
+            "detected_language": detected_language,
             "detected_language_probability": None,
         }
 

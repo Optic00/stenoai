@@ -8918,12 +8918,12 @@ function saveOpenAiAsrKey(key) {
     if (!fs.existsSync(keyDir)) {
       fs.mkdirSync(keyDir, { recursive: true });
     }
-    const encrypted = safeStorage.encryptString(key);
+    const encrypted = getSafeStorage().encryptString(key);
     fs.writeFileSync(getOpenAiAsrKeyPath(), encrypted);
     return true;
   } catch (error) {
     console.error('Failed to save OpenAI ASR API key:', error.message);
-    return false;
+    throw error;
   }
 }
 
@@ -8933,7 +8933,7 @@ function loadOpenAiAsrKey() {
     migrateLegacyCredentialFile(keyPath, '.openai-asr-api-key');
     if (!fs.existsSync(keyPath)) return null;
     const encrypted = fs.readFileSync(keyPath);
-    return safeStorage.decryptString(encrypted);
+    return getSafeStorage().decryptString(encrypted);
   } catch (error) {
     console.error('Failed to load OpenAI ASR API key:', error.message);
     return null;
@@ -8962,12 +8962,12 @@ function getAiEnv() {
   return env;
 }
 
-// Env additions a transcription subprocess needs. The OpenAI-compatible ASR
-// key (decrypted from safeStorage only here) is surfaced as STENOAI_OAI_API_KEY
-// so the Python transcriber's get_openai_asr_api_key() can read it. Empty when
-// no key is set / the engine isn't openai-asr — the Python side no-ops on it.
+// Env additions a transcription subprocess needs. Only when openai-asr is the
+// configured engine, decrypt its key from safeStorage and surface it to the
+// Python transcriber as STENOAI_OAI_API_KEY.
 function getTranscriptionEnv() {
   const env = {};
+  if (loadTranscriptionEngine() !== 'openai-asr') return env;
   const oaiKey = loadOpenAiAsrKey();
   if (oaiKey) env.STENOAI_OAI_API_KEY = oaiKey;
   return env;

@@ -224,6 +224,43 @@ class ConfigOpenAiAsrTests(unittest.TestCase):
             self.assertFalse(config.set_openai_asr_api_url("   "))
             self.assertEqual(config.get_openai_asr_api_url(), "https://custom.example/v1")
 
+    def test_set_api_url_rejects_remote_plain_http_and_keeps_prior(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            self.assertTrue(config.set_openai_asr_api_url("https://custom.example/v1"))
+            self.assertFalse(config.set_openai_asr_api_url("http://evil.example/v1"))
+            self.assertEqual(config.get_openai_asr_api_url(), "https://custom.example/v1")
+
+    def test_set_api_url_accepts_loopback_plain_http(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            for url in (
+                "http://localhost:9000/v1",
+                "http://127.0.0.1:9000/v1",
+                "http://[::1]:9000/v1",
+            ):
+                with self.subTest(url=url):
+                    self.assertTrue(config.set_openai_asr_api_url(url))
+                    self.assertEqual(config.get_openai_asr_api_url(), url)
+
+    def test_set_api_url_rejects_malformed_url_without_raising(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            with self.assertLogs("src.config", level="ERROR") as captured:
+                try:
+                    result = config.set_openai_asr_api_url("http://[")
+                except ValueError as error:
+                    self.fail(f"setter raised instead of returning False: {error}")
+            self.assertFalse(result)
+            self.assertIn("URL", " ".join(captured.output))
+
+    def test_set_api_url_rejects_missing_host_or_embedded_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            for url in ("https://", "https://key@example.com/v1"):
+                with self.subTest(url=url):
+                    self.assertFalse(config.set_openai_asr_api_url(url))
+
     def test_set_model_rejects_blank_and_keeps_prior(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = Config(config_path=Path(tmp_dir) / "config.json")
