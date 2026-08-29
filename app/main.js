@@ -57,11 +57,13 @@ const {
   legacyKeyMigrationAction,
   loadEncryptedKeyForOrigin,
   markEncryptedKeyClearedAtomically,
-  readLegacyCredentialSnapshot,
   readOpenAiAsrConfigSnapshot,
   readOpenAiAsrEndpointSnapshot,
   saveEncryptedKeyAtomically,
 } = require('./openai-asr-key-store');
+// Keep an unreadable config distinct from a readable config without a legacy
+// key. Migration may treat only the latter as complete.
+const OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE = Symbol('openai-asr-config-snapshot-unreadable');
 const { registerOpenAiAsrIpc } = require('./openai-asr-ipc');
 const { createDebugLog } = require('./debug-log');
 const { createTeardownRegistry } = require('./teardown');
@@ -8998,13 +9000,15 @@ function hasOpenAiAsrKey() {
 }
 
 function readLegacyOpenAiAsrCredential() {
-  return readLegacyCredentialSnapshot({
+  const snapshot = readOpenAiAsrConfigSnapshot({
     fs,
     configPath: path.join(getUserDataDir(), 'config.json'),
   });
+  return snapshot === null ? OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE : snapshot.legacy;
 }
 
 function secureLegacyOpenAiAsrApiKey(legacy = readLegacyOpenAiAsrCredential()) {
+  if (legacy === OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE) return false;
   if (!legacy || !legacy.key || !legacy.origin) return false;
   const stored = loadOpenAiAsrKey(legacy.origin);
   const action = legacyKeyMigrationAction({
@@ -9023,6 +9027,7 @@ function secureLegacyOpenAiAsrApiKey(legacy = readLegacyOpenAiAsrCredential()) {
 }
 
 async function migrateLegacyOpenAiAsrApiKey(legacy = readLegacyOpenAiAsrCredential()) {
+  if (legacy === OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE) return false;
   if (!legacy) return true;
   const removeLegacyKey = async () => {
     try {
@@ -9099,10 +9104,9 @@ function getTranscriptionEnv() {
   });
   // Endpoint, origin, and any legacy credential come from one direct config
   // read. Do not let the asynchronous cleanup read a replacement endpoint.
-  // Pass null after a failed snapshot read. Passing undefined would trigger
-  // both helpers' backwards-compatible default parameter and re-read a
-  // potentially different config while this job is being assembled.
-  const legacy = configSnapshot ? configSnapshot.legacy : null;
+  const legacy = configSnapshot === null
+    ? OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE
+    : configSnapshot.legacy;
   secureLegacyOpenAiAsrApiKey(legacy);
   void migrateLegacyOpenAiAsrApiKey(legacy);
   const endpoint = configSnapshot?.endpoint || null;

@@ -343,6 +343,74 @@ class ConfigWhisperModelTests(unittest.TestCase):
 
 
 class ConfigOpenAiAsrTests(unittest.TestCase):
+    def test_endpoint_cli_update_rejects_legacy_key_added_before_locked_transaction(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            config = Config(config_path=path)
+            # Model Electron's successful migration followed by an older
+            # writer adding plaintext just before the endpoint writer obtains
+            # the lock. begin_transaction() must reload this under that lock.
+            path.write_text(json.dumps({
+                "openai_asr_api_key": "late-legacy-key",
+                "openai_asr_api_url": "https://old.example/v1",
+            }))
+
+            with patch("src.config.get_config", return_value=config):
+                result = CliRunner().invoke(
+                    simple_recorder.set_openai_asr_config_cmd,
+                    ["--api-url", "https://replacement.example/v1"],
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertFalse(json.loads(result.output)["success"])
+            self.assertNotIn("late-legacy-key", result.output)
+            self.assertEqual(json.loads(path.read_text()), {
+                "openai_asr_api_key": "late-legacy-key",
+                "openai_asr_api_url": "https://old.example/v1",
+            })
+
+    def test_model_only_cli_update_preserves_legacy_key_and_remains_available(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(json.dumps({
+                "openai_asr_api_key": "legacy-key",
+                "openai_asr_api_url": "https://old.example/v1",
+            }))
+            config = Config(config_path=path)
+
+            with patch("src.config.get_config", return_value=config):
+                result = CliRunner().invoke(
+                    simple_recorder.set_openai_asr_config_cmd,
+                    ["--model", "whisper-large-v3"],
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertTrue(json.loads(result.output)["success"])
+            reloaded = json.loads(path.read_text())
+            self.assertEqual(reloaded["openai_asr_api_key"], "legacy-key")
+            self.assertEqual(reloaded["openai_asr_api_url"], "https://old.example/v1")
+            self.assertEqual(reloaded["openai_asr_model"], "whisper-large-v3")
+
+    def test_endpoint_cli_update_fails_closed_when_locked_config_read_fails(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            config = Config(config_path=path)
+            original = json.loads(path.read_text())
+
+            with patch.object(
+                config,
+                "_read_disk_for_secure_transaction",
+                return_value=(False, None),
+            ), patch("src.config.get_config", return_value=config):
+                result = CliRunner().invoke(
+                    simple_recorder.set_openai_asr_config_cmd,
+                    ["--api-url", "https://replacement.example/v1"],
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertFalse(json.loads(result.output)["success"])
+            self.assertEqual(json.loads(path.read_text()), original)
+
     def test_multi_field_cli_update_commits_both_fields(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "config.json"

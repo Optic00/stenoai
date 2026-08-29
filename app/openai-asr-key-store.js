@@ -52,14 +52,19 @@ function normalizeOpenAiAsrOrigin(apiUrl) {
  * credential to the wrong request URL.
  */
 function readOpenAiAsrConfigSnapshot({ fs, configPath }) {
+  let config = null;
   try {
     let apiUrl = OPENAI_ASR_DEFAULT_URL;
-    let config = null;
-    if (fs.existsSync(configPath)) {
+    // Read directly instead of checking existsSync first. A transient access
+    // failure must fail closed, never masquerade as a missing config whose
+    // default endpoint could activate an origin-bound credential.
+    try {
       config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-      if (config && Object.prototype.hasOwnProperty.call(config, 'openai_asr_api_url')) {
-        apiUrl = config.openai_asr_api_url;
-      }
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') return null;
+    }
+    if (config && Object.prototype.hasOwnProperty.call(config, 'openai_asr_api_url')) {
+      apiUrl = config.openai_asr_api_url;
     }
     const canonicalUrl = normalizeOpenAiAsrApiUrl(apiUrl);
     const endpoint = canonicalUrl

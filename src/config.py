@@ -809,6 +809,22 @@ class Config:
             return None
         return data if isinstance(data, dict) else None
 
+    def _read_disk_for_secure_transaction(self) -> tuple[bool, Optional[Dict[str, Any]]]:
+        """Read config under an already-held lock without conflating errors with ENOENT.
+
+        Endpoint changes with an origin-bound credential need an authoritative
+        answer about legacy plaintext. A missing config is a valid fresh state;
+        a malformed or inaccessible one must instead fail the transaction.
+        """
+        try:
+            with open(self.config_path, "r") as file_handle:
+                data = json.load(file_handle)
+        except FileNotFoundError:
+            return True, None
+        except Exception:
+            return False, None
+        return (True, data) if isinstance(data, dict) else (False, None)
+
     @classmethod
     def _apply_changes(
         cls, base: Dict[str, Any], current: Dict[str, Any], snapshot: Any
@@ -912,7 +928,7 @@ class Config:
             logger.error(f"Error saving config: {e}")
             return False
 
-    def begin_transaction(self) -> bool:
+    def begin_transaction(self, *, require_readable_disk: bool = False) -> bool:
         """Reload and defer mutations while holding the config file lock."""
         if self._transaction_backup is not None:
             raise RuntimeError("Config transaction already active")
@@ -924,7 +940,14 @@ class Config:
         except filelock.Timeout:
             logger.error(f"Timed out acquiring config lock at {lock.lock_file}")
             return False
-        fresh = self._read_disk_for_merge()
+        if require_readable_disk:
+            readable, fresh = self._read_disk_for_secure_transaction()
+            if not readable:
+                lock.release()
+                logger.error("Could not read config under lock for secure transaction")
+                return False
+        else:
+            fresh = self._read_disk_for_merge()
         if fresh is not None:
             self._config = fresh
             self._snapshot = copy.deepcopy(fresh)
@@ -2272,6 +2295,17 @@ class Config:
             return False
         self._config["openai_asr_api_url"] = clean_url
         return self._save()
+
+    def has_legacy_openai_asr_api_key(self) -> bool:
+        """Whether the locked in-memory config still carries plaintext ASR key text.
+
+        Call this only while a transaction is active for a settings mutation.
+        A non-empty raw string is enough to block an endpoint change even when
+        it is malformed: only migration may delete that value, and it does so
+        with a separate digest-bound compare-and-delete operation.
+        """
+        legacy_key = self._config.get("openai_asr_api_key")
+        return isinstance(legacy_key, str) and legacy_key != ""
 
     def get_openai_asr_api_key(self) -> str:
         """Bearer token for the OpenAI-compatible STT endpoint.

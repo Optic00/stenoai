@@ -40,7 +40,10 @@ test('transcription launches use one config snapshot for endpoint and legacy key
   assert.match(launch, /STENOAI_OAI_API_ORIGIN/);
   assert.match(launch, /STENOAI_OAI_API_URL/);
   assert.match(launch, /loadOpenAiAsrCredential/);
-  assert.match(launch, /const legacy = configSnapshot \? configSnapshot\.legacy : null/);
+  assert.match(
+    launch,
+    /const legacy = configSnapshot === null\s+\? OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE\s+: configSnapshot\.legacy/,
+  );
   assert.match(launch, /secureLegacyOpenAiAsrApiKey\(legacy\)/);
   assert.match(launch, /migrateLegacyOpenAiAsrApiKey\(legacy\)/);
   assert.doesNotMatch(launch, /configSnapshot\?\.legacy/);
@@ -199,6 +202,44 @@ test('transcription takes its legacy cleanup and endpoint from one config snapsh
     },
   });
   assert.strictEqual(reads, 1);
+});
+
+test('missing config defaults, but inaccessible config fails closed without an exists check', () => {
+  const configPath = '/config.json';
+  const missing = {
+    existsSync: () => { throw new Error('existsSync must not be used'); },
+    readFileSync: () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); },
+  };
+  assert.deepStrictEqual(readOpenAiAsrConfigSnapshot({ fs: missing, configPath }), {
+    endpoint: {
+      apiUrl: 'https://api.openai.com/v1',
+      origin: 'https://api.openai.com',
+    },
+    legacy: null,
+  });
+
+  for (const error of [
+    Object.assign(new Error('permission denied'), { code: 'EACCES' }),
+    Object.assign(new Error('temporarily unavailable'), { code: 'EIO' }),
+  ]) {
+    const inaccessible = {
+      existsSync: () => { throw new Error('existsSync must not be used'); },
+      readFileSync: () => { throw error; },
+    };
+    assert.strictEqual(readOpenAiAsrConfigSnapshot({ fs: inaccessible, configPath }), null);
+  }
+});
+
+test('main keeps an unreadable config distinct from an absent legacy key', () => {
+  const credentialFlow = source.slice(
+    source.indexOf('function readLegacyOpenAiAsrCredential()'),
+    source.indexOf('// Build the env additions a Python AI-driven subprocess needs.'),
+  );
+  assert.match(credentialFlow, /OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE/);
+  assert.match(
+    credentialFlow,
+    /if \(legacy === OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE\) return false/,
+  );
 });
 
 test('legacy snapshot digest preserves the raw URL value across migration edge cases', () => {

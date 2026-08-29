@@ -1741,12 +1741,18 @@ def set_openai_asr_config_cmd(api_url, model):
     config = get_config()
     errors = []
 
-    if not config.begin_transaction():
+    if not config.begin_transaction(require_readable_disk=api_url is not None):
         errors.append("Failed to start config transaction")
     else:
         try:
             if api_url is not None:
-                if not config.set_openai_asr_api_url(api_url):
+                # This transaction has reloaded config.json while holding its
+                # cross-process lock. A legacy plaintext key added after the
+                # Electron migration must prevent an endpoint switch, because
+                # a later cleanup could otherwise bind it to the new origin.
+                if config.has_legacy_openai_asr_api_key():
+                    errors.append("Legacy ASR credential must be migrated before changing endpoint")
+                elif not config.set_openai_asr_api_url(api_url):
                     errors.append("Failed to save api_url")
             if model is not None:
                 if not config.set_openai_asr_model(model):
