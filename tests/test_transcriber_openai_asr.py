@@ -85,6 +85,22 @@ class _BlockingOpener:
         return _json_response({"text": "late", "segments": []})
 
 
+class _DelayedFallbackOpener:
+    """Makes each response-format negotiation step consume wall-clock time."""
+    def __init__(self, responses, delay_seconds: float):
+        self.responses = iter(responses)
+        self.delay_seconds = delay_seconds
+        self.calls = 0
+
+    def open(self, request, timeout):
+        self.calls += 1
+        time.sleep(self.delay_seconds)
+        response = next(self.responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
 def _json_response(payload):
     return _FakeResponse(json.dumps(payload).encode())
 
@@ -288,6 +304,33 @@ class OpenAiAsrTests(unittest.TestCase):
                     transcriber._run_openai_asr(audio, language="en")
 
         self.assertTrue(response.released.is_set())
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_total_deadline_spans_all_response_format_fallbacks(self):
+        """Late 400 fallbacks must not reset the one upload attempt's budget."""
+        transcriber = _build_transcriber()
+        opener = _DelayedFallbackOpener(
+            [
+                _http_error(400, b"verbose_json unsupported"),
+                _http_error(400, b"json unsupported"),
+                _FakeResponse(b"late third-format success", "text/plain"),
+            ],
+            delay_seconds=0.015,
+        )
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch("urllib.request.build_opener", return_value=opener), patch(
+                "src.transcriber.OPENAI_ASR_REQUEST_DEADLINE_SECONDS", 0.02,
+            ), patch(
+                "src.transcriber._heartbeat_while_waiting",
+                return_value=contextlib.nullcontext(),
+            ):
+                with self.assertRaisesRegex(TimeoutError, "total deadline"):
+                    transcriber._run_openai_asr(audio, language="en")
+
+        self.assertLess(opener.calls, 3, "deadline must prevent the third-format success")
         self.assertLess(time.monotonic() - started, 1.0)
 
     def test_oversized_non_wav_names_25_mb_limit(self):

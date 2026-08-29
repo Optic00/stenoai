@@ -2088,8 +2088,11 @@ class WhisperTranscriber:
                 )
         opener = urllib.request.build_opener(NoRedirectHandler)
 
-        def _do_request(response_format: str, request_audio_path: Path) -> tuple[bytes, str]:
-            request_deadline = time.monotonic() + OPENAI_ASR_REQUEST_DEADLINE_SECONDS
+        def _do_request(
+            response_format: str,
+            request_audio_path: Path,
+            request_deadline: float,
+        ) -> tuple[bytes, str]:
             for attempt in range(2):
                 remaining = request_deadline - time.monotonic()
                 if remaining <= 0:
@@ -2173,10 +2176,17 @@ class WhisperTranscriber:
             }
 
         def _transcribe_one(request_audio_path: Path) -> dict:
+            # A response-format fallback is still one upload attempt for this
+            # audio file. Keep one absolute wall-clock budget across
+            # verbose_json -> json -> text as well as each format's retry, so
+            # a slow provider cannot extend foreground work by failing late at
+            # every negotiation step.
+            request_deadline = time.monotonic() + OPENAI_ASR_REQUEST_DEADLINE_SECONDS
+
             # --- Pass 1: verbose_json (segments + timestamps) -----------
             try:
                 raw, _content_type = _do_request(
-                    "verbose_json", request_audio_path
+                    "verbose_json", request_audio_path, request_deadline
                 )
                 data = _json.loads(raw.decode())
                 if not isinstance(data, dict) or "text" not in data:
@@ -2235,7 +2245,9 @@ class WhisperTranscriber:
 
             # --- Pass 2: json (full text, no timestamps) ----------------
             try:
-                raw, _content_type = _do_request("json", request_audio_path)
+                raw, _content_type = _do_request(
+                    "json", request_audio_path, request_deadline
+                )
                 data = _json.loads(raw.decode())
                 if not isinstance(data, dict) or "text" not in data:
                     raise RuntimeError(
@@ -2257,7 +2269,9 @@ class WhisperTranscriber:
                 )
 
             # --- Pass 3: plain text fallback ----------------------------
-            raw, content_type = _do_request("text", request_audio_path)
+            raw, content_type = _do_request(
+                "text", request_audio_path, request_deadline
+            )
             text = raw.decode(errors="replace").strip()
             leading = text.lstrip().lower()
             if (
