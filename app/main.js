@@ -68,7 +68,11 @@ const processingLog = require('./processing-log');
 const { isMeetingApp, allowsDeviceLevelFallback, isMacos14Plus } = require('./meeting-detect');
 const { sweepOrphanedLiveSnapshots } = require('./live-snapshot-sweep');
 const { userNotesFilePath } = require('./notes-file');
-const { buildNoteReadyNotificationOptions, buildTranscriptReadyBody } = require('./notification-copy');
+const {
+  buildNoteReadyNotificationOptions,
+  buildTranscriptReadyBody,
+  shouldSuppressNoteReadyNotification,
+} = require('./notification-copy');
 const { makeLineReader } = require('./backend-stream');
 // Pure deep-link (stenoai://) parsing/sanitizing lives in ./shortcut-url
 // (unit-tested). The stateful side — window creation, IPC dispatch,
@@ -305,6 +309,21 @@ function getOutputDir() {
 
 let mainWindow;
 let notificationWindow;
+const pendingObsidianForkNotifications = new Map();
+
+function markObsidianForkNotificationPending(summaryFile) {
+  if (typeof summaryFile !== 'string' || !summaryFile) return;
+  pendingObsidianForkNotifications.set(
+    summaryFile,
+    (pendingObsidianForkNotifications.get(summaryFile) || 0) + 1,
+  );
+}
+
+function clearObsidianForkNotificationPending(summaryFile) {
+  const count = pendingObsidianForkNotifications.get(summaryFile) || 0;
+  if (count <= 1) pendingObsidianForkNotifications.delete(summaryFile);
+  else pendingObsidianForkNotifications.set(summaryFile, count - 1);
+}
 
 // ── Custom notification toast ────────────────────────────────────────────────
 // Drop-in replacement for Electron's `Notification` that renders our OWN
@@ -2942,24 +2961,32 @@ ipcMain.handle('clear-state', async () => {
 
 async function showObsidianForkNotification(result) {
   if (!result || result.status !== 'forked') return { success: true, shown: false };
-  if (!(await notificationsEnabled())) return { success: true, shown: false };
-  const replacementName = path.basename(result.vaultRelPath || 'the new copy');
-  const notif = new Notification({
-    title: 'Obsidian edit preserved',
-    body: `Latest version saved as ${replacementName}.`,
-    iconType: 'success',
-  });
-  notif.on('click', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      exposeMainWindow();
-      if (result.summaryFile) {
-        mainWindow.webContents.send('navigate-to-meeting', { summaryFile: result.summaryFile });
+  const { summaryFile } = result;
+  markObsidianForkNotificationPending(summaryFile);
+  try {
+    if (!(await notificationsEnabled())) return { success: true, shown: false };
+    const replacementName = path.basename(result.vaultRelPath || 'the new copy');
+    const notif = new Notification({
+      title: 'Obsidian edit preserved',
+      body: `Latest version saved as ${replacementName}.`,
+      iconType: 'success',
+      completionKind: 'obsidian-fork',
+      summaryFile,
+    });
+    notif.on('click', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        exposeMainWindow();
+        if (summaryFile) {
+          mainWindow.webContents.send('navigate-to-meeting', { summaryFile });
+        }
       }
-    }
-  });
-  trackNotificationLifecycle(notif, 'obsidian_fork');
-  notif.show();
-  return { success: true, shown: true };
+    });
+    trackNotificationLifecycle(notif, 'obsidian_fork');
+    notif.show();
+    return { success: true, shown: true };
+  } finally {
+    clearObsidianForkNotificationPending(summaryFile);
+  }
 }
 
 ipcMain.handle('show-obsidian-fork-notification', async (_event, result) => {
@@ -8418,8 +8445,22 @@ async function showNoteReadyNotification(payload) {
   // `shown` = passed the notifications_enabled gate (see show-silence-auto-stop).
   if (!(await notificationsEnabled())) return { success: true, shown: false };
   const { summaryFile } = payload || {};
+  const activeOptions = notificationWindow && !notificationWindow.isDestroyed()
+    ? notificationWindow._activeCustomNotification?.options
+    : undefined;
+  const forkPending = typeof summaryFile === 'string' &&
+    pendingObsidianForkNotifications.has(summaryFile);
+  if (shouldSuppressNoteReadyNotification(activeOptions, summaryFile, forkPending)) {
+    return { success: true, shown: false };
+  }
   const { title, body, iconType, outcome } = buildNoteReadyNotificationOptions(payload);
-  const notif = new Notification({ title, body, iconType });
+  const notif = new Notification({
+    title,
+    body,
+    iconType,
+    completionKind: 'note-ready',
+    summaryFile,
+  });
   notif.on('click', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       exposeMainWindow();

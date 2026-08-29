@@ -33,4 +33,22 @@ function buildTranscriptReadyBody(title) {
   return title ? `Summarise "${title}"?` : 'Summarise?';
 }
 
-module.exports = { buildNoteReadyNotificationOptions, buildTranscriptReadyBody };
+/**
+ * Keep an actionable preservation notice when a late ordinary note-ready
+ * request refers to that same note. The fork request may still be waiting on
+ * its asynchronous settings gate, or its toast may already be active. Different
+ * notes retain normal single-toast semantics and may supersede one another.
+ */
+function shouldSuppressNoteReadyNotification(activeOptions, summaryFile, forkPending = false) {
+  return typeof summaryFile === 'string' && summaryFile.length > 0 &&
+    (forkPending || (
+      activeOptions?.completionKind === 'obsidian-fork' &&
+      activeOptions.summaryFile === summaryFile
+    ));
+}
+
+module.exports = {
+  buildNoteReadyNotificationOptions,
+  buildTranscriptReadyBody,
+  shouldSuppressNoteReadyNotification,
+};
