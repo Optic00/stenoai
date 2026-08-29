@@ -1992,7 +1992,7 @@ class WhisperTranscriber:
         else:
             endpoint = api_url
 
-        logger.info("openai-asr: POST configured endpoint  model=%s", model)
+        logger.info("openai-asr: POST configured endpoint")
 
         if not api_key:
             raise RuntimeError(
@@ -2337,7 +2337,12 @@ class WhisperTranscriber:
                 raise RuntimeError(
                     "openai-asr text response has an unexpected content type"
                 )
-            text = raw.decode(errors="replace").strip()
+            try:
+                text = raw.decode("utf-8", errors="strict").strip()
+            except UnicodeDecodeError:
+                raise RuntimeError(
+                    "openai-asr text response is not valid UTF-8"
+                ) from None
             leading = text.lstrip().lower()
             if (
                 "text/html" in content_type.lower()
@@ -2442,6 +2447,10 @@ class WhisperTranscriber:
                 chunk_duration = chunk_result.get("duration_seconds")
                 if chunk_duration is not None:
                     duration_seconds += float(chunk_duration)
+                    if not math.isfinite(duration_seconds):
+                        raise RuntimeError(
+                            "openai-asr chunked response has invalid duration metadata"
+                        )
                     has_duration = True
                 _emit_heartbeat(chunk_index + 1, total_chunks)
 

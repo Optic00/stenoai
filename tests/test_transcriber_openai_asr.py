@@ -298,6 +298,45 @@ class OpenAiAsrTests(unittest.TestCase):
         self.assertEqual(result["detected_language"], "en")
         self.assertEqual(heartbeats, [(1, 2), (2, 2)])
 
+    def test_chunk_duration_sum_must_remain_finite(self):
+        transcriber = _build_transcriber()
+        responses = [
+            _json_response(
+                {
+                    "text": f"chunk {index}",
+                    "segments": [
+                        {"text": f"chunk {index}", "start": 0.0, "end": 1.0}
+                    ],
+                    "duration": 1e308,
+                }
+            )
+            for index in (1, 2)
+        ]
+        opener = _FakeOpener(responses)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "two-chunks.wav"
+            _write_pcm_wav(audio, frame_count=16000 * 2)
+            with patch.object(
+                transcriber, "_preprocess_audio", return_value=(audio, False)
+            ), patch.object(
+                transcriber, "_build_whisper_fallback", return_value=False
+            ), patch(
+                "src.transcriber.OPENAI_ASR_CHUNK_THRESHOLD_BYTES", 1
+            ), patch(
+                "src.transcriber.OPENAI_ASR_MAX_CHUNK_SECONDS", 1
+            ), patch(
+                "urllib.request.build_opener", return_value=opener
+            ):
+                failure = transcriber.transcribe_audio(audio, language="en")
+
+            self.assertTrue(failure["transcription_failed"])
+            self.assertEqual(
+                failure["error"],
+                "openai-asr chunked response has invalid duration metadata",
+            )
+            self.assertTrue(audio.exists(), "failed ASR must retain retry audio")
+
     def test_file_under_limit_uses_single_request_path(self):
         transcriber = _build_transcriber()
         opener = _FakeOpener(
@@ -634,6 +673,32 @@ class OpenAiAsrTests(unittest.TestCase):
                 "application/problem+json failure must bypass keep_recordings=false deletion",
             )
 
+    def test_invalid_utf8_text_fallback_uses_transcription_failure_path(self):
+        transcriber = _build_transcriber()
+        opener = _FakeOpener(
+            [
+                _FakeResponse(b"not-json"),
+                _FakeResponse(b"still-not-json"),
+                _FakeResponse(b"\xff\xfe", "text/plain; charset=utf-8"),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch.object(
+                transcriber, "_preprocess_audio", return_value=(audio, False)
+            ), patch.object(
+                transcriber, "_build_whisper_fallback", return_value=False
+            ), patch("urllib.request.build_opener", return_value=opener):
+                failure = transcriber.transcribe_audio(audio, language="en")
+
+            self.assertTrue(failure["transcription_failed"])
+            self.assertEqual(
+                failure["error"],
+                "openai-asr text response is not valid UTF-8",
+            )
+            self.assertTrue(audio.exists(), "failed ASR must retain retry audio")
+
     def test_http_error_body_never_reaches_exception_logs_result_or_meeting_metadata(self):
         marker = "PRIVATE-PROVIDER-ERROR-BODY"
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -936,7 +1001,9 @@ class OpenAiAsrTests(unittest.TestCase):
 
     def test_multipart_filename_and_logs_never_expose_meeting_name(self):
         marker = "PRIVATE-MEETING-STEM"
+        model_marker = "PRIVATE-CLIENT-MODEL"
         transcriber = _build_transcriber()
+        transcriber._openai_asr_model = model_marker
         opener = _FakeOpener([
             _json_response({"text": "safe transcript", "segments": []})
         ])
@@ -955,6 +1022,7 @@ class OpenAiAsrTests(unittest.TestCase):
         self.assertIn(b'name="file"; filename="audio"\r\n', prefix)
         self.assertNotIn(marker.encode(), prefix)
         self.assertNotIn(marker, "\n".join(logs.output))
+        self.assertNotIn(model_marker, "\n".join(logs.output))
 
     def test_json_rung_fallback_synthesizes_segment(self):
         transcriber = _build_transcriber()
