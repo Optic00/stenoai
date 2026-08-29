@@ -235,7 +235,6 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
       .toBe(true);
     writeFileSync(originalPath, 'HAND-EDITED IN OBSIDIAN', 'utf8');
 
-    const notificationWindow = app.waitForEvent('window', { timeout: 30_000 });
     const result = await page.evaluate(
       (f) =>
         (window as StenoWin).stenoai.meetings.reprocess(f, false, 'Reprocess Conflict'),
@@ -245,7 +244,21 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
 
     // Assert the short-lived toast immediately. The remaining disk and settings
     // checks can legitimately take longer than its 15-second lifetime on CI.
-    const notification = await notificationWindow;
+    const findNotificationWindow = () =>
+      app.windows().find((candidate) => {
+        try {
+          return new URL(candidate.url()).hash === '#/notification';
+        } catch {
+          return false;
+        }
+      });
+    await expect
+      .poll(() => Boolean(findNotificationWindow()), {
+        timeout: 30_000,
+        intervals: [100],
+      })
+      .toBe(true);
+    const notification = findNotificationWindow()!;
     await notification.waitForLoadState('domcontentloaded');
     await expect(notification.getByText('Obsidian edit preserved')).toBeVisible();
     await expect(notification.getByText(/^Latest version saved as .+\.$/)).toBeVisible();
