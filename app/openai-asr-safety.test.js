@@ -12,6 +12,7 @@ const {
   legacyKeyMigrationAction,
   loadEncryptedKeyForOrigin,
   markEncryptedKeyClearedAtomically,
+  normalizeOpenAiAsrApiUrl,
   readLegacyCredentialSnapshot,
   saveEncryptedKeyAtomically,
 } = require('./openai-asr-key-store');
@@ -115,6 +116,25 @@ test('an invalid legacy endpoint still yields a digest-bound cleanup snapshot', 
       ),
     });
   });
+});
+
+test('OpenAI ASR URL canonicalisation rejects secret-bearing URLs before a CLI argv exists', () => {
+  assert.strictEqual(
+    normalizeOpenAiAsrApiUrl(' HTTPS://API.EXAMPLE.COM:443/v1/ '),
+    'https://api.example.com/v1',
+  );
+  assert.strictEqual(
+    normalizeOpenAiAsrApiUrl('http://[::1]:9000/v1/'),
+    'http://[::1]:9000/v1',
+  );
+  for (const unsafe of [
+    'https://user:secret@provider.example/v1',
+    'https://provider.example/v1?sig=secret',
+    'https://provider.example/v1#secret',
+    'http://provider.example/v1',
+  ]) {
+    assert.strictEqual(normalizeOpenAiAsrApiUrl(unsafe), null);
+  }
 });
 
 test('legacy snapshot digest preserves the raw URL value across migration edge cases', () => {

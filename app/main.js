@@ -61,6 +61,7 @@ const {
   readLegacyCredentialSnapshot,
   saveEncryptedKeyAtomically,
 } = require('./openai-asr-key-store');
+const { registerOpenAiAsrIpc } = require('./openai-asr-ipc');
 const { createDebugLog } = require('./debug-log');
 const { createTeardownRegistry } = require('./teardown');
 const { registerFoldersIpc } = require('./folders-ipc');
@@ -8081,17 +8082,11 @@ ipcMain.handle('get-openai-asr-config', async () => {
   } catch (e) { return { success: false, error: e.message }; }
 });
 
-ipcMain.handle('set-openai-asr-config', async (_event, cfg) => {
-  try {
-    await migrateLegacyOpenAiAsrApiKey();
-    const args = ['set-openai-asr-config'];
-    if (cfg && cfg.api_url !== undefined) { args.push('--api-url', cfg.api_url); }
-    if (cfg && cfg.model !== undefined) { args.push('--model', cfg.model); }
-    const result = await runPythonScript('simple_recorder.py', args, true);
-    const jsonData = JSON.parse(result.trim());
-    jsonData.api_key_set = hasOpenAiAsrKey();
-    return jsonData;
-  } catch (e) { return { success: false, error: e.message }; }
+registerOpenAiAsrIpc({
+  ipcMain,
+  runPythonScript,
+  migrateLegacyOpenAiAsrApiKey,
+  hasOpenAiAsrKey,
 });
 
 // The SECRET key: stored encrypted via safeStorage (never argv, never

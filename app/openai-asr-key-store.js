@@ -12,18 +12,37 @@ function isValidOpenAiAsrApiKey(key) {
     && /^[\x21-\x7e]+$/.test(key);
 }
 
-function normalizeOpenAiAsrOrigin(apiUrl) {
+function normalizeOpenAiAsrApiUrl(apiUrl) {
   try {
     if (typeof apiUrl !== 'string' || !apiUrl.trim()) return null;
     const endpoint = new URL(apiUrl.trim());
     const hostname = endpoint.hostname.toLowerCase();
-    if (!hostname || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) return null;
+    // `URL.search` / `.hash` are empty for a bare '?' / '#', but those are
+    // still query/fragment delimiters and must not reach the child argv.
+    if (
+      !hostname
+      || endpoint.username
+      || endpoint.password
+      || endpoint.search
+      || endpoint.hash
+      || endpoint.href.includes('?')
+      || endpoint.href.includes('#')
+    ) return null;
     const loopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
     if (endpoint.protocol !== 'https:' && !(endpoint.protocol === 'http:' && loopback)) return null;
-    return endpoint.origin === 'null' ? null : endpoint.origin;
+    if (endpoint.origin === 'null') return null;
+    // Match Python's config normaliser: retain a meaningful base path such as
+    // /v1, but remove trailing slashes and canonicalise scheme/host/port.
+    const pathname = endpoint.pathname.replace(/\/+$/, '');
+    return `${endpoint.origin}${pathname}`;
   } catch (_) {
     return null;
   }
+}
+
+function normalizeOpenAiAsrOrigin(apiUrl) {
+  const normalized = normalizeOpenAiAsrApiUrl(apiUrl);
+  return normalized ? new URL(normalized).origin : null;
 }
 
 function legacyCredentialSnapshotDigest(rawKey, apiUrl) {
@@ -277,6 +296,7 @@ module.exports = {
   legacyKeyMigrationAction,
   loadEncryptedKeyForOrigin,
   markEncryptedKeyClearedAtomically,
+  normalizeOpenAiAsrApiUrl,
   normalizeOpenAiAsrOrigin,
   readLegacyCredentialSnapshot,
   saveEncryptedKeyAtomically,
