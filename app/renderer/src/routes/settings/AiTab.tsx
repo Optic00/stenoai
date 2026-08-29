@@ -19,6 +19,7 @@ import { GoogleIcon } from '@/components/ui/google-icon';
 import { MetaIcon } from '@/components/ui/meta-icon';
 import { QwenIcon } from '@/components/ui/qwen-icon';
 import { cn, isMac } from '@/lib/utils';
+import { t } from '@/i18n';
 import type { AiProvider, CloudProvider, TranscriptionEngine } from '@/lib/ipc';
 import {
   useAiProvider,
@@ -115,7 +116,7 @@ function TranscriptionSection() {
         style={{ color: 'var(--fg-2)', marginBottom: 4 }}
       >
         {engine === 'openai-asr'
-          ? 'Speech-to-text is sent to an OpenAI-compatible cloud endpoint. Unlike the on-device engines, your audio leaves your computer.'
+          ? t('settings.ai.cloudAsr.disclosure')
           : 'Speech-to-text always runs on your device \u2014 your audio never leaves your computer.'}
       </p>
       <SettingRow
@@ -188,10 +189,9 @@ export function SpeakerIdentificationSetting() {
 // old card layout's note line). Keyed by engine since each only ever has
 // one supported model today (see SUPPORTED_PARAKEET_MODELS /
 // SUPPORTED_WHISPER_MODELS in the Python registries).
-const ENGINE_TAGLINE: Record<TranscriptionEngine, string> = {
+const ENGINE_TAGLINE: Record<Exclude<TranscriptionEngine, 'openai-asr'>, string> = {
   parakeet: 'Fastest — English + European languages',
   whisper: 'Most accurate — 99 languages',
-  'openai-asr': 'Cloud API - sends audio to an OpenAI-compatible endpoint',
 };
 
 /**
@@ -281,7 +281,10 @@ function TranscriptionModelList() {
   const triggerFor: Record<TranscriptionEngine, { icon: React.ReactNode; name: string }> = {
     parakeet: { icon: <NvidiaIcon size={12} />, name: parakeetModel.displayName ?? parakeetModel.name },
     whisper: { icon: <OpenAiIcon size={12} />, name: whisperModel.displayName ?? whisperModel.name },
-    'openai-asr': { icon: <Cloud className="size-3" />, name: 'Cloud API' },
+    'openai-asr': {
+      icon: <Cloud className="size-3" />,
+      name: t('settings.ai.cloudAsr.providerLabel'),
+    },
   };
   const current = triggerFor[value];
 
@@ -349,10 +352,13 @@ function TranscriptionModelList() {
                 {whisperModel.displayName ?? whisperModel.name}
               </span>
             </SelectItem>
-            <SelectItem value="openai-asr" description={ENGINE_TAGLINE['openai-asr']}>
+            <SelectItem
+              value="openai-asr"
+              description={t('settings.ai.cloudAsr.engineTagline')}
+            >
               <span className="inline-flex items-center gap-1.5">
                 <Cloud className="size-3" />
-                Cloud API
+                {t('settings.ai.cloudAsr.providerLabel')}
               </span>
             </SelectItem>
           </SelectContent>
@@ -364,9 +370,9 @@ function TranscriptionModelList() {
       <ConfirmDialog
         open={confirmCloudAsr}
         onOpenChange={setConfirmCloudAsr}
-        title="Send audio to a cloud service?"
-        description="Cloud transcription uploads your recording audio to the OpenAI-compatible endpoint you configure. Unlike the on-device engines, your audio leaves your computer. Continue?"
-        confirmLabel="Use cloud ASR"
+        title={t('settings.ai.cloudAsr.confirmTitle')}
+        description={t('settings.ai.cloudAsr.confirmDescription')}
+        confirmLabel={t('settings.ai.cloudAsr.confirmAction')}
         onConfirm={() => {
           setConfirmCloudAsr(false);
           setActive.mutate({ engine: 'openai-asr' });
@@ -419,7 +425,7 @@ function OpenAiAsrConfig() {
         // The backend rejected or failed to save the edit. Restore the
         // displayed committed value instead of leaving a value that is not
         // actually active, especially important for an audio-upload endpoint.
-        setSaveError('Could not save this cloud transcription setting. The previous value is still active.');
+        setSaveError(t('settings.ai.cloudAsr.saveSettingError'));
         if (field === 'api_url') setApiUrl(config.data?.api_url ?? DEFAULT_OPENAI_ASR_URL);
         else setModel(config.data?.model ?? DEFAULT_OPENAI_ASR_MODEL);
       });
@@ -435,7 +441,7 @@ function OpenAiAsrConfig() {
     void operation
       .then(() => setSaveError(null))
       .catch(() => {
-        setSaveError('Could not securely save the API key. The existing key was not changed.');
+        setSaveError(t('settings.ai.cloudAsr.saveKeyError'));
       })
       .finally(() => {
         // Do not retain a plaintext credential in renderer state after either
@@ -456,13 +462,13 @@ function OpenAiAsrConfig() {
           className="mb-1 block text-[12px] font-medium uppercase"
           style={{ letterSpacing: '0.06em', color: 'var(--fg-muted)' }}
         >
-          API base URL
+          {t('settings.ai.cloudAsr.apiBaseUrlLabel')}
         </label>
         <Input
           id="openai-asr-api-url"
           value={apiUrl}
           onChange={(e) => setApiUrl(e.target.value)}
-          placeholder="https://api.openai.com/v1"
+          placeholder={t('settings.ai.cloudAsr.apiUrlPlaceholder')}
           onBlur={() => {
             // A cleared (or whitespace-only) field resets to the default URL
             // rather than trying to persist a blank the backend would reject -
@@ -480,13 +486,13 @@ function OpenAiAsrConfig() {
           className="mb-1 block text-[12px] font-medium uppercase"
           style={{ letterSpacing: '0.06em', color: 'var(--fg-muted)' }}
         >
-          Model
+          {t('settings.ai.cloudAsr.modelLabel')}
         </label>
         <Input
           id="openai-asr-model"
           value={model}
           onChange={(e) => setModel(e.target.value)}
-          placeholder="whisper-1"
+          placeholder={t('settings.ai.cloudAsr.modelPlaceholder')}
           onBlur={() => {
             // Same as the URL: a cleared field resets to the default model
             // rather than persisting a blank (which the backend rejects).
@@ -503,7 +509,7 @@ function OpenAiAsrConfig() {
           className="mb-1 block text-[12px] font-medium uppercase"
           style={{ letterSpacing: '0.06em', color: 'var(--fg-muted)' }}
         >
-          API key
+          {t('settings.ai.cloudAsr.apiKeyLabel')}
         </label>
         <div className="flex items-center gap-2">
           <Input
@@ -511,7 +517,7 @@ function OpenAiAsrConfig() {
             type="password"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
-            placeholder={keySet ? '••••••••' : 'sk-…'}
+            placeholder={keySet ? '••••••••' : t('settings.ai.cloudAsr.apiKeyPlaceholder')}
             onBlur={() => {
               if (apiKey) {
                 saveKey(apiKey);
@@ -529,14 +535,14 @@ function OpenAiAsrConfig() {
                 saveKey('');
               }}
             >
-              Clear
+              {t('settings.ai.cloudAsr.clearAction')}
             </Button>
           )}
         </div>
         <div className="mt-1 text-[11.5px]" style={{ color: 'var(--fg-muted)' }}>
           {keySet
-            ? 'A key is saved. Enter a new one to replace it, or clear it.'
-            : 'Stored encrypted on your device - never written to config or sent anywhere except your chosen endpoint.'}
+            ? t('settings.ai.cloudAsr.keySavedDescription')
+            : t('settings.ai.cloudAsr.keyEmptyDescription')}
         </div>
         {saveError && (
           <p role="alert" className="mt-1 text-[11.5px]" style={{ color: 'var(--danger, #b42318)' }}>
