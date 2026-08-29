@@ -120,10 +120,6 @@ CHANNEL_DETECT_TIMEOUT_S = 60
 # this gate's only job is to skip channels with effectively zero audio.
 MIN_RMS_THRESHOLD = 0.0003
 
-# Cap how many 1-second windows we sample when scanning RMS so a 30-min
-# recording doesn't pull all 30 min of int16 samples into Python lists.
-RMS_MAX_WINDOWS = 60
-
 # Acoustic per-channel speaker diarization (steno-diarize sidecar, macOS
 # only). Merge gap for consecutive same-speaker diarizer segments — reduces
 # diarization flicker and shrinks the gaps that cause boundary sentence
@@ -165,12 +161,166 @@ SILENCE_SENTINEL = "No speech detected in audio"
 # 24 MiB to leave headroom for the multipart fields and boundary bytes.
 OPENAI_ASR_CHUNK_THRESHOLD_BYTES = 24 * 1024 * 1024
 OPENAI_ASR_MAX_CHUNK_SECONDS = 600
+# Each request deliberately overlaps the preceding one. Speech recognisers are
+# less reliable at a hard audio cutoff; timestamped overlap is assigned to one
+# temporal ownership window, while untimed responses are preserved verbatim.
+OPENAI_ASR_CHUNK_OVERLAP_SECONDS = 5
 OPENAI_ASR_REQUEST_DEADLINE_SECONDS = 10 * 60
 OPENAI_ASR_SOCKET_TIMEOUT_SECONDS = 300
 # A verbose transcription response can be substantially larger than its text,
 # but it must still have a finite in-memory bound. Read one byte past the
 # limit so chunked responses and responses without Content-Length fail closed.
 OPENAI_ASR_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+# Providers round timestamps differently. A quarter-second leeway accepts
+# normal frame rounding while rejecting a segment from another request/chunk.
+OPENAI_ASR_TIMESTAMP_TOLERANCE_SECONDS = 0.25
+OPENAI_ASR_MAX_API_KEY_LENGTH = 4096
+
+_OPENAI_ASR_CREDENTIAL_ENV_NAMES = {
+    "STENOAI_OAI_API_KEY",
+    "STENOAI_OAI_API_ORIGIN",
+}
+
+_OPENAI_ASR_UPLOAD_FORMATS = {
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+    ".mp4": "audio/mp4",
+    ".mpeg": "audio/mpeg",
+    ".mpga": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+}
+
+
+def _non_asr_subprocess_env(extra_env: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """Return inherited subprocess state without cloud-ASR credentials."""
+    combined = {**os.environ, **(extra_env or {})}
+    return {
+        name: value
+        for name, value in combined.items()
+        if name.upper() not in _OPENAI_ASR_CREDENTIAL_ENV_NAMES
+    }
+
+
+def _validate_openai_asr_api_key(api_key: str) -> str:
+    """Accept only a bounded visible-ASCII bearer token without echoing it."""
+    if (
+        not isinstance(api_key, str)
+        or not api_key
+        or len(api_key) > OPENAI_ASR_MAX_API_KEY_LENGTH
+        or any(ord(char) < 33 or ord(char) > 126 for char in api_key)
+    ):
+        raise RuntimeError("openai-asr API key has an invalid format")
+    return api_key
+
+
+def _openai_asr_upload_metadata(audio_path: Path) -> tuple[str, str]:
+    """Return a privacy-safe filename and explicit type for an ASR upload."""
+    suffix = audio_path.suffix.lower()
+    content_type = _OPENAI_ASR_UPLOAD_FORMATS.get(suffix)
+    if content_type is None:
+        raise RuntimeError("openai-asr upload format is not allowlisted")
+    return f"audio{suffix}", content_type
+
+
+def _openai_asr_analyse_canonical_wav(audio_path: Path) -> Optional[tuple[float, bool]]:
+    """Return ``(duration, has_signal)`` only for fully readable PCM WAV input.
+
+    Empty cloud responses are safe only after this complete scan proves digital
+    silence. Sampling windows would leave a gap in that proof, so scan every
+    declared frame even after observing signal.
+    """
+    import wave
+
+    try:
+        with wave.open(str(audio_path), "rb") as wav_file:
+            if wav_file.getcomptype() != "NONE" or wav_file.getsampwidth() != 2:
+                return None
+            rate = wav_file.getframerate()
+            channels = wav_file.getnchannels()
+            total_frames = wav_file.getnframes()
+            if rate <= 0 or channels <= 0:
+                return None
+            block_frames = max(1, min(rate, 8192))
+            remaining_frames = total_frames
+            has_signal = False
+            while remaining_frames:
+                requested_frames = min(block_frames, remaining_frames)
+                frames = wav_file.readframes(requested_frames)
+                expected_bytes = requested_frames * channels * 2
+                if len(frames) != expected_bytes:
+                    return None
+                if not has_signal and (
+                    _max_channel_rms_pcm16(frames, requested_frames, channels)
+                    >= MIN_RMS_THRESHOLD
+                ):
+                    has_signal = True
+                remaining_frames -= requested_frames
+            return total_frames / rate, has_signal
+    except (EOFError, OSError, ValueError, wave.Error):
+        return None
+
+
+def _openai_asr_wav_duration(audio_path: Path) -> Optional[float]:
+    """Return a canonical WAV duration, never a header-only best effort."""
+    analysis = _openai_asr_analyse_canonical_wav(audio_path)
+    return analysis[0] if analysis is not None else None
+
+
+def _openai_asr_wav_has_signal(audio_path: Path) -> Optional[bool]:
+    """Distinguish verified digital silence from a suspicious empty response."""
+    analysis = _openai_asr_analyse_canonical_wav(audio_path)
+    return analysis[1] if analysis is not None else None
+
+
+def _merge_openai_asr_timed_chunks(
+    chunk_segments: list[list[dict]], duration_seconds: float,
+) -> list[dict]:
+    """Preserve every timed observation and order it by global provider time.
+
+    Equal text and nearby timestamps do not prove that two observations are
+    the same utterance. Duplicated overlap text is preferable to deletion. If
+    the complete stable ordering is not globally monotone, validation fails and
+    the source recording stays available for retry.
+    """
+    ordered = []
+    for chunk_index, segments in enumerate(chunk_segments):
+        for segment_index, segment in enumerate(segments):
+            ordered.append((
+                segment["start"], segment["end"], chunk_index, segment_index,
+                segment,
+            ))
+    ordered.sort(key=lambda item: item[:4])
+    merged = [item[4] for item in ordered]
+    return _validate_openai_asr_global_segments(merged, duration_seconds)
+
+
+def _validate_openai_asr_global_segments(
+    segments: list[dict], duration_seconds: float,
+) -> list[dict]:
+    """Reject, rather than reorder or clamp, uncertain global segment times."""
+    previous_start = 0.0
+    previous_end = 0.0
+    for segment in segments:
+        start = segment["start"]
+        end = segment["end"]
+        if (
+            not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or not math.isfinite(start)
+            or not math.isfinite(end)
+            or start < 0
+            or end < start
+            or end > duration_seconds + OPENAI_ASR_TIMESTAMP_TOLERANCE_SECONDS
+            or start < previous_start
+            or end < previous_end
+        ):
+            raise RuntimeError("openai-asr final segment times are not globally monotone")
+        previous_start = start
+        previous_end = end
+    return segments
 
 # Resolve a usable ffmpeg binary. Electron-spawned subprocesses don't inherit
 # the user's shell PATH (no /opt/homebrew/bin), so a bare `ffmpeg` string fails
@@ -233,7 +383,10 @@ def _resolve_ffmpeg() -> Optional[str]:
             ])
         for cand in candidates:
             try:
-                r = subprocess.run([cand, '-version'], capture_output=True, timeout=5)
+                r = subprocess.run(
+                    [cand, '-version'], capture_output=True, timeout=5,
+                    env=_non_asr_subprocess_env(),
+                )
                 if r.returncode == 0:
                     _FFMPEG_PATH_CACHE = cand
                     logger.info(f"ffmpeg resolved at: {cand}")
@@ -346,6 +499,8 @@ def _rms_of_pcm16(raw: bytes, n_samples: int) -> float:
 
     if n_samples == 0:
         return 0.0
+    if len(raw) != n_samples * 2:
+        raise ValueError("PCM16 buffer length does not match its sample count")
     if _NUMPY_AVAILABLE:
         samples = _np.frombuffer(raw, dtype=_np.int16).astype(_np.float32)
         samples /= 32768.0
@@ -354,28 +509,51 @@ def _rms_of_pcm16(raw: bytes, n_samples: int) -> float:
     return math.sqrt(sum((s / 32768.0) ** 2 for s in unpacked) / len(unpacked))
 
 
-def _scan_max_rms(wf, window: int, step: int, early_exit_threshold: float) -> float:
-    """Return the maximum RMS amplitude found across stepped 1-second windows."""
+def _max_channel_rms_pcm16(raw: bytes, n_frames: int, channels: int) -> float:
+    """Return the loudest channel RMS without diluting it across channels."""
+    import struct
+
+    sample_count = n_frames * channels
+    if len(raw) != sample_count * 2:
+        raise ValueError("PCM16 buffer length does not match its frame count")
+    if sample_count == 0:
+        return 0.0
+    if _NUMPY_AVAILABLE:
+        samples = _np.frombuffer(raw, dtype=_np.int16).reshape(n_frames, channels)
+        samples = samples.astype(_np.float32) / 32768.0
+        per_channel = _np.sqrt(_np.mean(samples * samples, axis=0))
+        return float(_np.max(per_channel))
+
+    squared_sums = [0] * channels
+    for sample_index, (sample,) in enumerate(struct.iter_unpack("<h", raw)):
+        squared_sums[sample_index % channels] += sample * sample
+    return max(
+        math.sqrt(squared_sum / n_frames) / 32768.0
+        for squared_sum in squared_sums
+    )
+
+
+def _scan_max_rms(wf, window: int, early_exit_threshold: float) -> float:
+    """Scan contiguous blocks, reading every PCM frame before returning silence."""
     n_frames = wf.getnframes()
     if n_frames == 0:
         return 0.0
+    channels = wf.getnchannels()
+    if window <= 0 or channels <= 0 or wf.getsampwidth() != 2 or wf.getcomptype() != "NONE":
+        raise ValueError("RMS scan requires readable PCM16 WAV input")
 
-    if n_frames < window:
-        wf.setpos(0)
-        raw = wf.readframes(n_frames)
-        return _rms_of_pcm16(raw, n_frames)
-
+    wf.rewind()
     max_rms = 0.0
-    pos = 0
-    while pos + window <= n_frames:
-        wf.setpos(pos)
-        raw = wf.readframes(window)
-        rms = _rms_of_pcm16(raw, window)
+    remaining = n_frames
+    while remaining:
+        requested = min(window, remaining)
+        raw = wf.readframes(requested)
+        rms = _max_channel_rms_pcm16(raw, requested, channels)
         if rms > max_rms:
             max_rms = rms
         if max_rms >= early_exit_threshold:
             return max_rms
-        pos += step
+        remaining -= requested
     return max_rms
 
 
@@ -815,6 +993,7 @@ def _terminate_process_tree(proc: subprocess.Popen) -> None:
                 capture_output=True,
                 timeout=10,
                 check=False,
+                env=_non_asr_subprocess_env(),
             )
             if result.returncode != 0:
                 raise OSError(f"taskkill exited {result.returncode}")
@@ -879,7 +1058,7 @@ def _run_steno_diarize(
         proc = subprocess.Popen(
             [binary, "diarize", str(channel_path)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env={**os.environ, **extra_env} if extra_env else None,
+            env=_non_asr_subprocess_env(extra_env),
             **process_group_options,
         )
         stdout_chunks: list[bytes] = []
@@ -1844,7 +2023,10 @@ class WhisperTranscriber:
             ])
 
         try:
-            subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5, check=True)
+            subprocess.run(
+                ['ffmpeg', '-version'], capture_output=True, timeout=5, check=True,
+                env=_non_asr_subprocess_env(),
+            )
             logger.info("ffmpeg found in PATH")
             return
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
@@ -1853,7 +2035,10 @@ class WhisperTranscriber:
         ffmpeg_found_path = None
         for ffmpeg_path in possible_ffmpeg_paths:
             try:
-                subprocess.run([ffmpeg_path, '-version'], capture_output=True, timeout=5, check=True)
+                subprocess.run(
+                    [ffmpeg_path, '-version'], capture_output=True, timeout=5, check=True,
+                    env=_non_asr_subprocess_env(),
+                )
                 ffmpeg_found_path = ffmpeg_path
                 logger.info(f"Found ffmpeg at: {ffmpeg_path}")
                 break
@@ -1891,9 +2076,7 @@ class WhisperTranscriber:
         # back to the original audio like every other pre-processing problem,
         # not fail the meeting.
         try:
-            fd, temp_name = tempfile.mkstemp(
-                prefix=f"stenoai_prep_{audio_filepath.stem}_", suffix=".wav"
-            )
+            fd, temp_name = tempfile.mkstemp(prefix="stenoai_prep_", suffix=".wav")
             os.close(fd)
         except OSError as e:
             logger.warning("Could not create pre-processing temp file; using original audio: %s", e)
@@ -1912,6 +2095,7 @@ class WhisperTranscriber:
                  str(temp_path)],
                 capture_output=True,
                 timeout=AUDIO_PREPROCESS_TIMEOUT_S,
+                env=_non_asr_subprocess_env(),
             )
             if result.returncode == 0 and temp_path.exists() and temp_path.stat().st_size > 0:
                 logger.info("Audio pre-processed (highpass + loudnorm)")
@@ -1967,7 +2151,6 @@ class WhisperTranscriber:
         reprocessable) rather than silently returning an empty meeting.
         """
         import json as _json
-        import mimetypes
         import os
         import time
         import urllib.error
@@ -1980,12 +2163,14 @@ class WhisperTranscriber:
         api_key = getattr(self, "_openai_asr_api_key", "")
         model = getattr(self, "_openai_asr_model", "") or "whisper-1"
 
-        from src.config import _normalise_openai_asr_api_url
+        from src.config import _normalise_openai_asr_api_url, _openai_asr_api_origin
 
         api_url = _normalise_openai_asr_api_url(api_url)
         if not api_url:
             raise RuntimeError("openai-asr: configured endpoint is unsafe or invalid")
         api_url = api_url.rstrip("/")
+        endpoint_origin = _openai_asr_api_origin(api_url)
+        credential_origin = os.environ.get("STENOAI_OAI_API_ORIGIN", "")
 
         if "/audio/transcriptions" not in api_url:
             endpoint = f"{api_url}/audio/transcriptions"
@@ -1999,6 +2184,12 @@ class WhisperTranscriber:
                 "openai-asr: No API key configured. "
                 "Set it in Settings > Transcription > OpenAI-compatible ASR."
             )
+        api_key = _validate_openai_asr_api_key(api_key)
+        if not endpoint_origin or credential_origin != endpoint_origin:
+            # The config is deliberately re-read in this subprocess.  If it
+            # changed after Electron's safeStorage snapshot, never reuse the
+            # bearer token at this different endpoint.
+            raise RuntimeError("openai-asr: credential origin does not match endpoint")
 
         boundary = uuid.uuid4().hex
 
@@ -2025,7 +2216,7 @@ class WhisperTranscriber:
 
         class _MultipartStream:
             def __init__(self, response_format: str, request_audio_path: Path):
-                mime_type = mimetypes.guess_type(str(request_audio_path))[0] or "audio/wav"
+                filename, mime_type = _openai_asr_upload_metadata(request_audio_path)
                 self.prefix_parts = [
                     _field("model", model),
                     _field("response_format", response_format),
@@ -2033,7 +2224,7 @@ class WhisperTranscriber:
                 if language and language != "auto":
                     self.prefix_parts.append(_field("language", language))
                 self.prefix_parts.append(
-                    _file_field_header("file", "audio", mime_type)
+                    _file_field_header("file", filename, mime_type)
                 )
 
                 self.prefix_bytes = b"".join(self.prefix_parts)
@@ -2112,13 +2303,18 @@ class WhisperTranscriber:
                 remaining = request_deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("openai-asr request exceeded its total deadline")
-                stream = _MultipartStream(response_format, request_audio_path)
-                req = urllib.request.Request(
-                    endpoint,
-                    data=stream,
-                    headers={**headers, "Content-Length": str(len(stream))},
-                    method="POST",
-                )
+                try:
+                    stream = _MultipartStream(response_format, request_audio_path)
+                    req = urllib.request.Request(
+                        endpoint,
+                        data=stream,
+                        headers={**headers, "Content-Length": str(len(stream))},
+                        method="POST",
+                    )
+                except (ValueError, UnicodeError, http.client.HTTPException):
+                    raise RuntimeError(
+                        "openai-asr request metadata could not be serialized"
+                    ) from None
                 try:
                     # urllib has no progress callback while upload/response is
                     # blocked. Keep the parent watchdog alive during each
@@ -2174,6 +2370,13 @@ class WhisperTranscriber:
                                 resp.close()
                             except Exception:
                                 pass
+                except (ValueError, UnicodeError):
+                    # Header serialization errors can embed the Authorization
+                    # value in their message. Replace them before any caller
+                    # logs or persists the exception.
+                    raise RuntimeError(
+                        "openai-asr request metadata could not be serialized"
+                    ) from None
                 except (urllib.error.URLError, http.client.HTTPException):
                     if attempt == 0:
                         time.sleep(min(2, max(0, request_deadline - time.monotonic())))
@@ -2208,6 +2411,58 @@ class WhisperTranscriber:
                 "detected_language": detected_lang,
                 "detected_language_probability": None,
             }
+
+        def _validate_response_for_request(result: dict, request_audio_path: Path) -> dict:
+            timed_segments = [
+                segment for segment in result.get("segments") or []
+                if segment.get("has_timestamps") is not False
+            ]
+            requires_canonical_wav = (
+                not result.get("text")
+                or result.get("duration_seconds") is not None
+                or bool(timed_segments)
+            )
+            analysis = _openai_asr_analyse_canonical_wav(request_audio_path)
+            if requires_canonical_wav and analysis is None:
+                raise RuntimeError(
+                    "openai-asr response requires canonical WAV validation"
+                )
+            has_signal = False
+            if analysis is not None:
+                request_duration, has_signal = analysis
+                provider_duration = result.get("duration_seconds")
+                if (
+                    provider_duration is not None
+                    and provider_duration
+                    > request_duration + OPENAI_ASR_TIMESTAMP_TOLERANCE_SECONDS
+                ):
+                    raise RuntimeError(
+                        "openai-asr response timestamps exceed request duration"
+                    )
+                previous_start = 0.0
+                previous_end = 0.0
+                for segment in timed_segments:
+                    start = segment["start"]
+                    end = segment["end"]
+                    if (
+                        start > request_duration + OPENAI_ASR_TIMESTAMP_TOLERANCE_SECONDS
+                        or end > request_duration + OPENAI_ASR_TIMESTAMP_TOLERANCE_SECONDS
+                        or start < previous_start
+                        or end < previous_end
+                    ):
+                        raise RuntimeError(
+                            "openai-asr response timestamps exceed request duration"
+                        )
+                    previous_start = start
+                    previous_end = end
+                # The bytes actually consumed are authoritative. Provider
+                # duration is validation metadata, never the returned duration.
+                result["duration_seconds"] = request_duration
+            if not result.get("text") and has_signal:
+                raise RuntimeError(
+                    "openai-asr returned empty transcription for audio with signal"
+                )
+            return result
 
         def _transcribe_one(request_audio_path: Path) -> dict:
             # A response-format fallback is still one upload attempt for this
@@ -2255,8 +2510,12 @@ class WhisperTranscriber:
                 try:
                     if not isinstance(raw_segs, list):
                         raise TypeError("segments must be a list")
-                    duration = _provider_time(data.get("duration"))
-                    parsed_duration = duration or None
+                    duration_value = data.get("duration")
+                    parsed_duration = (
+                        _provider_time(duration_value)
+                        if "duration" in data and duration_value not in (None, "")
+                        else None
+                    )
                     segments = []
                     for segment in raw_segs:
                         if not isinstance(segment, dict):
@@ -2301,7 +2560,7 @@ class WhisperTranscriber:
                     ) from None
                 if raw_text and not segments:
                     logger.info("openai-asr verbose_json response has text without segments")
-                    return _text_result(raw_text)
+                    return _validate_response_for_request(_text_result(raw_text), request_audio_path)
                 compact_text = "".join(raw_text.split())
                 compact_segments = "".join(
                     "".join(segment["text"].split()) for segment in segments
@@ -2311,12 +2570,12 @@ class WhisperTranscriber:
                         "openai-asr verbose_json segments do not cover the full text; "
                         "preserving complete text without timestamps"
                     )
-                    return _text_result(raw_text)
+                    return _validate_response_for_request(_text_result(raw_text), request_audio_path)
                 logger.info(
                     "openai-asr verbose_json: %d chars, %d segments",
                     len(raw_text), len(segments),
                 )
-                return {
+                return _validate_response_for_request({
                     "text": raw_text or None,
                     "segments": segments,
                     "duration_seconds": parsed_duration,
@@ -2324,7 +2583,7 @@ class WhisperTranscriber:
                         detected_lang
                     ),
                     "detected_language_probability": None,
-                }
+                }, request_audio_path)
             except Exception as verbose_error:
                 if not _can_fallback(verbose_error):
                     raise
@@ -2349,7 +2608,7 @@ class WhisperTranscriber:
                     )
                 text = data["text"].strip()
                 logger.info("openai-asr json fallback: %d chars", len(text))
-                return _text_result(text)
+                return _validate_response_for_request(_text_result(text), request_audio_path)
             except Exception as json_error:
                 if not _can_fallback(json_error):
                     raise
@@ -2384,7 +2643,7 @@ class WhisperTranscriber:
                     "misconfigured endpoint"
                 )
             logger.info("openai-asr text fallback: %d chars", len(text))
-            return _text_result(text)
+            return _validate_response_for_request(_text_result(text), request_audio_path)
 
         if audio_filepath.stat().st_size <= OPENAI_ASR_CHUNK_THRESHOLD_BYTES:
             return _transcribe_one(audio_filepath)
@@ -2393,6 +2652,9 @@ class WhisperTranscriber:
             "openai-asr audio exceeds the 25 MB upload limit and is not a "
             "readable 16 kHz mono PCM WAV; cannot split it safely"
         )
+        source_analysis = _openai_asr_analyse_canonical_wav(audio_filepath)
+        if source_analysis is None:
+            raise RuntimeError(limit_error)
         try:
             source_wav = wave.open(str(audio_filepath), "rb")
         except (EOFError, OSError, wave.Error) as error:
@@ -2411,27 +2673,44 @@ class WhisperTranscriber:
                 source_wav.getframerate() * OPENAI_ASR_MAX_CHUNK_SECONDS
             )
             total_frames = source_wav.getnframes()
-            total_chunks = math.ceil(total_frames / frames_per_chunk)
+            overlap_frames = int(
+                source_wav.getframerate() * OPENAI_ASR_CHUNK_OVERLAP_SECONDS
+            )
+            if overlap_frames < 0 or overlap_frames >= frames_per_chunk:
+                raise RuntimeError("openai-asr chunk overlap is invalid")
+            step_frames = frames_per_chunk - overlap_frames
+            total_chunks = max(
+                1,
+                math.ceil(max(0, total_frames - frames_per_chunk) / step_frames) + 1,
+            )
             if total_chunks < 1:
                 raise RuntimeError(limit_error)
 
-            texts = []
+            merged_text_parts = []
             segments = []
+            timed_chunk_segments: list[list[dict]] = [
+                [] for _ in range(total_chunks)
+            ]
+            saw_timed_chunk = False
+            saw_untimed_chunk = False
             detected_language = None
-            duration_seconds = 0.0
-            has_duration = False
+            duration_seconds = source_analysis[0]
 
             for chunk_index in range(total_chunks):
-                chunk_start_frames = chunk_index * frames_per_chunk
+                chunk_start_frames = chunk_index * step_frames
                 chunk_start_seconds = (
                     chunk_start_frames / source_wav.getframerate()
                 )
+                source_wav.setpos(chunk_start_frames)
                 chunk_frames = source_wav.readframes(frames_per_chunk)
-                if not chunk_frames:
+                expected_chunk_frames = min(
+                    frames_per_chunk, total_frames - chunk_start_frames
+                )
+                if len(chunk_frames) != expected_chunk_frames * 2:
                     raise RuntimeError(limit_error)
 
                 fd, chunk_name = tempfile.mkstemp(
-                    prefix=f"stenoai_oai_{audio_filepath.stem}_",
+                    prefix="stenoai_oai_",
                     suffix=".wav",
                 )
                 os.close(fd)
@@ -2451,43 +2730,62 @@ class WhisperTranscriber:
                         pass
 
                 chunk_text = (chunk_result.get("text") or "").strip()
-                if chunk_text:
-                    texts.append(chunk_text)
-                for segment in chunk_result.get("segments") or []:
-                    has_timestamps = segment.get("has_timestamps") is not False
-                    merged_segment = {
-                        "text": segment["text"],
-                        "start": (
-                            float(segment["start"]) + chunk_start_seconds
-                            if has_timestamps else 0.0
-                        ),
-                        "end": (
-                            float(segment["end"]) + chunk_start_seconds
-                            if has_timestamps else 0.0
-                        ),
-                    }
-                    if not has_timestamps:
-                        merged_segment["has_timestamps"] = False
-                    segments.append(merged_segment)
+                chunk_segments = chunk_result.get("segments") or []
+                has_timed_segments = any(
+                    segment.get("has_timestamps") is not False
+                    for segment in chunk_segments
+                )
+                has_untimed_segments = any(
+                    segment.get("has_timestamps") is False
+                    for segment in chunk_segments
+                )
+                if has_timed_segments and has_untimed_segments:
+                    raise RuntimeError(
+                        "openai-asr chunk mixes timed and untimed segments"
+                    )
+                if has_timed_segments:
+                    saw_timed_chunk = True
+                    global_chunk_segments = []
+                    for segment in chunk_segments:
+                        global_chunk_segments.append({
+                            "text": segment["text"],
+                            "start": float(segment["start"]) + chunk_start_seconds,
+                            "end": float(segment["end"]) + chunk_start_seconds,
+                        })
+                    timed_chunk_segments[chunk_index] = global_chunk_segments
+                else:
+                    # Without timestamps there is no safe way to identify an
+                    # overlap. Preserve every chunk verbatim rather than
+                    # deleting possibly real repeated speech by its spelling.
+                    if chunk_text or chunk_segments:
+                        saw_untimed_chunk = True
+                    if chunk_text:
+                        merged_text_parts.append(chunk_text)
+                    for segment in chunk_segments:
+                        segments.append({
+                            "text": segment["text"],
+                            "start": 0.0,
+                            "end": 0.0,
+                            "has_timestamps": False,
+                        })
                 if (
                     detected_language is None
                     and chunk_result.get("detected_language")
                 ):
                     detected_language = chunk_result["detected_language"]
-                chunk_duration = chunk_result.get("duration_seconds")
-                if chunk_duration is not None:
-                    duration_seconds += float(chunk_duration)
-                    if not math.isfinite(duration_seconds):
-                        raise RuntimeError(
-                            "openai-asr chunked response has invalid duration metadata"
-                        )
-                    has_duration = True
                 _emit_heartbeat(chunk_index + 1, total_chunks)
 
+        if saw_timed_chunk and saw_untimed_chunk:
+            raise RuntimeError("openai-asr chunk timeline mixes timed and untimed output")
+        if saw_timed_chunk:
+            segments = _merge_openai_asr_timed_chunks(
+                timed_chunk_segments, duration_seconds
+            )
+            merged_text_parts = [segment["text"] for segment in segments]
         return {
-            "text": " ".join(texts) or None,
+            "text": " ".join(merged_text_parts) or None,
             "segments": segments,
-            "duration_seconds": duration_seconds if has_duration else None,
+            "duration_seconds": duration_seconds,
             "detected_language": detected_language,
             "detected_language_probability": None,
         }
@@ -2558,9 +2856,7 @@ class WhisperTranscriber:
         # temp when it returns as the converted path; on any failure we return
         # the original audio, so we must clean up the mkstemp file ourselves.
         try:
-            fd, temp_name = tempfile.mkstemp(
-                prefix=f"stenoai_16khz_{audio_filepath.stem}_", suffix=".wav"
-            )
+            fd, temp_name = tempfile.mkstemp(prefix="stenoai_16khz_", suffix=".wav")
             os.close(fd)
         except OSError as e:
             logger.error("Could not create 16 kHz temp file: %s", e)
@@ -2573,6 +2869,7 @@ class WhisperTranscriber:
                  str(converted_path)],
                 capture_output=True,
                 timeout=60,
+                env=_non_asr_subprocess_env(),
             )
             if result.returncode == 0 and converted_path.exists() and converted_path.stat().st_size > 0:
                 duration_seconds = None
@@ -2726,6 +3023,18 @@ class WhisperTranscriber:
                 file_size,
             )
 
+            if file_size < 1000 and self.backend == "openai-asr":
+                logger.warning("OpenAI ASR input is too small or unreadable")
+                return {
+                    "text": None,
+                    "segments": [],
+                    "duration_seconds": None,
+                    "detected_language": None,
+                    "detected_language_probability": None,
+                    "transcription_failed": True,
+                    "error": "openai-asr audio input is too small or unreadable",
+                }
+
             if file_size < 1000:  # Less than 1KB
                 logger.warning("Audio file appears to be too small for transcription")
                 return {
@@ -2829,7 +3138,8 @@ class WhisperTranscriber:
             probe = subprocess.run(
                 [ffmpeg, '-hide_banner', '-t', '0', '-i', str(audio_filepath),
                  '-f', 'null', '-'],
-                capture_output=True, timeout=CHANNEL_DETECT_TIMEOUT_S, text=True
+                capture_output=True, timeout=CHANNEL_DETECT_TIMEOUT_S, text=True,
+                env=_non_asr_subprocess_env(),
             )
             stderr = probe.stderr or ''
             channels = _parse_channels_from_ffmpeg_stderr(stderr)
@@ -2850,9 +3160,44 @@ class WhisperTranscriber:
 
         # Split channels into temp files (16kHz mono — Parakeet's expected
         # rate, so the model doesn't have to resample internally).
-        temp_dir = tempfile.gettempdir()
-        mic_path = Path(temp_dir) / f"stenoai_ch0_{audio_filepath.stem}.wav"
-        system_path = Path(temp_dir) / f"stenoai_ch1_{audio_filepath.stem}.wav"
+        # Reserve both output paths atomically.  A source-derived filename
+        # would disclose a meeting name in the shared temp directory and lets
+        # two concurrent transcriptions overwrite or unlink one another.
+        mic_fd = None
+        system_fd = None
+        mic_name = None
+        system_name = None
+        try:
+            mic_fd, mic_name = tempfile.mkstemp(prefix="stenoai_ch0_", suffix=".wav")
+            system_fd, system_name = tempfile.mkstemp(prefix="stenoai_ch1_", suffix=".wav")
+            os.close(mic_fd)
+            mic_fd = None
+            os.close(system_fd)
+            system_fd = None
+        except OSError as error:
+            for fd in (mic_fd, system_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            for temp_name in (mic_name, system_name):
+                if temp_name:
+                    try:
+                        Path(temp_name).unlink()
+                    except OSError:
+                        pass
+            logger.warning("Could not reserve stereo temp files: %s", error)
+            return None, None, None
+        mic_path = Path(mic_name)
+        system_path = Path(system_name)
+
+        def _discard_channel_temps() -> None:
+            for temp_path in (mic_path, system_path):
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
         # Scale the decode timeout to the recording length — a fixed 120 s
         # silently timed out on multi-hour files and lost speaker separation.
@@ -2870,10 +3215,12 @@ class WhisperTranscriber:
                      '-af', f'pan=mono|c0=c{ch_idx},highpass=f={AUDIO_HIGHPASS_HZ}',
                      '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le',
                      str(out_path)],
-                    capture_output=True, timeout=split_timeout
+                    capture_output=True, timeout=split_timeout,
+                    env=_non_asr_subprocess_env(),
                 )
                 if result.returncode != 0:
                     logger.error(f"Channel {ch_idx} extraction failed: {result.stderr.decode()}")
+                    _discard_channel_temps()
                     return None, None, None
 
             # If ffprobe couldn't get duration from the container (e.g. WebM),
@@ -2891,6 +3238,7 @@ class WhisperTranscriber:
             return mic_path, system_path, duration
         except Exception as e:
             logger.error(f"Channel splitting error: {e}")
+            _discard_channel_temps()
             return None, None, None
 
     def _check_rms_energy(self, audio_path: Path, threshold: float = MIN_RMS_THRESHOLD) -> bool:
@@ -2912,10 +3260,9 @@ class WhisperTranscriber:
                 if n_frames == 0:
                     return False
                 window = sr  # 1 second
-                step = max(window, n_frames // RMS_MAX_WINDOWS)
-                max_rms = _scan_max_rms(wf, window, step, threshold)
+                max_rms = _scan_max_rms(wf, window, threshold)
 
-            label = "early exit" if max_rms >= threshold else "scanned"
+            label = "signal found" if max_rms >= threshold else "fully scanned"
             logger.info(
                 f"RMS energy for {audio_path.name}: max={max_rms:.6f} "
                 f"(threshold {threshold}, {label})"

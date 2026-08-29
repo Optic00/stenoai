@@ -125,6 +125,16 @@ test('openai-asr API key is stored encrypted (safeStorage), not in config.json',
   // ...and the plaintext key never appears in config.json.
   expect(JSON.stringify(readUserConfig(userDataDir))).not.toContain(SECRET);
 
+  // A bearer token is scoped to the canonical endpoint origin. Changing the
+  // provider must leave the encrypted blob inert until the user saves a key
+  // for that new origin, never reusing Authorization across providers.
+  await page.evaluate(() =>
+    (window as StenoWindow).stenoai.openaiAsr.setConfig({
+      api_url: 'https://replacement.example/v1',
+    }),
+  );
+  await expect.poll(async () => (await getConfig(page)).api_key_set).toBe(false);
+
   // Clearing removes the encrypted file and flips api_key_set back to false.
   await page.evaluate(() => (window as StenoWindow).stenoai.openaiAsr.setKey(''));
   await expect

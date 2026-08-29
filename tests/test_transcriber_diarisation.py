@@ -12,6 +12,7 @@ Covers:
 import io
 import json
 import math
+import os
 import struct
 import subprocess
 import sys
@@ -809,6 +810,34 @@ class CheckRmsEnergyTests(unittest.TestCase):
         # surface the late-arriving energy and return True.
         path = self.tmpdir / 'late_speech.wav'
         _write_wav_with_segments(path, [(10, 'silent'), (5, 'loud')])
+        self.assertTrue(self.transcriber._check_rms_energy(path))
+
+    def test_sparse_left_channel_burst_between_old_windows_is_caught(self):
+        path = self.tmpdir / 'sparse_stereo_burst.wav'
+        frame_count = 16000 * 120
+        burst_start = 16000 * 37 + 8000
+        raw = bytearray(frame_count * 4)
+        # Per-channel RMS is above the gate while a stereo-wide average
+        # would dilute this below it.
+        signal_frame = (150).to_bytes(2, 'little', signed=True) + b'\0\0'
+        for frame in range(burst_start, burst_start + 80):
+            raw[frame * 4:(frame + 1) * 4] = signal_frame
+        with wave.open(str(path), 'wb') as wf:
+            wf.setnchannels(2)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(raw)
+
+        self.assertTrue(self.transcriber._check_rms_energy(path))
+
+    def test_truncated_pcm_read_is_not_classified_as_silence(self):
+        path = self.tmpdir / 'truncated.wav'
+        _write_wav_with_segments(path, [(1, 'silent')])
+        raw = bytearray(path.read_bytes())
+        raw[4:8] = (36 + 64000).to_bytes(4, 'little')
+        raw[40:44] = (64000).to_bytes(4, 'little')
+        path.write_bytes(raw)
+
         self.assertTrue(self.transcriber._check_rms_energy(path))
 
     def test_zero_frame_file_returns_false(self):
@@ -1927,6 +1956,34 @@ class RunStenoDiarizeTests(unittest.TestCase):
     def test_returns_none_when_binary_unresolved(self):
         with patch("src.transcriber._resolve_steno_diarize", return_value=None):
             self.assertIsNone(_run_steno_diarize(Path("/fake/mic.wav"), 60))
+
+    def test_sidecar_env_removes_cloud_credentials_case_insensitively(self):
+        payload = json.dumps({"segments": [], "speakers": {}}).encode()
+        fake = _FakePopen(stdout=payload)
+        with patch.dict(os.environ, {
+            "STENOAI_OAI_API_KEY": "parent-key",
+            "stenoai_oai_api_origin": "https://parent.example",
+        }), patch(
+            "src.transcriber._resolve_steno_diarize",
+            return_value="/fake/steno-diarize",
+        ), patch("subprocess.Popen", return_value=fake) as popen:
+            self.assertIsNotNone(_run_steno_diarize(
+                Path("/fake/mic.wav"),
+                60,
+                extra_env={
+                    "StEnOaI_OaI_ApI_KeY": "extra-key",
+                    "STENOAI_DIARIZE_COMPUTE_UNITS": "cpuOnly",
+                },
+            ))
+
+        env = popen.call_args.kwargs["env"]
+        self.assertFalse(any(
+            name.upper() in {
+                "STENOAI_OAI_API_KEY", "STENOAI_OAI_API_ORIGIN",
+            }
+            for name in env
+        ))
+        self.assertEqual(env["STENOAI_DIARIZE_COMPUTE_UNITS"], "cpuOnly")
 
     def test_windows_taskkill_failure_falls_back_to_parent_kill(self):
         proc = _FakePopen()

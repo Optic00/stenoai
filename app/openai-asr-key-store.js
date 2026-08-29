@@ -1,5 +1,49 @@
 'use strict';
 
+const OPENAI_ASR_DEFAULT_URL = 'https://api.openai.com/v1';
+const OPENAI_ASR_MAX_KEY_LENGTH = 4096;
+
+function isValidOpenAiAsrApiKey(key) {
+  return typeof key === 'string'
+    && key.length > 0
+    && key.length <= OPENAI_ASR_MAX_KEY_LENGTH
+    && /^[\x21-\x7e]+$/.test(key);
+}
+
+function normalizeOpenAiAsrOrigin(apiUrl) {
+  try {
+    if (typeof apiUrl !== 'string' || !apiUrl.trim()) return null;
+    const endpoint = new URL(apiUrl.trim());
+    const hostname = endpoint.hostname.toLowerCase();
+    if (!hostname || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) return null;
+    const loopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
+    if (endpoint.protocol !== 'https:' && !(endpoint.protocol === 'http:' && loopback)) return null;
+    return endpoint.origin === 'null' ? null : endpoint.origin;
+  } catch (_) {
+    return null;
+  }
+}
+
+function readLegacyCredentialSnapshot({ fs, configPath }) {
+  try {
+    if (!fs.existsSync(configPath)) return null;
+    // This single read is the authority for both fields. A later endpoint
+    // change must never bind this snapshot's plaintext key to another origin.
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    const key = config && typeof config.openai_asr_api_key === 'string'
+      ? config.openai_asr_api_key.trim()
+      : '';
+    if (!key) return null;
+    const apiUrl = config && Object.prototype.hasOwnProperty.call(config, 'openai_asr_api_url')
+      ? config.openai_asr_api_url
+      : OPENAI_ASR_DEFAULT_URL;
+    const origin = normalizeOpenAiAsrOrigin(apiUrl);
+    return origin ? { key, origin } : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function clearedMarkerPath(keyPath) {
   return `${keyPath}.cleared`;
 }
@@ -49,13 +93,43 @@ function legacyKeyMigrationAction({ cleared, legacyKey, storedKey }) {
   return 'remove-legacy';
 }
 
+function decodeKeyEnvelope(value, origin) {
+  try {
+    const envelope = JSON.parse(value);
+    if (
+      !envelope
+      || envelope.version !== 1
+      || envelope.origin !== origin
+      || typeof envelope.key !== 'string'
+      || !isValidOpenAiAsrApiKey(envelope.key)
+    ) {
+      return null;
+    }
+    return envelope.key;
+  } catch (_) {
+    // Pre-envelope safeStorage blobs intentionally fail closed. We cannot
+    // prove which endpoint received the key that they contain.
+    return null;
+  }
+}
+
+function loadEncryptedKeyForOrigin({ fs, keyPath, origin, safeStorage }) {
+  if (typeof origin !== 'string' || !origin) return null;
+  try {
+    if (!fs.existsSync(keyPath)) return null;
+    return decodeKeyEnvelope(safeStorage.decryptString(fs.readFileSync(keyPath)), origin);
+  } catch (_) {
+    return null;
+  }
+}
+
 /**
  * Atomically replace an encrypted OpenAI ASR credential and verify that the
  * committed bytes decrypt to the requested plaintext. The previous blob is
  * captured before encryption starts, so an early safeStorage failure cannot
  * be mistaken for "there was no previous credential".
  */
-function saveEncryptedKeyAtomically({ fs, path, processId, now, keyPath, key, safeStorage }) {
+function saveEncryptedKeyAtomically({ fs, path, processId, now, keyPath, key, origin, safeStorage }) {
   const tempPath = `${keyPath}.${processId}.${now}.tmp`;
   const rollbackPath = `${tempPath}.rollback`;
   const markerPath = clearedMarkerPath(keyPath);
@@ -67,12 +141,19 @@ function saveEncryptedKeyAtomically({ fs, path, processId, now, keyPath, key, sa
   let clearedStateRemoved = false;
 
   try {
+    if (typeof origin !== 'string' || !origin) {
+      throw new Error('OpenAI ASR API key endpoint is invalid');
+    }
+    if (!isValidOpenAiAsrApiKey(key)) {
+      throw new Error('OpenAI ASR API key has an invalid format');
+    }
     if (!fs.existsSync(keyDir)) fs.mkdirSync(keyDir, { recursive: true });
 
     hadPrevious = fs.existsSync(keyPath);
     if (hadPrevious) previous = fs.readFileSync(keyPath);
 
-    const encrypted = safeStorage.encryptString(key);
+    const envelope = JSON.stringify({ version: 1, origin, key });
+    const encrypted = safeStorage.encryptString(envelope);
     fs.writeFileSync(tempPath, encrypted, { mode: 0o600 });
     if (hadPrevious) {
       // Prepare the encrypted recovery blob before replacing keyPath. A disk
@@ -83,7 +164,9 @@ function saveEncryptedKeyAtomically({ fs, path, processId, now, keyPath, key, sa
     fs.renameSync(tempPath, keyPath);
     committed = true;
 
-    const readback = safeStorage.decryptString(fs.readFileSync(keyPath));
+    const readback = decodeKeyEnvelope(
+      safeStorage.decryptString(fs.readFileSync(keyPath)), origin,
+    );
     if (readback !== key) throw new Error('safeStorage readback did not match saved key');
     if (fs.existsSync(markerPath)) {
       // Only a verified explicit replacement may reactivate the credential.
@@ -147,7 +230,11 @@ function saveEncryptedKeyAtomically({ fs, path, processId, now, keyPath, key, sa
 
 module.exports = {
   isEncryptedKeyCleared,
+  isValidOpenAiAsrApiKey,
   legacyKeyMigrationAction,
+  loadEncryptedKeyForOrigin,
   markEncryptedKeyClearedAtomically,
+  normalizeOpenAiAsrOrigin,
+  readLegacyCredentialSnapshot,
   saveEncryptedKeyAtomically,
 };

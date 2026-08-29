@@ -7,8 +7,11 @@ const os = require('os');
 const path = require('path');
 const {
   isEncryptedKeyCleared,
+  isValidOpenAiAsrApiKey,
   legacyKeyMigrationAction,
+  loadEncryptedKeyForOrigin,
   markEncryptedKeyClearedAtomically,
+  readLegacyCredentialSnapshot,
   saveEncryptedKeyAtomically,
 } = require('./openai-asr-key-store');
 
@@ -22,6 +25,16 @@ test('OpenAI ASR plaintext-key migration runs at application startup', () => {
   assert.ok(ready >= 0, 'main process must initialize when Electron is ready');
   assert.ok(migration > ready, 'startup must schedule legacy-key migration');
   assert.ok(migration < menu, 'migration must not depend on opening Settings or selecting an engine');
+});
+
+test('transcription launches pass the credential origin alongside the key', () => {
+  const launch = source.slice(
+    source.indexOf('function getTranscriptionEnv()'),
+    source.indexOf('// Read the Python-side ai_provider config'),
+  );
+  assert.match(launch, /STENOAI_OAI_API_KEY/);
+  assert.match(launch, /STENOAI_OAI_API_ORIGIN/);
+  assert.match(launch, /loadOpenAiAsrCredential/);
 });
 
 function withKeyDirectory(run) {
@@ -46,7 +59,63 @@ function safeStorage(overrides = {}) {
   };
 }
 
-function save(keyPath, key, storage = safeStorage(), fsImpl = fs) {
+const ORIGIN = 'https://api.example';
+
+test('legacy key and origin come from one immutable config snapshot', () => {
+  withKeyDirectory((keyPath) => {
+    const configPath = path.join(path.dirname(keyPath), 'config.json');
+    let reads = 0;
+    const fsImpl = Object.create(fs);
+    fsImpl.existsSync = (target) => target === configPath || fs.existsSync(target);
+    fsImpl.readFileSync = (target, ...args) => {
+      if (target !== configPath) return fs.readFileSync(target, ...args);
+      reads += 1;
+      return JSON.stringify(reads === 1 ? {
+        openai_asr_api_key: 'key-for-a',
+        openai_asr_api_url: 'https://a.example/v1',
+      } : {
+        openai_asr_api_key: 'key-for-b',
+        openai_asr_api_url: 'https://b.example/v1',
+      });
+    };
+
+    const snapshot = readLegacyCredentialSnapshot({ fs: fsImpl, configPath });
+    assert.deepStrictEqual(snapshot, {
+      key: 'key-for-a',
+      origin: 'https://a.example',
+    });
+    assert.strictEqual(reads, 1);
+
+    assert.strictEqual(save(keyPath, snapshot.key, safeStorage(), fs, snapshot.origin), true);
+    assert.strictEqual(loadEncryptedKeyForOrigin({
+      fs,
+      keyPath,
+      origin: 'https://b.example',
+      safeStorage: safeStorage(),
+    }), null, 'an endpoint change must not activate A\'s snapshot at B');
+  });
+});
+
+test('API key validation rejects controls, whitespace, non-ASCII, and oversized values', () => {
+  assert.strictEqual(isValidOpenAiAsrApiKey('sk-valid_123'), true);
+  for (const invalid of ['', ' leading', 'trailing ', 'line\nbreak', 'unicode-\u2603', 'x'.repeat(4097)]) {
+    assert.strictEqual(isValidOpenAiAsrApiKey(invalid), false);
+  }
+  withKeyDirectory((keyPath) => {
+    const invalid = 'secret\nInjected: yes';
+    let failure;
+    try {
+      save(keyPath, invalid);
+    } catch (error) {
+      failure = error;
+    }
+    assert.match(failure.message, /was not saved/);
+    assert.doesNotMatch(failure.message, /secret|Injected/);
+    assert.strictEqual(fs.existsSync(keyPath), false);
+  });
+});
+
+function save(keyPath, key, storage = safeStorage(), fsImpl = fs, origin = ORIGIN) {
   return saveEncryptedKeyAtomically({
     fs: fsImpl,
     path,
@@ -54,9 +123,49 @@ function save(keyPath, key, storage = safeStorage(), fsImpl = fs) {
     now: 456,
     keyPath,
     key,
+    origin,
     safeStorage: storage,
   });
 }
+
+function decryptedEnvelope(keyPath, storage = safeStorage()) {
+  return JSON.parse(storage.decryptString(fs.readFileSync(keyPath)));
+}
+
+test('encrypted API keys are versioned envelopes bound to exactly one endpoint origin', () => {
+  withKeyDirectory((keyPath) => {
+    assert.strictEqual(save(keyPath, 'bound-key'), true);
+    assert.deepStrictEqual(decryptedEnvelope(keyPath), {
+      version: 1,
+      origin: ORIGIN,
+      key: 'bound-key',
+    });
+    assert.strictEqual(loadEncryptedKeyForOrigin({
+      fs,
+      keyPath,
+      origin: ORIGIN,
+      safeStorage: safeStorage(),
+    }), 'bound-key');
+    assert.strictEqual(loadEncryptedKeyForOrigin({
+      fs,
+      keyPath,
+      origin: 'https://replacement.example',
+      safeStorage: safeStorage(),
+    }), null, 'endpoint changes must fail closed before Authorization is sent');
+  });
+});
+
+test('legacy unbound encrypted blobs never become active at any endpoint', () => {
+  withKeyDirectory((keyPath) => {
+    fs.writeFileSync(keyPath, encrypted('legacy-unbound-key'));
+    assert.strictEqual(loadEncryptedKeyForOrigin({
+      fs,
+      keyPath,
+      origin: ORIGIN,
+      safeStorage: safeStorage(),
+    }), null);
+  });
+});
 
 test('early encryption failure leaves the previous encrypted key byte-for-byte intact', () => {
   withKeyDirectory((keyPath) => {
@@ -160,7 +269,11 @@ test('successful key rotation persists a decryptable replacement', () => {
   withKeyDirectory((keyPath) => {
     fs.writeFileSync(keyPath, encrypted('old-key'));
     assert.strictEqual(save(keyPath, 'new-key'), true);
-    assert.strictEqual(safeStorage().decryptString(fs.readFileSync(keyPath)), 'new-key');
+    assert.deepStrictEqual(decryptedEnvelope(keyPath), {
+      version: 1,
+      origin: ORIGIN,
+      key: 'new-key',
+    });
   });
 });
 
@@ -218,7 +331,11 @@ test('explicit replacement activates only after its encrypted readback succeeds'
 
     assert.strictEqual(save(keyPath, 'replacement-key'), true);
     assert.strictEqual(isEncryptedKeyCleared({ fs, keyPath }), false);
-    assert.strictEqual(safeStorage().decryptString(fs.readFileSync(keyPath)), 'replacement-key');
+    assert.deepStrictEqual(decryptedEnvelope(keyPath), {
+      version: 1,
+      origin: ORIGIN,
+      key: 'replacement-key',
+    });
   });
 });
 

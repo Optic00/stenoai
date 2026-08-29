@@ -79,6 +79,37 @@ def _normalise_openai_asr_api_url(value: object) -> Optional[str]:
     return urllib.parse.urlunsplit((scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
 
 
+def _openai_asr_api_origin(value: object) -> Optional[str]:
+    """Return the canonical scheme/host/port origin of a safe ASR endpoint.
+
+    This deliberately starts from the normalised endpoint representation so a
+    credential cannot become valid for a URL that the normal configuration
+    path would reject.  It mirrors WHATWG URL's origin shape used by Electron:
+    lowercase scheme/host and no explicit default port.
+    """
+    normalised = _normalise_openai_asr_api_url(value)
+    if normalised is None:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(normalised)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    try:
+        hostname = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is None or (parsed.scheme == "https" and port == 443) or (
+        parsed.scheme == "http" and port == 80
+    ):
+        return f"{parsed.scheme}://{host}"
+    return f"{parsed.scheme}://{host}:{port}"
+
+
 def _atomic_write(path: Path, render, encoding: str = 'utf-8') -> None:
     """Durably replace `path` with whatever `render(fh)` writes.
 

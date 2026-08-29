@@ -20,10 +20,14 @@ const path = require('path');
 const { spawn: _spawnRaw } = require('child_process');
 
 const OPENAI_ASR_KEY_ENV = 'STENOAI_OAI_API_KEY';
+const OPENAI_ASR_ORIGIN_ENV = 'STENOAI_OAI_API_ORIGIN';
 
 function withoutOpenAiAsrKey(env) {
   return Object.fromEntries(
-    Object.entries(env || {}).filter(([name]) => name.toUpperCase() !== OPENAI_ASR_KEY_ENV),
+    Object.entries(env || {}).filter(([name]) => ![
+      OPENAI_ASR_KEY_ENV,
+      OPENAI_ASR_ORIGIN_ENV,
+    ].includes(name.toUpperCase())),
   );
 }
 

@@ -108,9 +108,11 @@ test('environment helper strips lower and mixed-case keys without mutating input
     PATH: '/bin',
     stenoai_oai_api_key: 'lower-secret',
     StEnOaI_OaI_ApI_KeY: 'mixed-secret',
+    stenoai_oai_api_origin: 'https://provider.example',
   };
   assert.deepStrictEqual(withoutOpenAiAsrKey(input), { PATH: '/bin' });
   assert.strictEqual(input.stenoai_oai_api_key, 'lower-secret');
+  assert.strictEqual(input.stenoai_oai_api_origin, 'https://provider.example');
 });
 
 test('spawn handles the 2-arg (command, options) form', () => {

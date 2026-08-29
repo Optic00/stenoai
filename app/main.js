@@ -55,7 +55,10 @@ const { spawn, killProcessTree, createBackendCli, withoutOpenAiAsrKey } = requir
 const {
   isEncryptedKeyCleared,
   legacyKeyMigrationAction,
+  loadEncryptedKeyForOrigin,
   markEncryptedKeyClearedAtomically,
+  normalizeOpenAiAsrOrigin,
+  readLegacyCredentialSnapshot,
   saveEncryptedKeyAtomically,
 } = require('./openai-asr-key-store');
 const { createDebugLog } = require('./debug-log');
@@ -8104,8 +8107,13 @@ ipcMain.handle('set-openai-asr-key', async (_event, key) => {
       await migrateLegacyOpenAiAsrApiKey();
       return { success: true, api_key_set: false };
     }
-    const saved = saveOpenAiAsrKey(key);
-    return { success: saved, api_key_set: saved && hasOpenAiAsrKey() };
+    const origin = getOpenAiAsrEndpointOrigin();
+    if (!origin) throw new Error('OpenAI ASR endpoint is invalid');
+    const saved = saveOpenAiAsrKey(key, origin);
+    return {
+      success: saved,
+      api_key_set: saved && Boolean(loadOpenAiAsrKey(origin)),
+    };
   } catch (e) { return { success: false, error: e.message }; }
 });
 
@@ -8926,6 +8934,26 @@ function getOpenAiAsrKeyPath() {
   return path.join(getUserDataDir(), '.openai-asr-api-key');
 }
 
+// Credentials belong to a network origin, not a configurable URL path. URL's
+// origin canonicalises scheme, hostname, and the effective port (including
+// default-port elision), so equivalent endpoints compare equal while a host,
+// scheme, or port change cannot reuse the old bearer token.
+function getOpenAiAsrEndpointOrigin() {
+  try {
+    const configPath = path.join(getUserDataDir(), 'config.json');
+    let apiUrl = 'https://api.openai.com/v1';
+    if (fs.existsSync(configPath)) {
+      const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      if (cfg && Object.prototype.hasOwnProperty.call(cfg, 'openai_asr_api_url')) {
+        apiUrl = cfg.openai_asr_api_url;
+      }
+    }
+    return normalizeOpenAiAsrOrigin(apiUrl);
+  } catch (_) {
+    return null;
+  }
+}
+
 function isOpenAiAsrKeyCleared() {
   return isEncryptedKeyCleared({ fs, keyPath: getOpenAiAsrKeyPath() });
 }
@@ -8940,8 +8968,9 @@ function markOpenAiAsrKeyCleared() {
   });
 }
 
-function saveOpenAiAsrKey(key) {
+function saveOpenAiAsrKey(key, origin) {
   try {
+    if (!origin) throw new Error('OpenAI ASR endpoint is invalid');
     return saveEncryptedKeyAtomically({
       fs,
       path,
@@ -8949,6 +8978,7 @@ function saveOpenAiAsrKey(key) {
       now: Date.now(),
       keyPath: getOpenAiAsrKeyPath(),
       key,
+      origin,
       safeStorage: getSafeStorage(),
     });
   } catch (error) {
@@ -8957,65 +8987,62 @@ function saveOpenAiAsrKey(key) {
   }
 }
 
-function loadOpenAiAsrKey() {
+function loadOpenAiAsrCredential(origin) {
   try {
     if (isOpenAiAsrKeyCleared()) return null;
+    if (!origin) return null;
     const keyPath = getOpenAiAsrKeyPath();
     migrateLegacyCredentialFile(keyPath, '.openai-asr-api-key');
-    if (!fs.existsSync(keyPath)) return null;
-    const encrypted = fs.readFileSync(keyPath);
-    return getSafeStorage().decryptString(encrypted);
+    const key = loadEncryptedKeyForOrigin({ fs, keyPath, origin, safeStorage: getSafeStorage() });
+    return key ? { key, origin } : null;
   } catch (error) {
     console.error('Failed to load OpenAI ASR API key:', error.message);
     return null;
   }
 }
 
-function hasOpenAiAsrKey() {
-  return !isOpenAiAsrKeyCleared() && fs.existsSync(getOpenAiAsrKeyPath());
+function loadOpenAiAsrKey(origin) {
+  return loadOpenAiAsrCredential(origin)?.key || null;
 }
 
-function readLegacyOpenAiAsrApiKey() {
-  try {
-    const configPath = path.join(getUserDataDir(), 'config.json');
-    if (!fs.existsSync(configPath)) return null;
-    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    const key = config && typeof config.openai_asr_api_key === 'string'
-      ? config.openai_asr_api_key.trim()
-      : '';
-    return key || null;
-  } catch (_) {
-    // A damaged legacy config remains recoverable through the normal backend
-    // path. Never log its contents, which may contain the key we are seeking.
-    return null;
-  }
+function hasOpenAiAsrKey() {
+  const origin = getOpenAiAsrEndpointOrigin();
+  return Boolean(origin && loadOpenAiAsrKey(origin));
+}
+
+function readLegacyOpenAiAsrCredential() {
+  return readLegacyCredentialSnapshot({
+    fs,
+    configPath: path.join(getUserDataDir(), 'config.json'),
+  });
 }
 
 function secureLegacyOpenAiAsrApiKey() {
-  const legacyKey = readLegacyOpenAiAsrApiKey();
-  if (!legacyKey) return false;
-  const stored = loadOpenAiAsrKey();
+  const legacy = readLegacyOpenAiAsrCredential();
+  if (!legacy) return false;
+  const stored = loadOpenAiAsrKey(legacy.origin);
   const action = legacyKeyMigrationAction({
     cleared: isOpenAiAsrKeyCleared(),
-    legacyKey,
+    legacyKey: legacy.key,
     storedKey: stored,
   });
   if (action !== 'secure') return action === 'remove-legacy' && Boolean(stored);
   try {
     // Do not remove config.json's value unless encrypt + decrypt both work.
-    return saveOpenAiAsrKey(legacyKey) && Boolean(loadOpenAiAsrKey());
+    return saveOpenAiAsrKey(legacy.key, legacy.origin)
+      && Boolean(loadOpenAiAsrKey(legacy.origin));
   } catch (_) {
     return false;
   }
 }
 
 async function migrateLegacyOpenAiAsrApiKey() {
-  const legacyKey = readLegacyOpenAiAsrApiKey();
-  if (!legacyKey) return true;
-  let stored = loadOpenAiAsrKey();
+  const legacy = readLegacyOpenAiAsrCredential();
+  if (!legacy) return true;
+  let stored = loadOpenAiAsrKey(legacy.origin);
   const action = legacyKeyMigrationAction({
     cleared: isOpenAiAsrKeyCleared(),
-    legacyKey,
+    legacyKey: legacy.key,
     storedKey: stored,
   });
   if (action === 'none') return false;
@@ -9034,9 +9061,9 @@ async function migrateLegacyOpenAiAsrApiKey() {
   if (action === 'remove-legacy') return removeLegacyKey();
   if (action === 'secure') {
     try {
-      if (!saveOpenAiAsrKey(legacyKey)) return false;
-      stored = loadOpenAiAsrKey();
-      if (stored !== legacyKey) return false;
+      if (!saveOpenAiAsrKey(legacy.key, legacy.origin)) return false;
+      stored = loadOpenAiAsrKey(legacy.origin);
+      if (stored !== legacy.key) return false;
     } catch (_) {
       return false;
     }
@@ -9067,8 +9094,8 @@ function getBackendEnv(extra = {}) {
 }
 
 // Env additions a transcription subprocess needs. Only when openai-asr is the
-// configured engine, decrypt its key from safeStorage and surface it to the
-// Python transcriber as STENOAI_OAI_API_KEY.
+// configured engine, decrypt its key from safeStorage and surface its
+// endpoint-bound credential snapshot to Python atomically.
 function getTranscriptionEnv() {
   const env = {};
   if (loadTranscriptionEngine() !== 'openai-asr') return env;
@@ -9077,8 +9104,12 @@ function getTranscriptionEnv() {
   // sync path can safely use the encrypted copy immediately.
   secureLegacyOpenAiAsrApiKey();
   void migrateLegacyOpenAiAsrApiKey();
-  const oaiKey = loadOpenAiAsrKey();
-  if (oaiKey) env.STENOAI_OAI_API_KEY = oaiKey;
+  const origin = getOpenAiAsrEndpointOrigin();
+  const credential = origin ? loadOpenAiAsrCredential(origin) : null;
+  if (credential) {
+    env.STENOAI_OAI_API_KEY = credential.key;
+    env.STENOAI_OAI_API_ORIGIN = credential.origin;
+  }
   return env;
 }
 
