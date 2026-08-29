@@ -1256,24 +1256,6 @@ def _has_spoken_content(text: Optional[str]) -> bool:
     return any(char.isalnum() for char in (text or ""))
 
 
-def _redact_openai_asr_error(message: object, api_key: str = "") -> str:
-    """Remove configured and common credential forms from provider errors."""
-    redacted = str(message)
-    if api_key:
-        redacted = redacted.replace(api_key, "[redacted]")
-    redacted = re.sub(r"(?i)(\bbearer\s+)[^\s,;\]\}\\]+", r"\1[redacted]", redacted)
-    redacted = re.sub(
-        r"(?i)(\b(?:api[_ -]?key|access[_ -]?token|token)\s*[=:]\s*)[^\s,;\]\}\\]+",
-        r"\1[redacted]",
-        redacted,
-    )
-    redacted = re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}", "[redacted]", redacted)
-
-    # Provider errors can echo signed paths or arbitrary query names. Treat the
-    # whole URL as sensitive instead of trying to enumerate credential fields.
-    return re.sub(r"(?i)https?://[^\s\"'<>]+", "[redacted-url]", redacted)
-
-
 def _open_openai_asr_response_with_deadline(opener, request, timeout: float, deadline: float):
     """Open a request without allowing connect/upload/headers to exceed deadline."""
     import queue
@@ -2086,7 +2068,27 @@ class WhisperTranscriber:
                 raise urllib.error.HTTPError(
                     req.full_url, code, f"Cross-origin redirect to {newurl} denied", hdrs, fp
                 )
-        opener = urllib.request.build_opener(NoRedirectHandler)
+        endpoint_parts = urllib.parse.urlsplit(endpoint)
+        opener_handlers = [NoRedirectHandler]
+        if (
+            endpoint_parts.scheme == "http"
+            and endpoint_parts.hostname in {"localhost", "127.0.0.1", "::1"}
+        ):
+            # urllib otherwise inherits HTTP_PROXY/ALL_PROXY from the parent
+            # environment. Plain HTTP has no TLS layer, so sending a loopback
+            # API key and recording through such a proxy would disclose both.
+            # An explicit empty ProxyHandler also avoids platform-dependent
+            # proxy-bypass rules on macOS and Windows.
+            opener_handlers.insert(0, urllib.request.ProxyHandler({}))
+        # HTTPS intentionally retains urllib's standard environment-proxy
+        # behavior. CONNECT tunnels remain protected by normal certificate
+        # validation, which is the expected behavior for managed networks.
+        opener = urllib.request.build_opener(*opener_handlers)
+
+        class _HttpStatusError(RuntimeError):
+            def __init__(self, status: int):
+                self.status = status
+                super().__init__(f"openai-asr HTTP {status}")
 
         def _do_request(
             response_format: str,
@@ -2123,16 +2125,13 @@ class WhisperTranscriber:
                                 e.close()
                                 time.sleep(min(2, max(0, request_deadline - time.monotonic())))
                                 continue
-                            try:
-                                err_body = _read_openai_asr_response_with_deadline(
-                                    e, request_deadline,
-                                ).decode(errors="replace")
-                            finally:
-                                e.close()
-                            err_body = _redact_openai_asr_error(err_body, api_key)[:500]
-                            raise RuntimeError(
-                                f"openai-asr HTTP {e.code}: {err_body}"
-                            ) from e
+                            status = int(e.code)
+                            # Error bodies are provider-controlled and can echo
+                            # credentials, signed URLs, or meeting content. Never
+                            # read or retain them; the status is sufficient for
+                            # fallback and diagnostics.
+                            e.close()
+                            raise _HttpStatusError(status) from None
                         try:
                             content_type = resp.headers.get("Content-Type", "") or ""
                             body = _read_openai_asr_response_with_deadline(
@@ -2144,23 +2143,24 @@ class WhisperTranscriber:
                                 resp.close()
                             except Exception:
                                 pass
-                except urllib.error.URLError as error:
+                except urllib.error.URLError:
                     if attempt == 0:
                         time.sleep(min(2, max(0, request_deadline - time.monotonic())))
                         continue
-                    raise RuntimeError(
-                        "openai-asr request failed: "
-                        f"{_redact_openai_asr_error(error, api_key)}"
-                    ) from error
+                    # urllib reasons may include proxy/provider-controlled text
+                    # or endpoint details. Keep returned errors and logs neutral.
+                    raise RuntimeError("openai-asr transport request failed") from None
             raise RuntimeError("openai-asr request retry loop exhausted")
 
         def _can_fallback(error: Exception) -> bool:
-            if isinstance(error, _json.JSONDecodeError):
+            if isinstance(error, (_json.JSONDecodeError, UnicodeDecodeError)):
                 return True
-            return (
-                isinstance(error, RuntimeError)
-                and getattr(error.__cause__, "code", None) in (400, 422, 501)
-            )
+            return isinstance(error, _HttpStatusError) and error.status in (400, 422, 501)
+
+        def _fallback_context(error: Exception) -> str:
+            if isinstance(error, _HttpStatusError):
+                return f"HTTP {error.status}"
+            return "invalid JSON response"
 
         def _text_result(text: str) -> dict:
             detected_lang = None if language == "auto" else language
@@ -2211,15 +2211,24 @@ class WhisperTranscriber:
                 detected_lang = data.get("language") or (
                     None if language == "auto" else language
                 )
-                segments = [
-                    {
-                        "text": segment.get("text", "").strip(),
-                        "start": float(segment.get("start") or 0.0),
-                        "end": float(segment.get("end") or 0.0),
-                    }
-                    for segment in raw_segs
-                    if segment.get("text", "").strip()
-                ]
+                try:
+                    segments = [
+                        {
+                            "text": segment.get("text", "").strip(),
+                            "start": float(segment.get("start") or 0.0),
+                            "end": float(segment.get("end") or 0.0),
+                        }
+                        for segment in raw_segs
+                        if segment.get("text", "").strip()
+                    ]
+                    parsed_duration = float(data.get("duration") or 0) or None
+                except (AttributeError, TypeError, ValueError):
+                    # Conversion errors include the offending provider value in
+                    # their message. Replace them before the outer failure path
+                    # records the exception in logs and meeting metadata.
+                    raise RuntimeError(
+                        "openai-asr verbose_json response has invalid segment metadata"
+                    ) from None
                 logger.info(
                     "openai-asr verbose_json: %d chars, %d segments",
                     len(raw_text), len(segments),
@@ -2227,9 +2236,7 @@ class WhisperTranscriber:
                 return {
                     "text": raw_text or None,
                     "segments": segments,
-                    "duration_seconds": (
-                        float(data.get("duration") or 0) or None
-                    ),
+                    "duration_seconds": parsed_duration,
                     "detected_language": _normalize_openai_language(
                         detected_lang
                     ),
@@ -2240,7 +2247,7 @@ class WhisperTranscriber:
                     raise
                 logger.warning(
                     "openai-asr verbose_json failed (%s); falling back to json format",
-                    verbose_error,
+                    _fallback_context(verbose_error),
                 )
 
             # --- Pass 2: json (full text, no timestamps) ----------------
@@ -2265,13 +2272,18 @@ class WhisperTranscriber:
                     raise
                 logger.warning(
                     "openai-asr json failed (%s); falling back to text format",
-                    json_error,
+                    _fallback_context(json_error),
                 )
 
             # --- Pass 3: plain text fallback ----------------------------
             raw, content_type = _do_request(
                 "text", request_audio_path, request_deadline
             )
+            media_type = content_type.partition(";")[0].strip().lower()
+            if media_type != "text/plain":
+                raise RuntimeError(
+                    "openai-asr text response has an unexpected content type"
+                )
             text = raw.decode(errors="replace").strip()
             leading = text.lstrip().lower()
             if (

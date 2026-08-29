@@ -1,6 +1,8 @@
 """Tests for the OpenAI-compatible batch transcription backend."""
 
+import asyncio
 import contextlib
+import http.server
 import io
 import json
 import tempfile
@@ -8,12 +10,14 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.request
 import wave
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import src.config as config_mod
 import src.transcriber as transcriber_mod
+from simple_recorder import MeetingPipeline, _parse_meeting_markdown
 from src.config import Config
 from src.transcriber import WhisperTranscriber
 
@@ -150,6 +154,93 @@ def _write_pcm_wav(path: Path, frame_count: int) -> None:
 
 
 class OpenAiAsrTests(unittest.TestCase):
+    def test_loopback_http_upload_bypasses_a_configured_proxy(self):
+        target_hits = []
+        proxy_hits = []
+
+        class TargetHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                target_hits.append(self.path)
+                self.rfile.read(int(self.headers["Content-Length"]))
+                body = json.dumps({"text": "local transcript", "segments": []}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *args):
+                pass
+
+        class ProxyHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                proxy_hits.append(self.path)
+                self.send_response(502)
+                self.end_headers()
+
+            def log_message(self, _format, *args):
+                pass
+
+        target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+        proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        target_thread = threading.Thread(target=target.serve_forever, daemon=True)
+        proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+        target_thread.start()
+        proxy_thread.start()
+        try:
+            transcriber = _build_transcriber()
+            transcriber._openai_asr_api_url = (
+                f"http://127.0.0.1:{target.server_port}/v1"
+            )
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                audio = Path(tmp_dir) / "short.wav"
+                _write_pcm_wav(audio, frame_count=16000)
+                with patch(
+                    "urllib.request.getproxies",
+                    return_value={"http": f"http://127.0.0.1:{proxy.server_port}"},
+                ), patch("urllib.request.proxy_bypass", return_value=False):
+                    result = transcriber._run_openai_asr(audio, language="en")
+            self.assertEqual(result["text"], "local transcript")
+            self.assertEqual(len(target_hits), 1)
+            self.assertEqual(proxy_hits, [], "API key and audio must never reach HTTP_PROXY")
+        finally:
+            target.shutdown()
+            proxy.shutdown()
+            target.server_close()
+            proxy.server_close()
+
+    def test_loopback_http_disables_environment_proxies_but_https_keeps_defaults(self):
+        endpoints = (
+            "http://localhost:9000/v1",
+            "http://127.0.0.1:9000/v1",
+            "http://[::1]:9000/v1",
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            for endpoint in endpoints:
+                with self.subTest(endpoint=endpoint):
+                    transcriber = _build_transcriber()
+                    transcriber._openai_asr_api_url = endpoint
+                    opener = _FakeOpener([_json_response({"text": "local", "segments": []})])
+                    with patch("urllib.request.build_opener", return_value=opener) as build:
+                        transcriber._run_openai_asr(audio, language="en")
+                    proxy_handlers = [
+                        handler for handler in build.call_args.args
+                        if isinstance(handler, urllib.request.ProxyHandler)
+                    ]
+                    self.assertEqual(len(proxy_handlers), 1)
+                    self.assertEqual(proxy_handlers[0].proxies, {})
+
+            transcriber = _build_transcriber()
+            opener = _FakeOpener([_json_response({"text": "remote", "segments": []})])
+            with patch("urllib.request.build_opener", return_value=opener) as build:
+                transcriber._run_openai_asr(audio, language="en")
+            self.assertFalse(any(
+                isinstance(handler, urllib.request.ProxyHandler)
+                for handler in build.call_args.args
+            ), "HTTPS must retain urllib's standard environment-proxy behavior")
+
     def test_large_wav_is_chunked_and_segment_timestamps_are_offset(self):
         transcriber = _build_transcriber()
         responses = [
@@ -286,7 +377,7 @@ class OpenAiAsrTests(unittest.TestCase):
         self.assertTrue(response.released.is_set())
         self.assertLess(time.monotonic() - started, 1.0)
 
-    def test_run_enforces_deadline_while_reading_http_error_body(self):
+    def test_run_never_reads_http_error_body_and_closes_it(self):
         transcriber = _build_transcriber()
         response = _TricklingResponse()
         opener = _FakeOpener([_streaming_http_error(401, response)])
@@ -300,7 +391,7 @@ class OpenAiAsrTests(unittest.TestCase):
                 "src.transcriber._heartbeat_while_waiting",
                 return_value=contextlib.nullcontext(),
             ):
-                with self.assertRaisesRegex(TimeoutError, "total deadline"):
+                with self.assertRaisesRegex(RuntimeError, "HTTP 401"):
                     transcriber._run_openai_asr(audio, language="en")
 
         self.assertTrue(response.released.is_set())
@@ -407,7 +498,7 @@ class OpenAiAsrTests(unittest.TestCase):
             audio = Path(tmp_dir) / "short.wav"
             _write_pcm_wav(audio, frame_count=16000)
             with patch("urllib.request.build_opener", return_value=opener):
-                with self.assertRaisesRegex(RuntimeError, "misconfigured endpoint"):
+                with self.assertRaisesRegex(RuntimeError, "unexpected content type"):
                     transcriber._run_openai_asr(audio, language="auto")
 
     def test_html_body_marker_in_text_fallback_is_rejected(self):
@@ -428,6 +519,182 @@ class OpenAiAsrTests(unittest.TestCase):
             with patch("urllib.request.build_opener", return_value=opener):
                 with self.assertRaisesRegex(RuntimeError, "misconfigured endpoint"):
                     transcriber._run_openai_asr(audio, language="auto")
+
+    def test_text_fallback_accepts_only_text_plain_media_type(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            problem_failure = None
+
+            transcriber = _build_transcriber()
+            opener = _FakeOpener([
+                _FakeResponse(b"not-json"),
+                _FakeResponse(b"still-not-json"),
+                _FakeResponse(b"legitimate transcript", "text/plain; charset=utf-8"),
+            ])
+            with patch("urllib.request.build_opener", return_value=opener):
+                result = transcriber._run_openai_asr(audio, language="en")
+            self.assertEqual(result["text"], "legitimate transcript")
+
+            for content_type in (
+                "application/problem+json",
+                "application/json",
+                "application/octet-stream",
+                "",
+            ):
+                with self.subTest(content_type=content_type):
+                    transcriber = _build_transcriber()
+                    marker = "PRIVATE-PROVIDER-ERROR-BODY"
+                    opener = _FakeOpener([
+                        _FakeResponse(b"not-json"),
+                        _FakeResponse(b"still-not-json"),
+                        _FakeResponse(
+                            json.dumps({"error": marker}).encode(),
+                            content_type,
+                        ),
+                    ])
+                    with patch.object(
+                        transcriber, "_preprocess_audio", return_value=(audio, False)
+                    ), patch.object(
+                        transcriber, "_build_whisper_fallback", return_value=False
+                    ), patch("urllib.request.build_opener", return_value=opener):
+                        failure = transcriber.transcribe_audio(audio, language="en")
+                    self.assertTrue(failure["transcription_failed"])
+                    self.assertNotIn(marker, failure["error"])
+                    self.assertTrue(audio.exists(), "failed ASR must retain retry audio")
+                    if content_type == "application/problem+json":
+                        problem_failure = failure
+
+            recorder = MeetingPipeline.__new__(MeetingPipeline)
+            recorder.output_dir = Path(tmp_dir) / "output"
+            recorder.output_dir.mkdir()
+            recorder.transcripts_dir = Path(tmp_dir) / "transcripts"
+            recorder.transcripts_dir.mkdir()
+            recorder.transcriber = Mock()
+            recorder.transcriber.transcribe_diarised.return_value = problem_failure
+            recorder.summarizer = None
+            config = Mock()
+            config.get_language.return_value = "en"
+            config.get_whisper_language.return_value = "en"
+            config.get_keep_recordings.return_value = False
+            with patch("src.config.get_config", return_value=config), patch.dict(
+                "os.environ", {"STENOAI_USER_DATA_DIR": tmp_dir}
+            ), contextlib.redirect_stdout(io.StringIO()):
+                pipeline_result = asyncio.run(
+                    recorder.process_recording_streaming(str(audio), "Bad text fallback")
+                )
+            self.assertTrue(pipeline_result["session_info"]["transcription_failed"])
+            self.assertTrue(
+                audio.exists(),
+                "application/problem+json failure must bypass keep_recordings=false deletion",
+            )
+
+    def test_http_error_body_never_reaches_exception_logs_result_or_meeting_metadata(self):
+        marker = "PRIVATE-PROVIDER-ERROR-BODY"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+
+            transcriber = _build_transcriber()
+            with patch(
+                "urllib.request.build_opener",
+                return_value=_FakeOpener([_http_error(401, marker.encode())]),
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    transcriber._run_openai_asr(audio, language="en")
+            self.assertNotIn(marker, str(raised.exception))
+
+            transcriber = _build_transcriber()
+            stderr = io.StringIO()
+            with self.assertLogs("src.transcriber", level="ERROR") as logs, contextlib.redirect_stderr(stderr), patch.object(
+                transcriber, "_preprocess_audio", return_value=(audio, False)
+            ), patch.object(
+                transcriber, "_build_whisper_fallback", return_value=False
+            ), patch(
+                "urllib.request.build_opener",
+                return_value=_FakeOpener([_http_error(401, marker.encode())]),
+            ):
+                failure = transcriber.transcribe_audio(audio, language="en")
+            self.assertTrue(failure["transcription_failed"])
+            self.assertNotIn(marker, failure["error"])
+            self.assertNotIn(marker, "\n".join(logs.output))
+            self.assertNotIn(marker, stderr.getvalue())
+
+            recorder = MeetingPipeline.__new__(MeetingPipeline)
+            recorder.output_dir = Path(tmp_dir) / "output"
+            recorder.output_dir.mkdir()
+            recorder.transcripts_dir = Path(tmp_dir) / "transcripts"
+            recorder.transcripts_dir.mkdir()
+            recorder.transcriber = Mock()
+            recorder.transcriber.transcribe_diarised.return_value = failure
+            recorder.summarizer = None
+            config = Mock()
+            config.get_language.return_value = "en"
+            config.get_whisper_language.return_value = "en"
+            config.get_keep_recordings.return_value = False
+            stdout = io.StringIO()
+            with patch("src.config.get_config", return_value=config), patch.dict(
+                "os.environ", {"STENOAI_USER_DATA_DIR": tmp_dir}
+            ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                result = asyncio.run(
+                    recorder.process_recording_streaming(str(audio), "Private failure")
+                )
+
+            summary_path = Path(result["session_info"]["summary_file"])
+            parsed = _parse_meeting_markdown(summary_path)
+            self.assertTrue(audio.exists(), "keep_recordings=false must not delete retry audio")
+            self.assertNotIn(marker, stdout.getvalue())
+            self.assertNotIn(marker, summary_path.read_text(encoding="utf-8"))
+            self.assertNotIn(marker, parsed["session_info"]["error"])
+
+    def test_fallback_warning_never_includes_http_error_body(self):
+        marker = "PRIVATE-PROVIDER-ERROR-BODY"
+        transcriber = _build_transcriber()
+        opener = _FakeOpener([
+            _http_error(400, marker.encode()),
+            _json_response({"text": "safe transcript"}),
+        ])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with self.assertLogs("src.transcriber", level="WARNING") as logs, patch(
+                "urllib.request.build_opener", return_value=opener
+            ):
+                result = transcriber._run_openai_asr(audio, language="en")
+        self.assertEqual(result["text"], "safe transcript")
+        self.assertNotIn(marker, "\n".join(logs.output))
+
+    def test_invalid_provider_numeric_metadata_never_reaches_failure_output(self):
+        marker = "PRIVATE-PROVIDER-METADATA"
+        payloads = (
+            {
+                "text": "provider transcript",
+                "segments": [{"text": "provider transcript", "start": marker, "end": 1}],
+            },
+            {
+                "text": "provider transcript",
+                "segments": [{"text": "provider transcript", "start": 0, "end": 1}],
+                "duration": marker,
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            for payload in payloads:
+                with self.subTest(payload=payload):
+                    transcriber = _build_transcriber()
+                    with self.assertLogs("src.transcriber", level="ERROR") as logs, patch.object(
+                        transcriber, "_preprocess_audio", return_value=(audio, False)
+                    ), patch.object(
+                        transcriber, "_build_whisper_fallback", return_value=False
+                    ), patch(
+                        "urllib.request.build_opener",
+                        return_value=_FakeOpener([_json_response(payload)]),
+                    ):
+                        failure = transcriber.transcribe_audio(audio, language="en")
+                    self.assertTrue(failure["transcription_failed"])
+                    self.assertNotIn(marker, failure["error"])
+                    self.assertNotIn(marker, "\n".join(logs.output))
 
     def test_json_rung_fallback_synthesizes_segment(self):
         transcriber = _build_transcriber()
@@ -489,7 +756,7 @@ class OpenAiAsrTests(unittest.TestCase):
         self.assertEqual(len(opener.requests), 2)
         sleep_mock.assert_called_once_with(2)
 
-    def test_http_error_redacts_bearer_and_sk_tokens(self):
+    def test_http_error_drops_bearer_and_sk_body_entirely(self):
         transcriber = _build_transcriber()
         opener = _FakeOpener(
             [
@@ -509,10 +776,9 @@ class OpenAiAsrTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertNotIn("secret-token", message)
         self.assertNotIn("sk-abcdefgh12345678", message)
-        self.assertIn("Bearer [redacted]", message)
-        self.assertIn("[redacted]", message)
+        self.assertEqual(message, "openai-asr HTTP 401")
 
-    def test_http_error_redacts_configured_non_openai_key_and_token_field(self):
+    def test_http_error_drops_configured_non_openai_key_body_entirely(self):
         transcriber = _build_transcriber()
         configured_key = "test-provider-credential-987654"
         transcriber._openai_asr_api_key = configured_key
@@ -529,18 +795,7 @@ class OpenAiAsrTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertNotIn(configured_key, message)
         self.assertNotIn("other-test-token", message)
-        self.assertIn("token=[redacted]", message)
-        self.assertIn("api_key=[redacted]", message)
-
-    def test_error_redacts_complete_urls_with_arbitrary_query_credentials(self):
-        for name in ("key", "subscription-key", "sig", "custom-provider-secret"):
-            with self.subTest(name=name):
-                raw = f"https://user:password@example.test/private/path?{name}=secret-value"
-                redacted = transcriber_mod._redact_openai_asr_error(raw)
-                self.assertEqual(redacted, "[redacted-url]")
-                self.assertNotIn("user:password", redacted)
-                self.assertNotIn("secret-value", redacted)
-                self.assertNotIn("private/path", redacted)
+        self.assertEqual(message, "openai-asr HTTP 401")
 
     def test_config_diagnostic_redacts_userinfo_and_query_credentials(self):
         redacted = config_mod._redact_url_credentials(
