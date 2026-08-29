@@ -61,6 +61,14 @@ describe('buildTranscriptBundle conversation view', () => {
     expect(paused).toContain('Me: First thought.\n\nMe: Later thought.');
   });
 
+  test('accepts a timed speaker marker whose text starts on the next line', () => {
+    const body = '[00:00] [You]\nWe should ship Friday.';
+    const bundle = buildTranscriptBundle(meeting({ diarised_text: body }));
+
+    expect(bundle).toContain('## Transcript\nMe: We should ship Friday.');
+    expect(bundle).toContain(`## Timestamped transcript\n${body}`);
+  });
+
   test('alternating channels keep honest labels and all source timestamps', () => {
     const body = [
       '[00:03] [You] Local opening.',
@@ -106,6 +114,7 @@ describe('buildTranscriptBundle conversation view', () => {
     '[1:60:00] [You] Invalid minutes in a long timestamp.',
     'Imported preface that cannot be attributed.\n[00:00] [You] Actual turn.',
     '[Intro: imported context]\n[00:00] [You] Actual turn.',
+    '[00:00] [You]\n[00:01] [Others] Actual turn after an empty marker.',
   ])(
     'falls back to the original transcript when a diarised source is not fully parseable',
     (body) => {

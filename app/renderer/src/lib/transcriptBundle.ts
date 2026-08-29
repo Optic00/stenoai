@@ -5,7 +5,7 @@ const COALESCE_MAX_GAP_S = 2.5;
 const COALESCE_MAX_SPAN_S = 20;
 const COALESCE_MAX_CHARS = 400;
 const TIMED_DIARISED_TURN_AT_HEAD_RE =
-  /^\[\d{1,3}:\d{2}(?::\d{2})?(?:\.\d+)?\][^\S\r\n]*\[[^\]\r\n]+\][^\S\r\n]*\S/;
+  /^\[\d{1,3}:\d{2}(?::\d{2})?(?:\.\d+)?\]\s*\[[^\]]+\]\s*([\s\S]*?)(?=(?:\[\d{1,3}:\d{2}(?::\d{2})?(?:\.\d+)?\]\s*)?\[[^\]]+\]|$)/;
 
 // Build a clean, metadata-rich Markdown bundle for pasting into an external LLM.
 // Pure: takes the in-memory Meeting, returns a string. Returns '' when there is no
@@ -163,7 +163,8 @@ function timestampToSeconds(ts: string | undefined): number | null {
 }
 
 function coalesceConversation(body: string): string | null {
-  if (!TIMED_DIARISED_TURN_AT_HEAD_RE.test(body)) return null;
+  const firstTurn = body.match(TIMED_DIARISED_TURN_AT_HEAD_RE);
+  if (!firstTurn?.[1]?.trim()) return null;
 
   const segs = parseTranscript(body, true);
   if (segs.length === 0) return null;
