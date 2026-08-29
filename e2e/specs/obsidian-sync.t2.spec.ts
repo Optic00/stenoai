@@ -244,25 +244,41 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
 
     // Assert the short-lived toast immediately. The remaining disk and settings
     // checks can legitimately take longer than its 15-second lifetime on CI.
-    const findNotificationWindow = () =>
-      app.windows().find((candidate) => {
+    const findNotificationWindow = async () => {
+      // A fast duplicate completion can briefly leave the superseded toast in
+      // ElectronApplication.windows() while its replacement mounts. Search
+      // newest-first and require the expected payload, rather than selecting a
+      // stale blank `/notification` page by URL alone.
+      for (const candidate of app.windows().slice().reverse()) {
+        if (candidate.isClosed()) continue;
         try {
-          return new URL(candidate.url()).hash === '#/notification';
+          if (new URL(candidate.url()).hash !== '#/notification') continue;
         } catch {
-          return false;
+          continue;
         }
-      });
+        if (
+          await candidate
+            .getByText('Obsidian edit preserved', { exact: true })
+            .isVisible()
+            .catch(() => false)
+        ) {
+          return candidate;
+        }
+      }
+      return undefined;
+    };
+    let notification: typeof page | undefined;
     await expect
-      .poll(() => Boolean(findNotificationWindow()), {
-        timeout: 30_000,
+      .poll(async () => {
+        notification = await findNotificationWindow();
+        return Boolean(notification);
+      }, {
+        timeout: 14_000,
         intervals: [100],
       })
       .toBe(true);
-    const notification = findNotificationWindow()!;
-    await notification.waitForLoadState('domcontentloaded');
-    await expect(notification.getByText('Obsidian edit preserved')).toBeVisible();
-    await expect(notification.getByText(/^Latest version saved as .+\.$/)).toBeVisible();
-    await notification.getByText('Obsidian edit preserved').click();
+    await expect(notification!.getByText(/^Latest version saved as .+\.$/)).toBeVisible();
+    await notification!.getByText('Obsidian edit preserved', { exact: true }).click();
     await expect
       .poll(() => page.evaluate(() => window.location.hash), {
         timeout: 10_000,
