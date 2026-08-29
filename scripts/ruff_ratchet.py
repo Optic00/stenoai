@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import re
@@ -67,38 +68,72 @@ def _finding_fingerprint(
         raise RuntimeError("Ruff returned a diagnostic without stable identity fields")
 
     start_row = location.get("row")
+    start_column = location.get("column")
     end_row = end_location.get("row")
     end_column = end_location.get("column")
     if (
         not isinstance(start_row, int)
         or isinstance(start_row, bool)
+        or not isinstance(start_column, int)
+        or isinstance(start_column, bool)
         or not isinstance(end_row, int)
         or isinstance(end_row, bool)
         or not isinstance(end_column, int)
         or isinstance(end_column, bool)
         or start_row < 1
+        or start_column < 1
         or end_row < start_row
         or end_column < 1
     ):
         raise RuntimeError("Ruff returned a diagnostic with invalid source coordinates")
 
-    # Ruff end locations are exclusive. A multi-line span ending at column 1
-    # therefore ends on the previous physical line; excluding that following
-    # line keeps the identity stable when unrelated lines move around it.
-    last_row = end_row - 1 if end_row > start_row and end_column == 1 else end_row
     source_path = root / PurePosixPath(filename)
     try:
-        source_lines = source_path.read_text(encoding="utf-8").splitlines()
+        source_text = source_path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         raise RuntimeError(f"Could not read Ruff source file {filename}") from error
-    if last_row > len(source_lines):
+    source_lines = source_text.splitlines()
+    if start_row > len(source_lines) or end_row > len(source_lines):
         raise RuntimeError("Ruff returned a diagnostic outside its source file")
-    source_span = "\n".join(source_lines[start_row - 1:last_row]).strip()
+    start_line = source_lines[start_row - 1]
+    end_line = source_lines[end_row - 1]
+    if start_column > len(start_line) + 1 or end_column > len(end_line) + 1:
+        raise RuntimeError("Ruff returned a diagnostic outside its source file")
+    if start_row == end_row:
+        if end_column <= start_column:
+            raise RuntimeError("Ruff returned a diagnostic with an empty source span")
+        source_span = start_line[start_column - 1:end_column - 1]
+    else:
+        span_lines = [start_line[start_column - 1:]]
+        span_lines.extend(source_lines[start_row:end_row - 1])
+        span_lines.append(end_line[:end_column - 1])
+        source_span = "\n".join(span_lines)
+    source_span = source_span.strip()
     if not source_span:
         raise RuntimeError("Ruff returned a diagnostic without source text")
 
+    scope_context = ["module"]
+    try:
+        tree = ast.parse(source_text, filename=filename)
+    except (SyntaxError, ValueError):
+        # Syntax diagnostics cannot always be parsed into scopes. Keeping their
+        # module context still lets the ratchet report the new E9 finding.
+        tree = None
+    if tree is not None:
+        scopes: list[ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            end_lineno = getattr(node, "end_lineno", None)
+            if isinstance(end_lineno, int) and node.lineno <= start_row <= end_lineno:
+                scopes.append(node)
+        scopes.sort(key=lambda node: (node.lineno, node.col_offset, -(node.end_lineno or node.lineno)))
+        for scope in scopes:
+            kind = "class" if isinstance(scope, ast.ClassDef) else "function"
+            scope_context.append(f"{kind}:{scope.name}")
+
     payload = json.dumps(
-        [code, message, source_span],
+        [code, message, source_span, scope_context],
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")

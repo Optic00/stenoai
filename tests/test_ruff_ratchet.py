@@ -166,6 +166,76 @@ class RuffRatchetTests(unittest.TestCase):
             self.assertEqual(before, after)
             self.assertEqual(ruff_ratchet.differences(before, after), [])
 
+    def test_same_finding_text_moved_between_function_scopes_is_a_swap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def findings(source: str, row: int):
+                filename.write_text(source, encoding="utf-8")
+                version = unittest.mock.Mock(returncode=0, stdout="ruff 0.15.21\n", stderr="")
+                diagnostics = unittest.mock.Mock(
+                    returncode=1,
+                    stdout=json.dumps([{
+                        "filename": str(filename),
+                        "code": "F841",
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": row, "column": 5},
+                        "end_location": {"row": row, "column": 11},
+                    }]),
+                    stderr="",
+                )
+                with patch.object(ruff_ratchet, "_run", side_effect=[version, diagnostics]):
+                    return ruff_ratchet.ruff_findings(root)
+
+            before = findings(
+                "def old_scope():\n"
+                "    unused = 1\n\n"
+                "def new_scope():\n"
+                "    return 1\n",
+                2,
+            )
+            after = findings(
+                "def old_scope():\n"
+                "    return 1\n\n"
+                "def new_scope():\n"
+                "    unused = 1\n",
+                5,
+            )
+
+            self.assertNotEqual(before, after)
+            self.assertTrue(ruff_ratchet.differences(before, after))
+
+    def test_formatting_outside_ruff_span_keeps_the_same_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            filename = root / "src" / "example.py"
+            filename.parent.mkdir()
+
+            def findings(source: str):
+                filename.write_text(source, encoding="utf-8")
+                version = unittest.mock.Mock(returncode=0, stdout="ruff 0.15.21\n", stderr="")
+                diagnostics = unittest.mock.Mock(
+                    returncode=1,
+                    stdout=json.dumps([{
+                        "filename": str(filename),
+                        "code": "F841",
+                        "message": "Local variable `unused` is assigned to but never used",
+                        "location": {"row": 2, "column": 5},
+                        "end_location": {"row": 2, "column": 11},
+                    }]),
+                    stderr="",
+                )
+                with patch.object(ruff_ratchet, "_run", side_effect=[version, diagnostics]):
+                    return ruff_ratchet.ruff_findings(root)
+
+            before = findings("def f():\n    unused = dict(a = 1)\n")
+            after = findings("def f():\n    unused = dict(a=1)\n")
+
+            self.assertEqual(before, after)
+            self.assertEqual(ruff_ratchet.differences(before, after), [])
+
     def test_protected_t1_job_directly_runs_both_new_lint_gates(self):
         workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "e2e.yml").read_text()
         t1_body = workflow.split("  t1-renderer:\n", 1)[1].split("\n  lint-renderer:\n", 1)[0]
