@@ -116,6 +116,28 @@ class _DelayedFallbackOpener:
         return response
 
 
+class _PausedUploadOpener:
+    """Consumes one audio chunk, then simulates a stalled socket write."""
+    def __init__(self):
+        self.audio_path = None
+        self.audio_chunk_read = threading.Event()
+        self.released = threading.Event()
+        self.finished = threading.Event()
+        self.post_cancel_chunks = []
+
+    def open(self, request, timeout):
+        stream = request.data
+        self.audio_path = stream.audio_path
+        iterator = iter(stream)
+        next(iterator)  # Multipart prefix.
+        next(iterator)  # First audio chunk.
+        self.audio_chunk_read.set()
+        self.released.wait()
+        self.post_cancel_chunks = list(iterator)
+        self.finished.set()
+        return _json_response({"text": "late", "segments": []})
+
+
 def _json_response(payload):
     return _FakeResponse(json.dumps(payload).encode())
 
@@ -574,6 +596,115 @@ class OpenAiAsrTests(unittest.TestCase):
 
         self.assertTrue(opener.entered.is_set())
         self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_deadline_cancels_upload_before_windows_chunk_cleanup(self):
+        """A stalled urllib upload must release its temp WAV before timeout returns."""
+        class _TrackedFile:
+            def __init__(self, file_handle, open_counter):
+                self._file_handle = file_handle
+                self._open_counter = open_counter
+                self._closed = False
+                self._open_counter[0] += 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self.close()
+                return False
+
+            def close(self):
+                if not self._closed:
+                    self._closed = True
+                    self._open_counter[0] -= 1
+                    self._file_handle.close()
+
+            def __getattr__(self, name):
+                return getattr(self._file_handle, name)
+
+        transcriber = _build_transcriber()
+        opener = _PausedUploadOpener()
+        open_counter = [0]
+        real_open = open
+        real_unlink = Path.unlink
+
+        def track_chunk_open(file, *args, **kwargs):
+            file_handle = real_open(file, *args, **kwargs)
+            if opener.audio_path is not None and Path(file) == opener.audio_path:
+                return _TrackedFile(file_handle, open_counter)
+            return file_handle
+
+        def windows_unlink(path, *args, **kwargs):
+            if path == opener.audio_path and open_counter[0]:
+                raise PermissionError("Windows cannot remove an open WAV")
+            return real_unlink(path, *args, **kwargs)
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                audio = Path(tmp_dir) / "two-seconds.wav"
+                _write_pcm_wav(audio, frame_count=16000 * 2)
+                with patch("src.transcriber.OPENAI_ASR_CHUNK_THRESHOLD_BYTES", 1), patch(
+                    "src.transcriber.OPENAI_ASR_MAX_CHUNK_SECONDS", 1
+                ), patch("src.transcriber.OPENAI_ASR_CHUNK_OVERLAP_SECONDS", 0), patch(
+                    "src.transcriber.OPENAI_ASR_REQUEST_DEADLINE_SECONDS", 0.05
+                ), patch("src.transcriber._heartbeat_while_waiting", return_value=contextlib.nullcontext()), patch(
+                    "urllib.request.build_opener", return_value=opener
+                ), patch("builtins.open", side_effect=track_chunk_open), patch.object(
+                    Path, "unlink", new=windows_unlink
+                ), self.assertRaisesRegex(TimeoutError, "total deadline"):
+                    transcriber._run_openai_asr(audio, language="en")
+
+            self.assertTrue(opener.audio_chunk_read.is_set())
+            self.assertEqual(open_counter[0], 0)
+            self.assertFalse(opener.audio_path.exists())
+        finally:
+            opener.released.set()
+            self.assertTrue(opener.finished.wait(1))
+        self.assertEqual(opener.post_cancel_chunks, [])
+
+    def test_temporary_audio_cleanup_retries_and_redacts_unresolved_path(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            temp_audio = Path(tmp_dir) / "PRIVATE-MEETING-AUDIO.wav"
+            temp_audio.write_bytes(b"private audio")
+            real_unlink = Path.unlink
+            attempts = [0]
+
+            def flaky_unlink(path, *args, **kwargs):
+                if path == temp_audio:
+                    attempts[0] += 1
+                    if attempts[0] < 3:
+                        raise PermissionError(str(path))
+                return real_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", new=flaky_unlink), patch(
+                "src.transcriber.time.sleep"
+            ) as sleep:
+                transcriber_mod._unlink_temporary_audio(temp_audio, "pre-processed")
+
+        self.assertEqual(attempts[0], 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertFalse(temp_audio.exists())
+
+    def test_temporary_audio_cleanup_logs_unresolved_file_without_path(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            temp_audio = Path(tmp_dir) / "PRIVATE-MEETING-AUDIO.wav"
+            temp_audio.write_bytes(b"private audio")
+
+            def locked_unlink(path, *args, **kwargs):
+                if path == temp_audio:
+                    raise PermissionError(str(path))
+                return Path.unlink(path, *args, **kwargs)
+
+            try:
+                with self.assertLogs("src.transcriber", level="ERROR") as logs, patch.object(
+                    Path, "unlink", new=locked_unlink
+                ), patch("src.transcriber.time.sleep"):
+                    transcriber_mod._unlink_temporary_audio(temp_audio, "openai-asr chunk")
+            finally:
+                temp_audio.unlink()
+
+        self.assertTrue(any("may remain on disk" in message for message in logs.output))
+        self.assertNotIn(str(temp_audio), "\n".join(logs.output))
 
     def test_run_enforces_deadline_while_reading_success_body(self):
         transcriber = _build_transcriber()
@@ -1616,6 +1747,31 @@ class OpenAiAsrTests(unittest.TestCase):
             "text": "whole-channel response", "start": 0.0, "end": 0.0,
             "has_timestamps": False,
         }])
+
+    def test_degraded_verbose_json_validates_duration_and_discarded_timestamps(self):
+        payloads = (
+            {"text": "hello", "segments": [], "duration": 999999},
+            {
+                "text": "hello extra",
+                "segments": [{"text": "hello", "start": 0.0, "end": 1.0}],
+                "duration": 999999,
+            },
+            {
+                "text": "hello extra",
+                "segments": [{"text": "hello", "start": 998, "end": 999}],
+                "duration": 1,
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "one-second.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            for payload in payloads:
+                with self.subTest(payload=payload):
+                    transcriber = _build_transcriber()
+                    with patch("urllib.request.build_opener", return_value=_FakeOpener([
+                        _json_response(payload),
+                    ])), self.assertRaisesRegex(RuntimeError, "timestamps exceed request duration"):
+                        transcriber._run_openai_asr(audio, language="en")
 
     def test_verbose_json_partial_segments_fall_back_to_complete_untimed_text(self):
         transcriber = _build_transcriber()

@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Tuple
@@ -1433,6 +1434,27 @@ def _has_spoken_content(text: Optional[str]) -> bool:
     return any(char.isalnum() for char in (text or ""))
 
 
+def _unlink_temporary_audio(path: Path, purpose: str) -> None:
+    """Remove private temporary audio without masking an otherwise successful run."""
+    for attempt in range(3):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt < 2:
+                # Windows antivirus and indexing can briefly retain a just
+                # closed WAV. Retry before admitting that private audio may
+                # remain, but never expose its path in user-visible logs.
+                time.sleep(0.05 * (attempt + 1))
+    logger.error(
+        "Could not remove %s temporary audio after retries; "
+        "the private temporary file may remain on disk",
+        purpose,
+    )
+
+
 def _open_openai_asr_response_with_deadline(opener, request, timeout: float, deadline: float):
     """Open a request without allowing connect/upload/headers to exceed deadline."""
     import queue
@@ -1440,6 +1462,16 @@ def _open_openai_asr_response_with_deadline(opener, request, timeout: float, dea
 
     result = queue.Queue(maxsize=1)
     cancelled = threading.Event()
+
+    def cancel_request_data() -> None:
+        """Stop a cancellable request body before reporting a deadline failure."""
+        cancelled.set()
+        cancel = getattr(getattr(request, "data", None), "cancel", None)
+        if callable(cancel):
+            # _MultipartStream.cancel() waits for any in-flight file read to
+            # close. This is what makes the following timeout safe for the
+            # caller to remove the temporary WAV on Windows.
+            cancel()
 
     def open_request() -> None:
         try:
@@ -1467,10 +1499,10 @@ def _open_openai_asr_response_with_deadline(opener, request, timeout: float, dea
     try:
         ok, value = result.get(timeout=remaining)
     except queue.Empty as error:
-        cancelled.set()
+        cancel_request_data()
         raise TimeoutError("openai-asr request exceeded its total deadline") from error
     if time.monotonic() > deadline:
-        cancelled.set()
+        cancel_request_data()
         try:
             value.close()
         except Exception:
@@ -2233,16 +2265,45 @@ class WhisperTranscriber:
                 self.audio_path = request_audio_path
                 self.file_size = os.path.getsize(request_audio_path)
                 self.total_size = len(self.prefix_bytes) + self.file_size + len(self.suffix_bytes)
+                self._cancelled = threading.Event()
+                self._audio_read_lock = threading.Lock()
+
+            def cancel(self) -> None:
+                """Prevent further reads and wait for a current file read to close."""
+                self._cancelled.set()
+                # Reading happens under this lock and closes the WAV before
+                # releasing it. Acquiring it here is therefore a synchronous
+                # guarantee for the caller's Windows-safe cleanup path.
+                with self._audio_read_lock:
+                    pass
+
+            def _read_audio_chunk(self, offset: int) -> bytes:
+                with self._audio_read_lock:
+                    if self._cancelled.is_set():
+                        return b""
+                    # Do not retain a file handle across a yielded multipart
+                    # chunk. urllib can pause an iterator indefinitely after a
+                    # yield, and Windows then refuses the temp WAV cleanup.
+                    with open(self.audio_path, "rb") as fh:
+                        fh.seek(offset)
+                        chunk = fh.read(8192 * 8)
+                    return b"" if self._cancelled.is_set() else chunk
 
             def __iter__(self):
+                if self._cancelled.is_set():
+                    return
                 yield self.prefix_bytes
-                with open(self.audio_path, "rb") as fh:
-                    while True:
-                        chunk = fh.read(8192 * 8)
-                        if not chunk:
-                            break
-                        yield chunk
-                yield self.suffix_bytes
+                offset = 0
+                while offset < self.file_size:
+                    if self._cancelled.is_set():
+                        return
+                    chunk = self._read_audio_chunk(offset)
+                    if not chunk or self._cancelled.is_set():
+                        return
+                    offset += len(chunk)
+                    yield chunk
+                if not self._cancelled.is_set():
+                    yield self.suffix_bytes
 
             def __len__(self):
                 return self.total_size
@@ -2399,7 +2460,7 @@ class WhisperTranscriber:
                 return f"HTTP {error.status}"
             return "invalid JSON response"
 
-        def _text_result(text: str) -> dict:
+        def _text_result(text: str, duration_seconds: float | None = None) -> dict:
             detected_lang = None if language == "auto" else language
             return {
                 "text": text or None,
@@ -2407,10 +2468,29 @@ class WhisperTranscriber:
                     [{"text": text, "start": 0.0, "end": 0.0, "has_timestamps": False}]
                     if text else []
                 ),
-                "duration_seconds": None,
+                "duration_seconds": duration_seconds,
                 "detected_language": detected_lang,
                 "detected_language_probability": None,
             }
+
+        def _degraded_text_result(
+            text: str,
+            provider_segments: list[dict],
+            provider_duration: float | None,
+            request_audio_path: Path,
+        ) -> dict:
+            """Validate provider timing before intentionally discarding it."""
+            validated = _validate_response_for_request(
+                {
+                    "text": text or None,
+                    "segments": provider_segments,
+                    "duration_seconds": provider_duration,
+                    "detected_language": None if language == "auto" else language,
+                    "detected_language_probability": None,
+                },
+                request_audio_path,
+            )
+            return _text_result(text, validated["duration_seconds"])
 
         def _validate_response_for_request(result: dict, request_audio_path: Path) -> dict:
             timed_segments = [
@@ -2560,7 +2640,9 @@ class WhisperTranscriber:
                     ) from None
                 if raw_text and not segments:
                     logger.info("openai-asr verbose_json response has text without segments")
-                    return _validate_response_for_request(_text_result(raw_text), request_audio_path)
+                    return _degraded_text_result(
+                        raw_text, segments, parsed_duration, request_audio_path
+                    )
                 compact_text = "".join(raw_text.split())
                 compact_segments = "".join(
                     "".join(segment["text"].split()) for segment in segments
@@ -2570,7 +2652,9 @@ class WhisperTranscriber:
                         "openai-asr verbose_json segments do not cover the full text; "
                         "preserving complete text without timestamps"
                     )
-                    return _validate_response_for_request(_text_result(raw_text), request_audio_path)
+                    return _degraded_text_result(
+                        raw_text, segments, parsed_duration, request_audio_path
+                    )
                 logger.info(
                     "openai-asr verbose_json: %d chars, %d segments",
                     len(raw_text), len(segments),
@@ -2724,10 +2808,7 @@ class WhisperTranscriber:
 
                     chunk_result = _transcribe_one(chunk_path)
                 finally:
-                    try:
-                        chunk_path.unlink()
-                    except OSError:
-                        pass
+                    _unlink_temporary_audio(chunk_path, "openai-asr chunk")
 
                 chunk_text = (chunk_result.get("text") or "").strip()
                 chunk_segments = chunk_result.get("segments") or []
@@ -3105,10 +3186,7 @@ class WhisperTranscriber:
             }
         finally:
             if preprocess_temp is not None:
-                try:
-                    preprocess_temp.unlink()
-                except OSError:
-                    pass
+                _unlink_temporary_audio(preprocess_temp, "pre-processed")
 
     def _split_stereo_to_channels(self, audio_filepath: Path) -> Tuple[Optional[Path], Optional[Path], Optional[float]]:
         """Detect stereo and split into mono mic + system channel files.
