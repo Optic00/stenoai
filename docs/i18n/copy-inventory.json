@@ -2535,7 +2535,7 @@
         "Sign in to your organisation to enable this option.",
         "Speaker identification",
         "Speaker identification",
-        "Speech-to-text always runs on your device - your audio never leaves your computer.",
+        "Speech-to-text always runs on your device — your audio never leaves your computer.",
         "Speech-to-text is sent to an OpenAI-compatible cloud endpoint. Unlike the on-device engines, your audio leaves your computer.",
         "Stored encrypted on your device - never written to config or sent anywhere except your chosen endpoint.",
         "Summaries, titles, and chat are routed through your organisation's adapter. The model and API key are configured by your organisation — no setup needed here.",

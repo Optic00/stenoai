@@ -116,7 +116,7 @@ function TranscriptionSection() {
       >
         {engine === 'openai-asr'
           ? 'Speech-to-text is sent to an OpenAI-compatible cloud endpoint. Unlike the on-device engines, your audio leaves your computer.'
-          : 'Speech-to-text always runs on your device - your audio never leaves your computer.'}
+          : 'Speech-to-text always runs on your device \u2014 your audio never leaves your computer.'}
       </p>
       <SettingRow
         label="Language"
@@ -397,6 +397,7 @@ function OpenAiAsrConfig() {
   const [model, setModel] = React.useState('');
   const [apiKey, setApiKey] = React.useState('');
   const [saveError, setSaveError] = React.useState<string | null>(null);
+  const keySaveTail = React.useRef<Promise<unknown>>(Promise.resolve());
 
   React.useEffect(() => {
     if (config.data) {
@@ -425,7 +426,13 @@ function OpenAiAsrConfig() {
   };
 
   const saveKey = (key: string) => {
-    void setKey.mutateAsync(key)
+    // Blur fires before a clicked Clear button. Serialize credential writes so
+    // the later clear always commits after any replacement queued by blur.
+    const operation = keySaveTail.current
+      .catch(() => undefined)
+      .then(() => setKey.mutateAsync(key));
+    keySaveTail.current = operation;
+    void operation
       .then(() => setSaveError(null))
       .catch(() => {
         setSaveError('Could not securely save the API key. The existing key was not changed.');
@@ -445,12 +452,14 @@ function OpenAiAsrConfig() {
     >
       <div>
         <label
+          htmlFor="openai-asr-api-url"
           className="mb-1 block text-[12px] font-medium uppercase"
           style={{ letterSpacing: '0.06em', color: 'var(--fg-muted)' }}
         >
           API base URL
         </label>
         <Input
+          id="openai-asr-api-url"
           value={apiUrl}
           onChange={(e) => setApiUrl(e.target.value)}
           placeholder="https://api.openai.com/v1"
@@ -460,19 +469,21 @@ function OpenAiAsrConfig() {
             // otherwise the stale value would return on the next refresh.
             const next = apiUrl.trim() || DEFAULT_OPENAI_ASR_URL;
             if (next !== apiUrl) setApiUrl(next);
-            saveEndpointField('api_url', next);
+            if (next !== config.data?.api_url) saveEndpointField('api_url', next);
           }}
           className={COMPACT_INPUT}
         />
       </div>
       <div>
         <label
+          htmlFor="openai-asr-model"
           className="mb-1 block text-[12px] font-medium uppercase"
           style={{ letterSpacing: '0.06em', color: 'var(--fg-muted)' }}
         >
           Model
         </label>
         <Input
+          id="openai-asr-model"
           value={model}
           onChange={(e) => setModel(e.target.value)}
           placeholder="whisper-1"
@@ -481,13 +492,14 @@ function OpenAiAsrConfig() {
             // rather than persisting a blank (which the backend rejects).
             const next = model.trim() || DEFAULT_OPENAI_ASR_MODEL;
             if (next !== model) setModel(next);
-            saveEndpointField('model', next);
+            if (next !== config.data?.model) saveEndpointField('model', next);
           }}
           className={COMPACT_INPUT}
         />
       </div>
       <div>
         <label
+          htmlFor="openai-asr-api-key"
           className="mb-1 block text-[12px] font-medium uppercase"
           style={{ letterSpacing: '0.06em', color: 'var(--fg-muted)' }}
         >
@@ -495,6 +507,7 @@ function OpenAiAsrConfig() {
         </label>
         <div className="flex items-center gap-2">
           <Input
+            id="openai-asr-api-key"
             type="password"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}

@@ -84,19 +84,17 @@ test('name / path / folder / URL setters redact their value arg(s)', () => {
   assert.strictEqual(sanitizeArgsForLog(['set-cloud-api-url', 'https://api.example.com/v1']), 'set-cloud-api-url <redacted>');
 });
 
-test('OpenAI ASR endpoint argv logging redacts every query name', () => {
-  for (const name of ['key', 'subscription-key', 'sig', 'unknown-provider-field']) {
-    const args = [
+test('OpenAI ASR config argv logging redacts the entire value-bearing tail', () => {
+  assert.strictEqual(
+    sanitizeArgsForLog([
       'set-openai-asr-config',
       '--api-url',
-      `https://provider.example/v1?${name}=secret-value`,
+      'https://provider.example/v1?subscription-key=secret-value',
       '--model',
-      'whisper-1',
-    ];
-    const logged = sanitizeArgsForLog(args);
-    assert.strictEqual(logged, 'set-openai-asr-config <redacted>');
-    assert.doesNotMatch(logged, /secret-value|provider\.example|subscription-key|sig/);
-  }
+      'private-provider-model',
+    ]),
+    'set-openai-asr-config <redacted>',
+  );
 });
 
 test('set-microphone redacts the device id + user-assigned label', () => {

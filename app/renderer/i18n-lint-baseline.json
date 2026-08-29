@@ -1,5 +1,5 @@
 {
-  "total": 765,
+  "total": 751,
   "files": {
     "renderer/src/components/AskBar.tsx": 25,
     "renderer/src/components/ChatHistoryRow.tsx": 5,
@@ -35,7 +35,7 @@
     "renderer/src/routes/Setup.tsx": 42,
     "renderer/src/routes/settings/AboutTab.tsx": 16,
     "renderer/src/routes/settings/AdvancedTab.tsx": 19,
-    "renderer/src/routes/settings/AiTab.tsx": 95,
+    "renderer/src/routes/settings/AiTab.tsx": 81,
     "renderer/src/routes/settings/DeveloperTab.tsx": 5,
     "renderer/src/routes/settings/GeneralTab.tsx": 59,
     "renderer/src/routes/settings/IntegrationsTab.tsx": 13,

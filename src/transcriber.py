@@ -158,9 +158,9 @@ CHANNEL_DOMINANCE_MIN_AVG_TURN_SECONDS = SUGGESTION_MIN_AVG_TURN_SECONDS
 # can detect it exactly.
 SILENCE_SENTINEL = "No speech detected in audio"
 
-# OpenAI documents a 25 MB transcription upload limit. Start chunking at
-# 24 MiB to leave headroom for the multipart fields and boundary bytes.
-OPENAI_ASR_CHUNK_THRESHOLD_BYTES = 24 * 1024 * 1024
+# OpenAI documents a decimal 25 MB transcription upload limit. Start chunking
+# at 23 MiB so the audio plus multipart fields remains below 25,000,000 bytes.
+OPENAI_ASR_CHUNK_THRESHOLD_BYTES = 23 * 1024 * 1024
 OPENAI_ASR_MAX_CHUNK_SECONDS = 600
 # Each request deliberately overlaps the preceding one. Speech recognisers are
 # less reliable at a hard audio cutoff; timestamped overlap is assigned to one
@@ -263,18 +263,6 @@ def _openai_asr_analyse_canonical_wav(audio_path: Path) -> Optional[tuple[float,
             return total_frames / rate, has_signal
     except (EOFError, OSError, ValueError, wave.Error):
         return None
-
-
-def _openai_asr_wav_duration(audio_path: Path) -> Optional[float]:
-    """Return a canonical WAV duration, never a header-only best effort."""
-    analysis = _openai_asr_analyse_canonical_wav(audio_path)
-    return analysis[0] if analysis is not None else None
-
-
-def _openai_asr_wav_has_signal(audio_path: Path) -> Optional[bool]:
-    """Distinguish verified digital silence from a suspicious empty response."""
-    analysis = _openai_asr_analyse_canonical_wav(audio_path)
-    return analysis[1] if analysis is not None else None
 
 
 def _merge_openai_asr_timed_chunks(
@@ -2209,7 +2197,6 @@ class WhisperTranscriber:
         if not canonical_api_url or canonical_api_url != api_url:
             raise RuntimeError("openai-asr: endpoint snapshot is unsafe or invalid")
         api_url = canonical_api_url
-        api_url = api_url.rstrip("/")
         endpoint_origin = _openai_asr_api_origin(api_url)
         credential_origin = os.environ.get("STENOAI_OAI_API_ORIGIN", "")
 
@@ -2491,7 +2478,7 @@ class WhisperTranscriber:
                 return f"HTTP {error.status}"
             return "invalid JSON response"
 
-        def _text_result(text: str, duration_seconds: float | None = None) -> dict:
+        def _text_result(text: str, duration_seconds: Optional[float] = None) -> dict:
             detected_lang = None if language == "auto" else language
             return {
                 "text": text or None,
@@ -2507,7 +2494,7 @@ class WhisperTranscriber:
         def _degraded_text_result(
             text: str,
             provider_segments: list[dict],
-            provider_duration: float | None,
+            provider_duration: Optional[float],
             request_audio_path: Path,
         ) -> dict:
             """Validate provider timing before intentionally discarding it."""

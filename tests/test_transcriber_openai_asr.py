@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 import wave
 from pathlib import Path
+from typing import Optional
 from unittest.mock import Mock, patch
 
 import src.config as config_mod
@@ -24,7 +25,7 @@ from src.config import Config
 from src.transcriber import WhisperTranscriber
 
 
-OPENAI_ASR_CHUNK_THRESHOLD_BYTES = 24 * 1024 * 1024
+OPENAI_ASR_CHUNK_THRESHOLD_BYTES = 23 * 1024 * 1024
 
 
 class _FakeResponse:
@@ -32,7 +33,7 @@ class _FakeResponse:
         self,
         body: bytes,
         content_type: str = "application/json",
-        content_length: str | None = None,
+        content_length: Optional[str] = None,
     ):
         self._body = body
         self.headers = {"Content-Type": content_type}
@@ -1314,7 +1315,7 @@ class OpenAiAsrTests(unittest.TestCase):
             _json_response({"text": "safe transcript", "segments": []})
         ])
         with tempfile.TemporaryDirectory() as tmp_dir:
-            audio = Path(tmp_dir) / f'{marker}-quote".wav'
+            audio = Path(tmp_dir) / f"{marker}-quote-marker.wav"
             _write_pcm_wav(audio, frame_count=16000)
             with self.assertLogs("src.transcriber", level="INFO") as logs, patch(
                 "urllib.request.build_opener", return_value=opener
@@ -1455,7 +1456,9 @@ class OpenAiAsrTests(unittest.TestCase):
                 burst_start=16000 * 37 + 8000,
                 burst_frames=80,
             )
-            self.assertTrue(transcriber_mod._openai_asr_wav_has_signal(audio))
+            analysis = transcriber_mod._openai_asr_analyse_canonical_wav(audio)
+            self.assertIsNotNone(analysis)
+            self.assertTrue(analysis[1])
 
     def test_canonical_analysis_reads_past_early_signal_and_rejects_truncation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

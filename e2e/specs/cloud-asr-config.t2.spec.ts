@@ -54,12 +54,13 @@ test('non-secret openai-asr config (url/model) round-trips and persists to confi
   expect(initial.api_key_set).toBe(false);
 
   // Set both non-secret fields.
-  await page.evaluate(() =>
+  const setResult = await page.evaluate(() =>
     (window as StenoWindow).stenoai.openaiAsr.setConfig({
       api_url: 'https://api.groq.example/openai/v1',
       model: 'whisper-large-v3',
     }),
   );
+  expect(setResult.success).toBe(true);
 
   // They persist to the right config.json keys...
   await expect
@@ -128,15 +129,19 @@ test('openai-asr API key is stored encrypted (safeStorage), not in config.json',
   // A bearer token is scoped to the canonical endpoint origin. Changing the
   // provider must leave the encrypted blob inert until the user saves a key
   // for that new origin, never reusing Authorization across providers.
-  await page.evaluate(() =>
+  const endpointResult = await page.evaluate(() =>
     (window as StenoWindow).stenoai.openaiAsr.setConfig({
       api_url: 'https://replacement.example/v1',
     }),
   );
+  expect(endpointResult.success).toBe(true);
   await expect.poll(async () => (await getConfig(page)).api_key_set).toBe(false);
 
   // Clearing removes the encrypted file and flips api_key_set back to false.
-  await page.evaluate(() => (window as StenoWindow).stenoai.openaiAsr.setKey(''));
+  const clearResult = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.openaiAsr.setKey(''),
+  );
+  expect(clearResult.success).toBe(true);
   await expect
     .poll(() => existsSync(path.join(userDataDir, '.openai-asr-api-key')))
     .toBe(false);

@@ -106,25 +106,27 @@ class PreprocessAudioTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             source = _make_audio_file(tmp_dir, f"{marker}.mp3")
-            with patch.object(transcriber_mod, "_resolve_ffmpeg", return_value="/fake/ffmpeg"), \
-                 patch.object(transcriber_mod.subprocess, "run", side_effect=fake_run), \
-                 patch.object(transcriber_mod.tempfile, "mkstemp", side_effect=capture_mkstemp):
-                prep_one, prep_one_is_temp = transcriber._preprocess_audio(source)
-                prep_two, prep_two_is_temp = transcriber._preprocess_audio(source)
-                converted_one, _ = transcriber._convert_to_16khz(source)
-                converted_two, _ = transcriber._convert_to_16khz(source)
-                mic, system, _ = transcriber._split_stereo_to_channels(source)
+            try:
+                with patch.object(transcriber_mod, "_resolve_ffmpeg", return_value="/fake/ffmpeg"), \
+                     patch.object(transcriber_mod.subprocess, "run", side_effect=fake_run), \
+                     patch.object(transcriber_mod.tempfile, "mkstemp", side_effect=capture_mkstemp):
+                    prep_one, prep_one_is_temp = transcriber._preprocess_audio(source)
+                    prep_two, prep_two_is_temp = transcriber._preprocess_audio(source)
+                    transcriber._convert_to_16khz(source)
+                    transcriber._convert_to_16khz(source)
+                    mic, system, _ = transcriber._split_stereo_to_channels(source)
 
-            self.assertTrue(prep_one_is_temp)
-            self.assertTrue(prep_two_is_temp)
-            self.assertIsNotNone(mic)
-            self.assertIsNotNone(system)
-            self.assertEqual(len(seen_paths), 6)
-            self.assertEqual(len(set(seen_paths)), len(seen_paths))
-            self.assertTrue(all(marker not in str(temp_path) for temp_path in seen_paths))
-            self.assertTrue(all(temp_path.exists() for temp_path in seen_paths))
-            for temp_path in [prep_one, prep_two, converted_one, converted_two, mic, system]:
-                temp_path.unlink()
+                self.assertTrue(prep_one_is_temp)
+                self.assertTrue(prep_two_is_temp)
+                self.assertIsNotNone(mic)
+                self.assertIsNotNone(system)
+                self.assertEqual(len(seen_paths), 6)
+                self.assertEqual(len(set(seen_paths)), len(seen_paths))
+                self.assertTrue(all(marker not in str(temp_path) for temp_path in seen_paths))
+                self.assertTrue(all(temp_path.exists() for temp_path in seen_paths))
+            finally:
+                for temp_path in seen_paths:
+                    temp_path.unlink(missing_ok=True)
 
     def test_failed_stereo_split_uses_retrying_private_temp_cleanup(self):
         transcriber = _build_transcriber()

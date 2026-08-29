@@ -2,6 +2,20 @@
 
 const { normalizeOpenAiAsrApiUrl } = require('./openai-asr-key-store');
 
+const OPENAI_ASR_MAX_MODEL_LENGTH = 256;
+
+function normalizeOpenAiAsrModel(model) {
+  if (typeof model !== 'string') return null;
+  const normalized = model.trim();
+  if (
+    !normalized
+    || normalized.length > OPENAI_ASR_MAX_MODEL_LENGTH
+    || normalized.startsWith('-')
+    || !/^[\x21-\x7e]+$/.test(normalized)
+  ) return null;
+  return normalized;
+}
+
 // Keep the sensitive endpoint argument construction outside main.js so it can
 // be exercised without Electron. The URL is validated before any backend
 // process is spawned: query strings, fragments, and userinfo can carry secrets
@@ -22,7 +36,13 @@ function registerOpenAiAsrIpc({
       }
       args.push('--api-url', apiUrl);
     }
-    if (cfg && cfg.model !== undefined) args.push('--model', cfg.model);
+    if (cfg && cfg.model !== undefined) {
+      const model = normalizeOpenAiAsrModel(cfg.model);
+      if (!model) {
+        return { success: false, error: 'OpenAI ASR model is invalid' };
+      }
+      args.push('--model', model);
+    }
 
     try {
       const migrated = await migrateLegacyOpenAiAsrApiKey();
@@ -40,4 +60,4 @@ function registerOpenAiAsrIpc({
   });
 }
 
-module.exports = { registerOpenAiAsrIpc };
+module.exports = { normalizeOpenAiAsrModel, registerOpenAiAsrIpc };

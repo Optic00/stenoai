@@ -138,7 +138,7 @@ test('OpenAI ASR URL canonicalisation rejects secret-bearing URLs before a CLI a
     'http://[::1]:9000/v1',
   );
   assert.strictEqual(
-    normalizeOpenAiAsrApiUrl('https://faß.de/v1'),
+    normalizeOpenAiAsrApiUrl('HTTPS://XN--FA-HIA.DE:443/v1/'),
     'https://xn--fa-hia.de/v1',
   );
   for (const unsafe of [
@@ -148,9 +148,19 @@ test('OpenAI ASR URL canonicalisation rejects secret-bearing URLs before a CLI a
     'https://provider.example/v1?',
     'https://provider.example/v1#',
     'http://provider.example/v1',
+    'https://provider.example/space here/v1',
+    'https://provider.example\\redirect.example/v1',
+    'https://faß.de/v1',
   ]) {
     assert.strictEqual(normalizeOpenAiAsrApiUrl(unsafe), null);
   }
+});
+
+test('OpenAI ASR URL canonicalisation matches Python for IPv6 default ports', () => {
+  assert.strictEqual(
+    normalizeOpenAiAsrApiUrl('http://[::1]:80/v1/'),
+    'http://[::1]/v1',
+  );
 });
 
 test('transcription endpoint snapshot derives canonical URL and origin from one read', () => {
@@ -161,7 +171,7 @@ test('transcription endpoint snapshot derives canonical URL and origin from one 
     readFileSync: () => {
       reads += 1;
       return JSON.stringify(reads === 1 ? {
-        openai_asr_api_url: 'https://faß.de/v1',
+        openai_asr_api_url: 'HTTPS://XN--FA-HIA.DE:443/v1/',
       } : {
         openai_asr_api_url: 'https://replacement.example/v1',
       });
@@ -183,7 +193,7 @@ test('transcription takes its legacy cleanup and endpoint from one config snapsh
       reads += 1;
       return JSON.stringify(reads === 1 ? {
         openai_asr_api_key: 'legacy-key',
-        openai_asr_api_url: 'https://faß.de/v1',
+        openai_asr_api_url: 'HTTPS://XN--FA-HIA.DE:443/v1/',
       } : {
         openai_asr_api_key: 'replacement-key',
         openai_asr_api_url: 'https://replacement.example/v1',
@@ -198,7 +208,7 @@ test('transcription takes its legacy cleanup and endpoint from one config snapsh
     legacy: {
       key: 'legacy-key',
       origin: 'https://xn--fa-hia.de',
-      snapshotDigest: legacyCredentialSnapshotDigest('legacy-key', 'https://faß.de/v1'),
+      snapshotDigest: legacyCredentialSnapshotDigest('legacy-key', 'HTTPS://XN--FA-HIA.DE:443/v1/'),
     },
   });
   assert.strictEqual(reads, 1);
@@ -501,11 +511,6 @@ test('clear marker remains authoritative when stale encrypted-key deletion fails
     assert.strictEqual(
       legacyKeyMigrationAction({ cleared: true, legacyKey: 'legacy-key', storedKey: null }),
       'remove-legacy',
-    );
-    assert.strictEqual(
-      legacyKeyMigrationAction({ cleared: true, legacyKey: 'legacy-key', storedKey: null }),
-      'remove-legacy',
-      'config refresh must retry deletion without restoring the key',
     );
   });
 });

@@ -15,7 +15,12 @@ function isValidOpenAiAsrApiKey(key) {
 function normalizeOpenAiAsrApiUrl(apiUrl) {
   try {
     if (typeof apiUrl !== 'string' || !apiUrl.trim()) return null;
-    const endpoint = new URL(apiUrl.trim());
+    const rawUrl = apiUrl.trim();
+    // Keep Electron and Python on one strict representation. WHATWG URL would
+    // otherwise repair backslashes, percent-encode spaces, and IDNA-map raw
+    // Unicode while urllib preserves or interprets those inputs differently.
+    if (!/^[\x21-\x7e]+$/.test(rawUrl) || rawUrl.includes('\\')) return null;
+    const endpoint = new URL(rawUrl);
     const hostname = endpoint.hostname.toLowerCase();
     // `URL.search` / `.hash` are empty for a bare '?' / '#', but those are
     // still query/fragment delimiters and must not reach the child argv.
@@ -38,11 +43,6 @@ function normalizeOpenAiAsrApiUrl(apiUrl) {
   } catch (_) {
     return null;
   }
-}
-
-function normalizeOpenAiAsrOrigin(apiUrl) {
-  const normalized = normalizeOpenAiAsrApiUrl(apiUrl);
-  return normalized ? new URL(normalized).origin : null;
 }
 
 /**
@@ -315,7 +315,6 @@ module.exports = {
   loadEncryptedKeyForOrigin,
   markEncryptedKeyClearedAtomically,
   normalizeOpenAiAsrApiUrl,
-  normalizeOpenAiAsrOrigin,
   readOpenAiAsrConfigSnapshot,
   readOpenAiAsrEndpointSnapshot,
   readLegacyCredentialSnapshot,

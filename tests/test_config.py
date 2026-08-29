@@ -496,6 +496,12 @@ class ConfigOpenAiAsrTests(unittest.TestCase):
             reloaded = Config(config_path=path)
             self.assertEqual(reloaded.get_openai_asr_api_url(), "https://api.groq.example/openai/v1")
 
+    def test_set_api_url_canonicalises_host_case_and_default_port(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            self.assertTrue(config.set_openai_asr_api_url(" HTTPS://API.EXAMPLE.COM:443/v1/ "))
+            self.assertEqual(config.get_openai_asr_api_url(), "https://api.example.com/v1")
+
     def test_set_api_url_rejects_blank_and_keeps_prior(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = Config(config_path=Path(tmp_dir) / "config.json")
@@ -542,6 +548,17 @@ class ConfigOpenAiAsrTests(unittest.TestCase):
                 with self.subTest(url=url):
                     self.assertFalse(config.set_openai_asr_api_url(url))
 
+    def test_set_api_url_rejects_cross_runtime_ambiguous_text(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            for url in (
+                "https://provider.example/space here/v1",
+                "https://provider.example\\redirect.example/v1",
+                "https://faß.de/v1",
+            ):
+                with self.subTest(url=url):
+                    self.assertFalse(config.set_openai_asr_api_url(url))
+
     def test_set_api_url_rejects_every_query_and_fragment_and_keeps_prior(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = Config(config_path=Path(tmp_dir) / "config.json")
@@ -567,6 +584,21 @@ class ConfigOpenAiAsrTests(unittest.TestCase):
             self.assertFalse(config.set_openai_asr_model(""))
             self.assertFalse(config.set_openai_asr_model("   "))
             self.assertEqual(config.get_openai_asr_model(), "whisper-large-v3")
+
+    def test_set_model_rejects_option_like_or_non_ascii_values_and_keeps_prior(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            self.assertTrue(config.set_openai_asr_model("whisper-large-v3"))
+            for model in ("-whisper-1", "model with spaces", "mødel"):
+                with self.subTest(model=model):
+                    self.assertFalse(config.set_openai_asr_model(model))
+                    self.assertEqual(config.get_openai_asr_model(), "whisper-large-v3")
+
+    def test_get_model_falls_back_for_invalid_legacy_value(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(json.dumps({"openai_asr_model": "-unsafe"}))
+            self.assertEqual(Config(config_path=path).get_openai_asr_model(), "whisper-1")
 
 
 class ConfigSummaryModelTests(unittest.TestCase):

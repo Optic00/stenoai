@@ -8097,6 +8097,9 @@ registerOpenAiAsrIpc({
 // (deletes the file).
 ipcMain.handle('set-openai-asr-key', async (_event, key) => {
   try {
+    if (typeof key !== 'string') {
+      return { success: false, error: 'OpenAI ASR API key must be a string' };
+    }
     if (!key) {
       markOpenAiAsrKeyCleared();
       // The durable marker already makes every encrypted/legacy copy

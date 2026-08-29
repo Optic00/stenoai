@@ -103,7 +103,13 @@ def _normalise_openai_asr_api_url(value: object) -> Optional[str]:
     # built, so reject them here as well rather than accepting a divergent
     # direct-CLI configuration path.
     raw_value = value.strip()
-    if "?" in raw_value or "#" in raw_value:
+    if (
+        "?" in raw_value
+        or "#" in raw_value
+        or "\\" in raw_value
+        or not raw_value.isascii()
+        or any(ord(char) < 33 or ord(char) > 126 for char in raw_value)
+    ):
         return None
     try:
         parsed = urllib.parse.urlsplit(raw_value)
@@ -114,7 +120,7 @@ def _normalise_openai_asr_api_url(value: object) -> Optional[str]:
     if not hostname or parsed.username is not None or parsed.password is not None:
         return None
     try:
-        _ = parsed.port
+        port = parsed.port
     except ValueError:
         return None
     if scheme == "http" and hostname in {"localhost", "127.0.0.1", "::1"}:
@@ -127,7 +133,28 @@ def _normalise_openai_asr_api_url(value: object) -> Optional[str]:
     # denylist that providers can outgrow.
     if parsed.query or parsed.fragment:
         return None
-    return urllib.parse.urlunsplit((scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+    canonical_host = hostname
+    if ":" in canonical_host:
+        canonical_host = f"[{canonical_host}]"
+    default_port = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
+    canonical_netloc = canonical_host if port is None or default_port else f"{canonical_host}:{port}"
+    return urllib.parse.urlunsplit((scheme, canonical_netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def _normalise_openai_asr_model(value: object) -> Optional[str]:
+    """Return a bounded argv-safe provider model identifier or None."""
+    if not isinstance(value, str):
+        return None
+    model = value.strip()
+    if (
+        not model
+        or len(model) > 256
+        or model.startswith("-")
+        or not model.isascii()
+        or any(ord(char) < 33 or ord(char) > 126 for char in model)
+    ):
+        return None
+    return model
 
 
 def _openai_asr_api_origin(value: object) -> Optional[str]:
@@ -2367,14 +2394,17 @@ class Config:
         Defaults to ``whisper-1`` (the standard OpenAI Whisper model).
         Groq uses ``whisper-large-v3``; other providers vary.
         """
-        return self._config.get("openai_asr_model", "whisper-1") or "whisper-1"
+        return _normalise_openai_asr_model(
+            self._config.get("openai_asr_model", "whisper-1")
+        ) or "whisper-1"
 
     def set_openai_asr_model(self, model: str) -> bool:
         """Set the model name for the OpenAI-compatible STT endpoint."""
-        if not model or not model.strip():
-            logger.error("openai_asr_model must not be empty")
+        clean_model = _normalise_openai_asr_model(model)
+        if clean_model is None:
+            logger.error("openai_asr_model has an invalid format")
             return False
-        self._config["openai_asr_model"] = model.strip()
+        self._config["openai_asr_model"] = clean_model
         return self._save()
 
     def get_system_audio_enabled(self) -> bool:
