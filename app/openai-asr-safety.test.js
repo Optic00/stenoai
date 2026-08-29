@@ -31,7 +31,7 @@ test('OpenAI ASR plaintext-key migration runs at application startup', () => {
   assert.ok(migration < menu, 'migration must not depend on opening Settings or selecting an engine');
 });
 
-test('transcription launches pass the credential origin alongside the key', () => {
+test('transcription launches use one config snapshot for endpoint and legacy key', () => {
   const launch = source.slice(
     source.indexOf('function getTranscriptionEnv()'),
     source.indexOf('// Read the Python-side ai_provider config'),
@@ -40,6 +40,10 @@ test('transcription launches pass the credential origin alongside the key', () =
   assert.match(launch, /STENOAI_OAI_API_ORIGIN/);
   assert.match(launch, /STENOAI_OAI_API_URL/);
   assert.match(launch, /loadOpenAiAsrCredential/);
+  assert.match(launch, /const legacy = configSnapshot \? configSnapshot\.legacy : null/);
+  assert.match(launch, /secureLegacyOpenAiAsrApiKey\(legacy\)/);
+  assert.match(launch, /migrateLegacyOpenAiAsrApiKey\(legacy\)/);
+  assert.doesNotMatch(launch, /configSnapshot\?\.legacy/);
 });
 
 function withKeyDirectory(run) {

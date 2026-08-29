@@ -9099,8 +9099,12 @@ function getTranscriptionEnv() {
   });
   // Endpoint, origin, and any legacy credential come from one direct config
   // read. Do not let the asynchronous cleanup read a replacement endpoint.
-  secureLegacyOpenAiAsrApiKey(configSnapshot?.legacy);
-  void migrateLegacyOpenAiAsrApiKey(configSnapshot?.legacy);
+  // Pass null after a failed snapshot read. Passing undefined would trigger
+  // both helpers' backwards-compatible default parameter and re-read a
+  // potentially different config while this job is being assembled.
+  const legacy = configSnapshot ? configSnapshot.legacy : null;
+  secureLegacyOpenAiAsrApiKey(legacy);
+  void migrateLegacyOpenAiAsrApiKey(legacy);
   const endpoint = configSnapshot?.endpoint || null;
   const credential = endpoint ? loadOpenAiAsrCredential(endpoint.origin) : null;
   if (credential) {
