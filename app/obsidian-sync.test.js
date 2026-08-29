@@ -337,6 +337,107 @@ test('reprocess preserves a vault edit when Windows briefly locks the tracked fi
   );
 });
 
+test('loadIndex treats malformed JSON as corruption rather than an I/O failure', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(h.dataDir, '.obsidian-sync-state.json'), '{not-json');
+
+  assert.deepEqual(h.eng.loadIndex(), {
+    version: 1,
+    notes: {},
+    conflicts: {},
+    stale: [],
+  });
+});
+
+test('reprocess retries a transient Windows lock on the ownership index', (t) => {
+  const h = harness();
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+  h.writeNote('n1', NOTE);
+  h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+  const original = path.join(h.vault, 'Sales', '2026-07-15 Acme Q3 Planning.md');
+  const state = path.join(h.dataDir, '.obsidian-sync-state.json');
+  fs.writeFileSync(original, 'HAND-EDITED IN OBSIDIAN');
+  h.writeNote('n1', NOTE.replace('Ship the pricing page Friday.', 'Ship the pricing page Thursday.'));
+
+  const readFileSync = fs.readFileSync;
+  let stateReads = 0;
+  fs.readFileSync = function patchedReadFileSync(filePath, ...args) {
+    if (filePath === state && stateReads < 2) {
+      stateReads += 1;
+      const error = new Error('temporarily locked ownership index');
+      error.code = 'EBUSY';
+      throw error;
+    }
+    if (filePath === state) stateReads += 1;
+    return readFileSync.call(this, filePath, ...args);
+  };
+  let result;
+  try {
+    result = h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'), { onConflict: 'fork' });
+  } finally {
+    fs.readFileSync = readFileSync;
+  }
+
+  assert.equal(stateReads, 3, 'one attempt plus two bounded retries');
+  assert.equal(result.status, 'forked');
+  assert.equal(fs.readFileSync(original, 'utf8'), 'HAND-EDITED IN OBSIDIAN');
+  assert.match(
+    fs.readFileSync(path.join(h.vault, result.vaultRelPath), 'utf8'),
+    /Ship the pricing page Thursday\./,
+  );
+});
+
+test('persistent ownership-index read errors fail closed without changing vault or index', async (t) => {
+  for (const code of ['EBUSY', 'EPERM', 'EACCES']) {
+    const h = harness();
+    t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+
+    h.writeNote('n1', NOTE);
+    h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+    const original = path.join(h.vault, 'Sales', '2026-07-15 Acme Q3 Planning.md');
+    const state = path.join(h.dataDir, '.obsidian-sync-state.json');
+    fs.writeFileSync(original, 'HAND-EDITED IN OBSIDIAN');
+    h.writeNote('n1', NOTE.replace('Ship the pricing page Friday.', 'Ship the pricing page Thursday.'));
+    const stateBefore = fs.readFileSync(state, 'utf8');
+    const vaultBefore = fs.readdirSync(path.dirname(original)).sort();
+
+    const readFileSync = fs.readFileSync;
+    let stateReads = 0;
+    fs.readFileSync = function patchedReadFileSync(filePath, ...args) {
+      if (filePath === state) {
+        stateReads += 1;
+        const error = new Error(`persistently locked ownership index (${code})`);
+        error.code = code;
+        throw error;
+      }
+      return readFileSync.call(this, filePath, ...args);
+    };
+    let syncResult;
+    let removeResult;
+    let reconcileResult;
+    try {
+      syncResult = h.eng.syncNoteBySummaryPath(
+        path.join(h.output, 'n1_summary.md'),
+        { onConflict: 'fork' },
+      );
+      removeResult = h.eng.removeNoteBySummaryPath('n1');
+      reconcileResult = await h.eng.reconcileOnLaunch();
+    } finally {
+      fs.readFileSync = readFileSync;
+    }
+
+    assert.equal(syncResult.status, 'error', `sync: ${code}`);
+    assert.equal(removeResult.status, 'error', `remove: ${code}`);
+    assert.equal(reconcileResult.status, 'error', `reconcile: ${code}`);
+    assert.equal(stateReads, code === 'EACCES' ? 3 : 9, code);
+    assert.equal(fs.readFileSync(state, 'utf8'), stateBefore, code);
+    assert.deepEqual(fs.readdirSync(path.dirname(original)).sort(), vaultBefore, code);
+    assert.equal(fs.readFileSync(original, 'utf8'), 'HAND-EDITED IN OBSIDIAN', code);
+  }
+});
+
 test('a persistently locked vault read forks without a long retry', (t) => {
   const h = harness();
   t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));

@@ -298,17 +298,33 @@ function registerObsidianSync({
   }
 
   function loadIndex() {
+    let raw;
     try {
-      const d = JSON.parse(fs.readFileSync(statePath(), 'utf8'));
-      if (d && typeof d === 'object') {
-        return {
-          version: STATE_VERSION,
-          notes: d.notes || {},
-          conflicts: normalizeConflicts(d.conflicts),
-          stale: Array.isArray(d.stale) ? d.stale : [],
-        };
+      raw = retryTransientRead(() => fs.readFileSync(statePath(), 'utf8'));
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        return { version: STATE_VERSION, notes: {}, conflicts: {}, stale: [] };
       }
-    } catch (_) { /* missing or corrupt → fresh */ }
+      throw err;
+    }
+
+    let d;
+    try { d = JSON.parse(raw); }
+    catch (err) {
+      if (err instanceof SyntaxError) {
+        return { version: STATE_VERSION, notes: {}, conflicts: {}, stale: [] };
+      }
+      throw err;
+    }
+    if (d && typeof d === 'object') {
+      return {
+        version: STATE_VERSION,
+        notes: d.notes || {},
+        conflicts: normalizeConflicts(d.conflicts),
+        stale: Array.isArray(d.stale) ? d.stale : [],
+      };
+    }
+    // Valid JSON with the wrong top-level shape is still a corrupt index.
     return { version: STATE_VERSION, notes: {}, conflicts: {}, stale: [] };
   }
 
@@ -426,8 +442,8 @@ function registerObsidianSync({
   function syncNoteBySummaryPath(summaryPath, { idx, onConflict = 'preserve' } = {}) {
     if (!isActive()) return { status: 'disabled' };
     const ownIdx = !idx;
-    idx = idx || loadIndex();
     try {
+      idx = idx || loadIndex();
       drainStale(idx); // retry any previously-blocked unlink first
       pruneMissingPreservedConflicts(idx);
       if (!summaryPath || !summaryPath.endsWith(SUMMARY_SUFFIX)) {
@@ -577,8 +593,8 @@ function registerObsidianSync({
   // (skip + flag) — the locked decision favours the user's edit over no-orphan.
   function removeNoteBySummaryPath(target) {
     if (!isActive()) return { status: 'disabled' };
-    const idx = loadIndex();
     try {
+      const idx = loadIndex();
       const stem = target && target.endsWith && target.endsWith(SUMMARY_SUFFIX)
         ? stemFromSummaryPath(target) : target;
       const entry = idx.notes[stem];
@@ -652,18 +668,18 @@ function registerObsidianSync({
   // Async + yielding so a large history never janks the launch critical path.
   async function reconcileOnLaunch() {
     if (!isActive()) return { status: 'disabled' };
-    const idx = loadIndex();
-    drainStale(idx);
-    pruneMissingPreservedConflicts(idx);
-    const scan = listSummaryFiles();
-    const onDisk = new Map(scan.files.map((p) => [stemFromSummaryPath(p), p]));
-    // Only delete on the strength of a scan that (a) completed without a read
-    // error on any base and (b) actually found notes. Either an incomplete scan
-    // (a custom storage path that failed to read/load this launch) or an empty
-    // one is treated as untrustworthy — skip deletes rather than wipe the vault
-    // (H2 + cubic: a partially-failed scan must not delete another dir's notes).
-    const trustDeletes = scan.complete && onDisk.size > 0;
     try {
+      const idx = loadIndex();
+      drainStale(idx);
+      pruneMissingPreservedConflicts(idx);
+      const scan = listSummaryFiles();
+      const onDisk = new Map(scan.files.map((p) => [stemFromSummaryPath(p), p]));
+      // Only delete on the strength of a scan that (a) completed without a read
+      // error on any base and (b) actually found notes. Either an incomplete scan
+      // (a custom storage path that failed to read/load this launch) or an empty
+      // one is treated as untrustworthy — skip deletes rather than wipe the vault
+      // (H2 + cubic: a partially-failed scan must not delete another dir's notes).
+      const trustDeletes = scan.complete && onDisk.size > 0;
       // 1. Index entries whose source note is gone → remove the vault copy,
       //    UNLESS it was edited in Obsidian (preserve + flag the conflict).
       if (trustDeletes) {
@@ -693,7 +709,10 @@ function registerObsidianSync({
         syncNoteBySummaryPath(p);
         if (++n % 25 === 0) await new Promise((r) => setImmediate(r)); // yield
       }
-    } catch (e) { log(`reconcile failed: ${e.code || e.message}`); }
+    } catch (e) {
+      log(`reconcile failed: ${e.code || e.message}`);
+      return { status: 'error' };
+    }
     return { status: 'done' };
   }
 
