@@ -1741,7 +1741,10 @@ def set_openai_asr_config_cmd(api_url, model):
     config = get_config()
     errors = []
 
-    if not config.begin_transaction(require_readable_disk=api_url is not None):
+    # Every mutation needs an authoritative locked read. A model-only update
+    # must not turn an unreadable existing file into a defaults-based rewrite
+    # that drops a legacy key or unrelated settings.
+    if not config.begin_transaction(require_readable_disk=True):
         errors.append("Failed to start config transaction")
     else:
         try:

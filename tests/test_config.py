@@ -411,6 +411,26 @@ class ConfigOpenAiAsrTests(unittest.TestCase):
             self.assertFalse(json.loads(result.output)["success"])
             self.assertEqual(json.loads(path.read_text()), original)
 
+    def test_model_only_cli_update_fails_closed_when_locked_config_read_fails(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            config = Config(config_path=path)
+            original = path.read_text()
+
+            with patch.object(
+                config,
+                "_read_disk_for_secure_transaction",
+                return_value=(False, None),
+            ), patch("src.config.get_config", return_value=config):
+                result = CliRunner().invoke(
+                    simple_recorder.set_openai_asr_config_cmd,
+                    ["--model", "whisper-large-v3"],
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertFalse(json.loads(result.output)["success"])
+            self.assertEqual(path.read_text(), original)
+
     def test_multi_field_cli_update_commits_both_fields(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "config.json"
