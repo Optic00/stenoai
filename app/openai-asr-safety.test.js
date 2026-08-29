@@ -3,17 +3,11 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { saveEncryptedKeyAtomically } = require('./openai-asr-key-store');
 
 const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
-
-function functionSource(name, nextName) {
-  const start = source.indexOf(`function ${name}(`);
-  const end = source.indexOf(`function ${nextName}(`, start + 1);
-  assert.notStrictEqual(start, -1, `${name} must exist`);
-  assert.notStrictEqual(end, -1, `${nextName} must follow ${name}`);
-  return source.slice(start, end);
-}
 
 test('OpenAI ASR plaintext-key migration runs at application startup', () => {
   const ready = source.indexOf('app.whenReady().then(async () => {');
@@ -25,15 +19,142 @@ test('OpenAI ASR plaintext-key migration runs at application startup', () => {
   assert.ok(migration < menu, 'migration must not depend on opening Settings or selecting an engine');
 });
 
-test('OpenAI ASR key writes atomically verify readback before plaintext removal', () => {
-  const save = functionSource('saveOpenAiAsrKey', 'loadOpenAiAsrKey');
-  const secureLegacy = functionSource('secureLegacyOpenAiAsrApiKey', 'migrateLegacyOpenAiAsrApiKey');
+function withKeyDirectory(run) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'stenoai-asr-key-'));
+  const keyPath = path.join(directory, '.openai-asr-api-key');
+  try {
+    return run(keyPath);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
 
-  assert.match(save, /fs\.writeFileSync\(tempPath, encrypted, \{ mode: 0o600 \}\)/);
-  assert.match(save, /fs\.renameSync\(tempPath, keyPath\)/);
-  assert.match(save, /loadOpenAiAsrKey\(\) !== key/);
-  assert.match(save, /prior credential state restored/);
-  assert.match(save, /rollback also failed/);
-  assert.match(secureLegacy, /stored === legacyKey/);
-  assert.match(secureLegacy, /saveOpenAiAsrKey\(legacyKey\)/);
+function encrypted(value) {
+  return Buffer.from(`encrypted:${value}`);
+}
+
+function safeStorage(overrides = {}) {
+  return {
+    encryptString: (value) => encrypted(value),
+    decryptString: (value) => value.toString().replace(/^encrypted:/, ''),
+    ...overrides,
+  };
+}
+
+function save(keyPath, key, storage = safeStorage(), fsImpl = fs) {
+  return saveEncryptedKeyAtomically({
+    fs: fsImpl,
+    path,
+    processId: 123,
+    now: 456,
+    keyPath,
+    key,
+    safeStorage: storage,
+  });
+}
+
+test('early encryption failure leaves the previous encrypted key byte-for-byte intact', () => {
+  withKeyDirectory((keyPath) => {
+    const previous = encrypted('old-key');
+    fs.writeFileSync(keyPath, previous);
+
+    assert.throws(
+      () => save(keyPath, 'new-key', safeStorage({
+        encryptString: () => { throw new Error('encryption unavailable'); },
+      })),
+      /prior credential state restored/,
+    );
+    assert.deepStrictEqual(fs.readFileSync(keyPath), previous);
+    assert.deepStrictEqual(fs.readdirSync(path.dirname(keyPath)), [path.basename(keyPath)]);
+  });
+});
+
+test('early read failure never deletes the previous encrypted key', () => {
+  withKeyDirectory((keyPath) => {
+    const previous = encrypted('old-key');
+    fs.writeFileSync(keyPath, previous);
+    const fsImpl = Object.create(fs);
+    fsImpl.readFileSync = (target, ...args) => {
+      if (target === keyPath) throw new Error('keychain file temporarily unreadable');
+      return fs.readFileSync(target, ...args);
+    };
+
+    assert.throws(() => save(keyPath, 'new-key', safeStorage(), fsImpl));
+    assert.deepStrictEqual(fs.readFileSync(keyPath), previous);
+  });
+});
+
+test('late decrypt mismatch atomically restores the previous encrypted key', () => {
+  withKeyDirectory((keyPath) => {
+    const previous = encrypted('old-key');
+    fs.writeFileSync(keyPath, previous);
+
+    assert.throws(
+      () => save(keyPath, 'new-key', safeStorage({ decryptString: () => 'wrong-key' })),
+      /prior credential state restored/,
+    );
+    assert.deepStrictEqual(fs.readFileSync(keyPath), previous);
+    assert.deepStrictEqual(fs.readdirSync(path.dirname(keyPath)), [path.basename(keyPath)]);
+  });
+});
+
+test('late readback failure atomically restores the previous encrypted key', () => {
+  withKeyDirectory((keyPath) => {
+    const previous = encrypted('old-key');
+    fs.writeFileSync(keyPath, previous);
+    let keyReads = 0;
+    const fsImpl = Object.create(fs);
+    fsImpl.readFileSync = (target, ...args) => {
+      if (target === keyPath && ++keyReads === 2) throw new Error('readback failed');
+      return fs.readFileSync(target, ...args);
+    };
+
+    assert.throws(() => save(keyPath, 'new-key', safeStorage(), fsImpl));
+    assert.deepStrictEqual(fs.readFileSync(keyPath), previous);
+  });
+});
+
+test('rollback filesystem failure retains an encrypted recovery copy of the old key', () => {
+  withKeyDirectory((keyPath) => {
+    const previous = encrypted('old-key');
+    fs.writeFileSync(keyPath, previous);
+    const rollbackPath = `${keyPath}.123.456.tmp.rollback`;
+    const fsImpl = Object.create(fs);
+    fsImpl.renameSync = (source, target) => {
+      if (source === rollbackPath && target === keyPath) {
+        throw new Error('restore rename failed');
+      }
+      return fs.renameSync(source, target);
+    };
+
+    assert.throws(
+      () => save(
+        keyPath,
+        'new-key',
+        safeStorage({ decryptString: () => 'wrong-key' }),
+        fsImpl,
+      ),
+      /rollback also failed/,
+    );
+    assert.deepStrictEqual(fs.readFileSync(rollbackPath), previous);
+  });
+});
+
+test('failed first key write removes the unverified new credential', () => {
+  withKeyDirectory((keyPath) => {
+    assert.throws(() => save(
+      keyPath,
+      'new-key',
+      safeStorage({ decryptString: () => 'wrong-key' }),
+    ));
+    assert.strictEqual(fs.existsSync(keyPath), false);
+  });
+});
+
+test('successful key rotation persists a decryptable replacement', () => {
+  withKeyDirectory((keyPath) => {
+    fs.writeFileSync(keyPath, encrypted('old-key'));
+    assert.strictEqual(save(keyPath, 'new-key'), true);
+    assert.strictEqual(safeStorage().decryptString(fs.readFileSync(keyPath)), 'new-key');
+  });
 });

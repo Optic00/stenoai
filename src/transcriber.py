@@ -1267,8 +1267,59 @@ def _redact_openai_asr_error(message: object, api_key: str = "") -> str:
         r"\1[redacted]",
         redacted,
     )
-    redacted = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[redacted]@", redacted)
-    return re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}", "[redacted]", redacted)
+    redacted = re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}", "[redacted]", redacted)
+
+    # Provider errors can echo signed paths or arbitrary query names. Treat the
+    # whole URL as sensitive instead of trying to enumerate credential fields.
+    return re.sub(r"(?i)https?://[^\s\"'<>]+", "[redacted-url]", redacted)
+
+
+def _open_openai_asr_response_with_deadline(opener, request, timeout: float, deadline: float):
+    """Open a request without allowing connect/upload/headers to exceed deadline."""
+    import queue
+    import time
+
+    result = queue.Queue(maxsize=1)
+    cancelled = threading.Event()
+
+    def open_request() -> None:
+        try:
+            value = opener.open(request, timeout=timeout)
+        except BaseException as error:
+            if cancelled.is_set():
+                try:
+                    error.close()
+                except Exception:
+                    pass
+                return
+            result.put((False, error))
+            return
+        if cancelled.is_set():
+            try:
+                value.close()
+            except Exception:
+                pass
+            return
+        result.put((True, value))
+
+    thread = threading.Thread(target=open_request, daemon=True)
+    thread.start()
+    remaining = max(0, deadline - time.monotonic())
+    try:
+        ok, value = result.get(timeout=remaining)
+    except queue.Empty as error:
+        cancelled.set()
+        raise TimeoutError("openai-asr request exceeded its total deadline") from error
+    if time.monotonic() > deadline:
+        cancelled.set()
+        try:
+            value.close()
+        except Exception:
+            pass
+        raise TimeoutError("openai-asr request exceeded its total deadline")
+    if ok:
+        return value
+    raise value
 
 
 def _read_openai_asr_response_with_deadline(response, deadline: float) -> bytes:
@@ -1941,24 +1992,19 @@ class WhisperTranscriber:
         api_key = getattr(self, "_openai_asr_api_key", "")
         model = getattr(self, "_openai_asr_model", "") or "whisper-1"
 
+        from src.config import _normalise_openai_asr_api_url
+
+        api_url = _normalise_openai_asr_api_url(api_url)
         if not api_url:
             raise RuntimeError("openai-asr: configured endpoint is unsafe or invalid")
         api_url = api_url.rstrip("/")
 
         if "/audio/transcriptions" not in api_url:
-            if "?" in api_url:
-                parts = urllib.parse.urlsplit(api_url)
-                new_path = parts.path.rstrip("/") + "/audio/transcriptions"
-                endpoint = urllib.parse.urlunsplit((parts.scheme, parts.netloc, new_path, parts.query, parts.fragment))
-            else:
-                endpoint = f"{api_url}/audio/transcriptions"
+            endpoint = f"{api_url}/audio/transcriptions"
         else:
             endpoint = api_url
 
-        logger.info(
-            "openai-asr: POST %s  model=%s  file=%s",
-            _redact_openai_asr_error(endpoint, api_key), model, audio_filepath.name,
-        )
+        logger.info("openai-asr: POST configured endpoint  model=%s  file=%s", model, audio_filepath.name)
 
         if not api_key:
             raise RuntimeError(
@@ -2042,9 +2088,8 @@ class WhisperTranscriber:
                 )
         opener = urllib.request.build_opener(NoRedirectHandler)
 
-        request_deadline = time.monotonic() + OPENAI_ASR_REQUEST_DEADLINE_SECONDS
-
         def _do_request(response_format: str, request_audio_path: Path) -> tuple[bytes, str]:
+            request_deadline = time.monotonic() + OPENAI_ASR_REQUEST_DEADLINE_SECONDS
             for attempt in range(2):
                 remaining = request_deadline - time.monotonic()
                 if remaining <= 0:
@@ -2064,21 +2109,38 @@ class WhisperTranscriber:
                     # The heartbeat protects Electron's inactivity watchdog, but must
                     # never extend this request's hard total wall-clock deadline.
                     timeout = min(OPENAI_ASR_SOCKET_TIMEOUT_SECONDS, max(1, remaining))
-                    with _heartbeat_while_waiting("openai-asr-request"), opener.open(req, timeout=timeout) as resp:
-                        content_type = resp.headers.get("Content-Type", "") or ""
-                        return _read_openai_asr_response_with_deadline(resp, request_deadline), content_type
-                except urllib.error.HTTPError as e:
-                    retryable = e.code == 429 or 500 <= e.code <= 599
-                    if attempt == 0 and retryable:
-                        e.close()
-                        time.sleep(min(2, max(0, request_deadline - time.monotonic())))
-                        continue
-                    err_body = e.read().decode(errors="replace")
-                    e.close()
-                    err_body = _redact_openai_asr_error(err_body, api_key)[:500]
-                    raise RuntimeError(
-                        f"openai-asr HTTP {e.code}: {err_body}"
-                    ) from e
+                    with _heartbeat_while_waiting("openai-asr-request"):
+                        try:
+                            resp = _open_openai_asr_response_with_deadline(
+                                opener, req, timeout, request_deadline,
+                            )
+                        except urllib.error.HTTPError as e:
+                            retryable = e.code == 429 or 500 <= e.code <= 599
+                            if attempt == 0 and retryable:
+                                e.close()
+                                time.sleep(min(2, max(0, request_deadline - time.monotonic())))
+                                continue
+                            try:
+                                err_body = _read_openai_asr_response_with_deadline(
+                                    e, request_deadline,
+                                ).decode(errors="replace")
+                            finally:
+                                e.close()
+                            err_body = _redact_openai_asr_error(err_body, api_key)[:500]
+                            raise RuntimeError(
+                                f"openai-asr HTTP {e.code}: {err_body}"
+                            ) from e
+                        try:
+                            content_type = resp.headers.get("Content-Type", "") or ""
+                            body = _read_openai_asr_response_with_deadline(
+                                resp, request_deadline,
+                            )
+                            return body, content_type
+                        finally:
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
                 except urllib.error.URLError as error:
                     if attempt == 0:
                         time.sleep(min(2, max(0, request_deadline - time.monotonic())))

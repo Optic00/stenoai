@@ -19,6 +19,14 @@
 const path = require('path');
 const { spawn: _spawnRaw } = require('child_process');
 
+const OPENAI_ASR_KEY_ENV = 'STENOAI_OAI_API_KEY';
+
+function withoutOpenAiAsrKey(env) {
+  return Object.fromEntries(
+    Object.entries(env || {}).filter(([name]) => name.toUpperCase() !== OPENAI_ASR_KEY_ENV),
+  );
+}
+
 // Wrap spawn so every backend / ollama launch defaults to windowsHide:true
 // AND PYTHONUNBUFFERED:1.
 // The PyInstaller backend (stenoai.exe) and bundled ollama.exe are console
@@ -39,10 +47,7 @@ function spawn(command, args, options) {
   const unbufferedEnv = (existingEnv) => ({
     // Never inherit an ambient ASR credential into arbitrary backend jobs.
     // The transcription path supplies it explicitly only for openai-asr.
-    ...(() => {
-      const { STENOAI_OAI_API_KEY, ...env } = require('process').env;
-      return env;
-    })(),
+    ...withoutOpenAiAsrKey(require('process').env),
     PYTHONUNBUFFERED: '1',
     ...(existingEnv || {}),
   });
@@ -126,7 +131,7 @@ function createBackendCli({
       const backendPath = getBackendPath();
 
       // Log the command being executed (unless silent)
-      console.log('Running:', `${backendPath} ${args.join(' ')}`);
+      console.log('Running:', `${backendPath} ${sanitizeArgsForLog(args)}`);
       if (!silent) {
         // Sanitize the echoed argv: denylisted commands (query, save-template,
         // set-user-name/storage-path, folder + URL setters) carry content/PII in
@@ -204,4 +209,4 @@ function createBackendCli({
   return { getBackendPath, getBackendCwd, runPythonScript };
 }
 
-module.exports = { spawn, killProcessTree, createBackendCli };
+module.exports = { spawn, killProcessTree, createBackendCli, withoutOpenAiAsrKey };

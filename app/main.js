@@ -51,7 +51,8 @@ const path = require('path');
 // Backend CLI seam (spawn wrapper, process-tree kill, bundled-backend paths,
 // runPythonScript), the debug-log sink, and the quit teardown registry are
 // carved out of this file (RFC #327, Phase 0); wired once below via factories.
-const { spawn, killProcessTree, createBackendCli } = require('./backend-cli');
+const { spawn, killProcessTree, createBackendCli, withoutOpenAiAsrKey } = require('./backend-cli');
+const { saveEncryptedKeyAtomically } = require('./openai-asr-key-store');
 const { createDebugLog } = require('./debug-log');
 const { createTeardownRegistry } = require('./teardown');
 const { registerFoldersIpc } = require('./folders-ipc');
@@ -8921,38 +8922,19 @@ function getOpenAiAsrKeyPath() {
 }
 
 function saveOpenAiAsrKey(key) {
-  const keyPath = getOpenAiAsrKeyPath();
-  const tempPath = `${keyPath}.${process.pid}.${Date.now()}.tmp`;
-  let previous = null;
   try {
-    const keyDir = path.dirname(keyPath);
-    if (!fs.existsSync(keyDir)) {
-      fs.mkdirSync(keyDir, { recursive: true });
-    }
-    const encrypted = getSafeStorage().encryptString(key);
-    previous = fs.existsSync(keyPath) ? fs.readFileSync(keyPath) : null;
-    fs.writeFileSync(tempPath, encrypted, { mode: 0o600 });
-    fs.renameSync(tempPath, keyPath);
-    if (loadOpenAiAsrKey() !== key) throw new Error('safeStorage readback did not match saved key');
-    return true;
+    return saveEncryptedKeyAtomically({
+      fs,
+      path,
+      processId: process.pid,
+      now: Date.now(),
+      keyPath: getOpenAiAsrKeyPath(),
+      key,
+      safeStorage: getSafeStorage(),
+    });
   } catch (error) {
-    let rollbackError = null;
-    try {
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-      if (previous) {
-        fs.writeFileSync(tempPath, previous, { mode: 0o600 });
-        fs.renameSync(tempPath, keyPath);
-      } else if (fs.existsSync(keyPath)) {
-        fs.unlinkSync(keyPath);
-      }
-    } catch (rollbackFailure) {
-      rollbackError = rollbackFailure;
-    }
-    const detail = rollbackError
-      ? `; rollback also failed: ${rollbackError.message}`
-      : '; prior credential state restored';
-    console.error(`Failed to save OpenAI ASR API key${detail}`);
-    throw new Error(`OpenAI ASR API key was not saved${detail}`);
+    console.error(error.message);
+    throw error;
   }
 }
 
@@ -9034,8 +9016,7 @@ function getAiEnv() {
 }
 
 function getBackendEnv(extra = {}) {
-  const { STENOAI_OAI_API_KEY, ...env } = require('process').env;
-  return { ...env, ...extra };
+  return { ...withoutOpenAiAsrKey(require('process').env), ...extra };
 }
 
 // Env additions a transcription subprocess needs. Only when openai-asr is the

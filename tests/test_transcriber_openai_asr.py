@@ -4,6 +4,8 @@ import contextlib
 import io
 import json
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 import wave
@@ -32,6 +34,9 @@ class _FakeResponse:
 
     def read(self):
         return self._body
+
+    def close(self):
+        pass
 
 
 class _TricklingResponse(_FakeResponse):
@@ -69,6 +74,17 @@ class _FakeOpener:
         return response
 
 
+class _BlockingOpener:
+    def __init__(self):
+        self.entered = threading.Event()
+        self.released = threading.Event()
+
+    def open(self, request, timeout):
+        self.entered.set()
+        self.released.wait()
+        return _json_response({"text": "late", "segments": []})
+
+
 def _json_response(payload):
     return _FakeResponse(json.dumps(payload).encode())
 
@@ -80,6 +96,16 @@ def _http_error(code: int, body: bytes = b"error"):
         "failure",
         {},
         io.BytesIO(body),
+    )
+
+
+def _streaming_http_error(code: int, response):
+    return urllib.error.HTTPError(
+        "https://api.example/v1/audio/transcriptions",
+        code,
+        "failure",
+        {},
+        response,
     )
 
 
@@ -195,13 +221,74 @@ class OpenAiAsrTests(unittest.TestCase):
         heartbeat.assert_called_once_with("openai-asr-request")
 
     def test_total_deadline_closes_a_trickling_response(self):
-        import time
         response = _TricklingResponse()
         with self.assertRaisesRegex(TimeoutError, "total deadline"):
             transcriber_mod._read_openai_asr_response_with_deadline(
                 response, time.monotonic() + 0.01
             )
         self.assertTrue(response.released.is_set())
+
+    def test_run_enforces_deadline_while_opening_request(self):
+        transcriber = _build_transcriber()
+        opener = _BlockingOpener()
+        started = time.monotonic()
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                audio = Path(tmp_dir) / "short.wav"
+                _write_pcm_wav(audio, frame_count=16000)
+                with patch("urllib.request.build_opener", return_value=opener), patch(
+                    "src.transcriber.OPENAI_ASR_REQUEST_DEADLINE_SECONDS", 0.02,
+                ), patch(
+                    "src.transcriber._heartbeat_while_waiting",
+                    return_value=contextlib.nullcontext(),
+                ):
+                    with self.assertRaisesRegex(TimeoutError, "total deadline"):
+                        transcriber._run_openai_asr(audio, language="en")
+        finally:
+            opener.released.set()
+
+        self.assertTrue(opener.entered.is_set())
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_run_enforces_deadline_while_reading_success_body(self):
+        transcriber = _build_transcriber()
+        response = _TricklingResponse()
+        opener = _FakeOpener([response])
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch("urllib.request.build_opener", return_value=opener), patch(
+                "src.transcriber.OPENAI_ASR_REQUEST_DEADLINE_SECONDS", 0.02,
+            ), patch(
+                "src.transcriber._heartbeat_while_waiting",
+                return_value=contextlib.nullcontext(),
+            ):
+                with self.assertRaisesRegex(TimeoutError, "total deadline"):
+                    transcriber._run_openai_asr(audio, language="en")
+
+        self.assertTrue(response.released.is_set())
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_run_enforces_deadline_while_reading_http_error_body(self):
+        transcriber = _build_transcriber()
+        response = _TricklingResponse()
+        opener = _FakeOpener([_streaming_http_error(401, response)])
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch("urllib.request.build_opener", return_value=opener), patch(
+                "src.transcriber.OPENAI_ASR_REQUEST_DEADLINE_SECONDS", 0.02,
+            ), patch(
+                "src.transcriber._heartbeat_while_waiting",
+                return_value=contextlib.nullcontext(),
+            ):
+                with self.assertRaisesRegex(TimeoutError, "total deadline"):
+                    transcriber._run_openai_asr(audio, language="en")
+
+        self.assertTrue(response.released.is_set())
+        self.assertLess(time.monotonic() - started, 1.0)
 
     def test_oversized_non_wav_names_25_mb_limit(self):
         transcriber = _build_transcriber()
@@ -402,21 +489,21 @@ class OpenAiAsrTests(unittest.TestCase):
         self.assertIn("token=[redacted]", message)
         self.assertIn("api_key=[redacted]", message)
 
-    def test_error_redacts_url_userinfo_and_query_credentials(self):
-        redacted = transcriber_mod._redact_openai_asr_error(
-            "https://user:password@example.test/v1?api-key=secret-value"
-        )
-        self.assertNotIn("user:password", redacted)
-        self.assertNotIn("secret-value", redacted)
-        self.assertIn("https://[redacted]@example.test", redacted)
+    def test_error_redacts_complete_urls_with_arbitrary_query_credentials(self):
+        for name in ("key", "subscription-key", "sig", "custom-provider-secret"):
+            with self.subTest(name=name):
+                raw = f"https://user:password@example.test/private/path?{name}=secret-value"
+                redacted = transcriber_mod._redact_openai_asr_error(raw)
+                self.assertEqual(redacted, "[redacted-url]")
+                self.assertNotIn("user:password", redacted)
+                self.assertNotIn("secret-value", redacted)
+                self.assertNotIn("private/path", redacted)
 
     def test_config_diagnostic_redacts_userinfo_and_query_credentials(self):
         redacted = config_mod._redact_url_credentials(
             "http://user:password@evil.example/v1?access_token=secret-value"
         )
-        self.assertNotIn("user:password", redacted)
-        self.assertNotIn("secret-value", redacted)
-        self.assertIn("http://[redacted]@evil.example", redacted)
+        self.assertEqual(redacted, "[redacted-url]")
 
     def test_url_guard_rejects_remote_http_and_accepts_loopback_or_https(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -426,14 +513,26 @@ class OpenAiAsrTests(unittest.TestCase):
             self.assertTrue(config.set_openai_asr_api_url("https://safe.example/v1"))
 
     def test_legacy_unsafe_url_fails_closed_and_never_reaches_the_transcriber(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            config_path = Path(tmp_dir) / "config.json"
-            config_path.write_text(json.dumps({
-                "openai_asr_api_url": "http://user:password@evil.example/v1"
-            }))
-            config = Config(config_path=config_path)
-            self.assertEqual(config.get_openai_asr_api_url(), "")
-            self.assertFalse(config.set_openai_asr_api_url("https://user:password@safe.example/v1"))
+        unsafe_urls = (
+            "http://user:password@evil.example/v1",
+            "https://safe.example/v1?key=secret",
+            "https://safe.example/v1?subscription-key=secret",
+            "https://safe.example/v1?sig=secret",
+            "https://safe.example/v1?unknown=secret",
+        )
+        for unsafe_url in unsafe_urls:
+            with self.subTest(url=unsafe_url), tempfile.TemporaryDirectory() as tmp_dir:
+                config_path = Path(tmp_dir) / "config.json"
+                config_path.write_text(json.dumps({"openai_asr_api_url": unsafe_url}))
+                config = Config(config_path=config_path)
+                self.assertEqual(config.get_openai_asr_api_url(), "")
+
+                transcriber = _build_transcriber()
+                transcriber._openai_asr_api_url = unsafe_url
+                with patch("urllib.request.build_opener") as build_opener:
+                    with self.assertRaisesRegex(RuntimeError, "unsafe or invalid"):
+                        transcriber._run_openai_asr(Path("unused.wav"), language="en")
+                build_opener.assert_not_called()
 
     def test_language_normalization(self):
         normalize = getattr(transcriber_mod, "_normalize_openai_language")

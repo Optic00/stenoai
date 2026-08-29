@@ -46,14 +46,8 @@ OPENAI_ASR_DEFAULT_URL = "https://api.openai.com/v1"
 
 
 def _redact_url_credentials(value: object) -> str:
-    """Keep malformed legacy endpoint diagnostics from exposing credentials."""
-    text = str(value)
-    text = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[redacted]@", text)
-    return re.sub(
-        r"(?i)([?&](?:api[_-]?key|access[_-]?token|token|password|secret)=)[^&#\s]*",
-        r"\1[redacted]",
-        text,
-    )
+    """Never echo a user-controlled endpoint into diagnostics."""
+    return "[redacted-url]"
 
 
 def _normalise_openai_asr_api_url(value: object) -> Optional[str]:
@@ -68,12 +62,21 @@ def _normalise_openai_asr_api_url(value: object) -> Optional[str]:
     hostname = (parsed.hostname or "").lower()
     if not hostname or parsed.username is not None or parsed.password is not None:
         return None
+    try:
+        _ = parsed.port
+    except ValueError:
+        return None
     if scheme == "http" and hostname in {"localhost", "127.0.0.1", "::1"}:
         pass
     elif scheme != "https":
         return None
-    # URL fragments are never sent in HTTP and can accidentally carry secrets.
-    return urllib.parse.urlunsplit((scheme, parsed.netloc, parsed.path.rstrip("/"), parsed.query, ""))
+    # Base endpoints are non-secret config. Query strings and fragments can be
+    # signed credentials and would otherwise land in config.json, argv and
+    # logs, so reject every one rather than maintaining a credential-name
+    # denylist that providers can outgrow.
+    if parsed.query or parsed.fragment:
+        return None
+    return urllib.parse.urlunsplit((scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
 
 
 def _atomic_write(path: Path, render, encoding: str = 'utf-8') -> None:
@@ -2170,15 +2173,20 @@ class Config:
     def set_openai_asr_api_url(self, url: str) -> bool:
         """Set the base URL for the OpenAI-compatible STT endpoint.
 
-        Rejects blank URLs and plaintext remote endpoints. HTTP is allowed only
-        for loopback development servers; all other hosts must use HTTPS.
+        Rejects blank URLs, credentials, queries, fragments, and plaintext
+        remote endpoints. HTTP is allowed only for loopback development
+        servers; all other hosts must use HTTPS.
         """
         if not url or not url.strip():
             logger.error("openai_asr_api_url must not be empty")
             return False
         clean_url = _normalise_openai_asr_api_url(url)
         if clean_url is None:
-            logger.error("openai_asr_api_url URL must be HTTPS (or loopback HTTP) without embedded credentials: %s", _redact_url_credentials(url))
+            logger.error(
+                "openai_asr_api_url URL must be HTTPS (or loopback HTTP) without "
+                "credentials, queries, or fragments: %s",
+                _redact_url_credentials(url),
+            )
             return False
         self._config["openai_asr_api_url"] = clean_url
         return self._save()

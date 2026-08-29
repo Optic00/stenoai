@@ -283,6 +283,22 @@ class ConfigOpenAiAsrTests(unittest.TestCase):
                 with self.subTest(url=url):
                     self.assertFalse(config.set_openai_asr_api_url(url))
 
+    def test_set_api_url_rejects_every_query_and_fragment_and_keeps_prior(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = Config(config_path=Path(tmp_dir) / "config.json")
+            prior = "https://custom.example/v1"
+            self.assertTrue(config.set_openai_asr_api_url(prior))
+            for suffix in (
+                "?key=secret",
+                "?subscription-key=secret",
+                "?sig=secret",
+                "?unknown-provider-field=secret",
+                "#credential-fragment",
+            ):
+                with self.subTest(suffix=suffix):
+                    self.assertFalse(config.set_openai_asr_api_url(prior + suffix))
+                    self.assertEqual(config.get_openai_asr_api_url(), prior)
+
     def test_set_model_rejects_blank_and_keeps_prior(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = Config(config_path=Path(tmp_dir) / "config.json")
