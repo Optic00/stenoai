@@ -2973,8 +2973,12 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
     // stuck.
     activeReprocessJobs.set(summaryFile, { summaryFile, sessionName: sessionName || null });
 
-    const aiEnv = getAiEnv();
-    const reprocessEnv = Object.keys(aiEnv).length > 0 ? { ...require('process').env, ...aiEnv } : undefined;
+    const reprocessSecrets = retranscribe
+      ? { ...getAiEnv(), ...getTranscriptionEnv() }
+      : getAiEnv();
+    const reprocessEnv = Object.keys(reprocessSecrets).length > 0
+      ? { ...require('process').env, ...reprocessSecrets }
+      : undefined;
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), args, {
@@ -8058,6 +8062,7 @@ ipcMain.handle('set-transcription-engine', async (event, engine) => {
 // which isn't injected on these calls, so its own api_key_set is unreliable.
 ipcMain.handle('get-openai-asr-config', async () => {
   try {
+    await migrateLegacyOpenAiAsrApiKey();
     const result = await runPythonScript('simple_recorder.py', ['get-openai-asr-config'], true);
     const jsonData = JSON.parse(result.trim());
     jsonData.api_key_set = hasOpenAiAsrKey();
@@ -8067,6 +8072,7 @@ ipcMain.handle('get-openai-asr-config', async () => {
 
 ipcMain.handle('set-openai-asr-config', async (_event, cfg) => {
   try {
+    await migrateLegacyOpenAiAsrApiKey();
     const args = ['set-openai-asr-config'];
     if (cfg && cfg.api_url !== undefined) { args.push('--api-url', cfg.api_url); }
     if (cfg && cfg.model !== undefined) { args.push('--model', cfg.model); }
@@ -8944,6 +8950,48 @@ function hasOpenAiAsrKey() {
   return fs.existsSync(getOpenAiAsrKeyPath());
 }
 
+function readLegacyOpenAiAsrApiKey() {
+  try {
+    const configPath = path.join(getUserDataDir(), 'config.json');
+    if (!fs.existsSync(configPath)) return null;
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    const key = config && typeof config.openai_asr_api_key === 'string'
+      ? config.openai_asr_api_key.trim()
+      : '';
+    return key || null;
+  } catch (_) {
+    // A damaged legacy config remains recoverable through the normal backend
+    // path. Never log its contents, which may contain the key we are seeking.
+    return null;
+  }
+}
+
+function secureLegacyOpenAiAsrApiKey() {
+  const legacyKey = readLegacyOpenAiAsrApiKey();
+  if (!legacyKey) return false;
+  const stored = loadOpenAiAsrKey();
+  if (stored) return true;
+  try {
+    // Do not remove config.json's value unless encrypt + decrypt both work.
+    return saveOpenAiAsrKey(legacyKey) && Boolean(loadOpenAiAsrKey());
+  } catch (_) {
+    return false;
+  }
+}
+
+async function migrateLegacyOpenAiAsrApiKey() {
+  if (!secureLegacyOpenAiAsrApiKey()) return false;
+  try {
+    const raw = await runPythonScript(
+      'simple_recorder.py', ['remove-legacy-openai-asr-api-key'], true,
+    );
+    return JSON.parse(raw.trim()).success === true;
+  } catch (_) {
+    // The encrypted copy is safe and the plaintext remains for a future retry.
+    return false;
+  }
+}
+
 // Build the env additions a Python AI-driven subprocess needs. Merges
 // the encrypted-on-disk cloud key (decrypted only here, never written
 // to the env if absent) AND the org adapter URL+JWT when a session
@@ -8968,6 +9016,10 @@ function getAiEnv() {
 function getTranscriptionEnv() {
   const env = {};
   if (loadTranscriptionEngine() !== 'openai-asr') return env;
+  // A legacy plaintext key must be secured before this first cloud job. The
+  // deletion itself is async (via the locked Python config writer), but this
+  // sync path can safely use the encrypted copy immediately.
+  if (secureLegacyOpenAiAsrApiKey()) void migrateLegacyOpenAiAsrApiKey();
   const oaiKey = loadOpenAiAsrKey();
   if (oaiKey) env.STENOAI_OAI_API_KEY = oaiKey;
   return env;

@@ -2171,6 +2171,21 @@ class Config:
         import os
         return os.environ.get("STENOAI_OAI_API_KEY", "")
 
+    def remove_legacy_openai_asr_api_key(self) -> bool:
+        """Remove a plaintext pre-safeStorage ASR key after Electron migrated it.
+
+        Electron calls this only after it has encrypted and read back the
+        credential through safeStorage.  Keep the old value in memory when a
+        disk write fails so a retry cannot silently discard the only copy.
+        """
+        if "openai_asr_api_key" not in self._config:
+            return True
+        legacy_key = self._config.pop("openai_asr_api_key")
+        if self._save():
+            return True
+        self._config["openai_asr_api_key"] = legacy_key
+        return False
+
     def get_openai_asr_model(self) -> str:
         """Model name passed to the OpenAI-compatible STT endpoint.
 

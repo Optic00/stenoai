@@ -7,6 +7,28 @@ from unittest.mock import patch
 from src.config import Config
 
 
+class OpenAiAsrCredentialMigrationTests(unittest.TestCase):
+    def test_removes_plaintext_legacy_asr_key_after_safe_storage_migration(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            config_path.write_text(json.dumps({"openai_asr_api_key": "legacy-test-value"}))
+            config = Config(config_path=config_path)
+
+            self.assertTrue(config.remove_legacy_openai_asr_api_key())
+            self.assertNotIn("openai_asr_api_key", json.loads(config_path.read_text()))
+
+    def test_keeps_plaintext_legacy_asr_key_when_removal_save_fails(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            config_path.write_text(json.dumps({"openai_asr_api_key": "legacy-test-value"}))
+            config = Config(config_path=config_path)
+
+            with patch.object(config, "_save", return_value=False):
+                self.assertFalse(config.remove_legacy_openai_asr_api_key())
+
+            self.assertEqual(config._config["openai_asr_api_key"], "legacy-test-value")
+
+
 class ConfigStoragePathTests(unittest.TestCase):
     def test_set_storage_path_handles_permission_errors(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

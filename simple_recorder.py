@@ -1759,6 +1759,21 @@ def set_openai_asr_config_cmd(api_url, model):
         }))
 
 
+@cli.command(name='remove-legacy-openai-asr-api-key')
+def remove_legacy_openai_asr_api_key_cmd():
+    """Remove a plaintext legacy ASR key after safeStorage migration.
+
+    The value is never accepted, printed, or logged by this CLI. Electron has
+    already encrypted and read it back before invoking this command.
+    """
+    from src.config import get_config
+    config = get_config()
+    if config.remove_legacy_openai_asr_api_key():
+        print(json.dumps({"success": True}))
+    else:
+        print(json.dumps({"success": False, "error": "Failed to remove legacy ASR key"}))
+
+
 @cli.command(name='onnx-selftest')
 def onnx_selftest_cmd():
     """Prove ONNX Runtime's native libraries load + run inside the bundle.

@@ -1254,6 +1254,20 @@ def _has_spoken_content(text: Optional[str]) -> bool:
     return any(char.isalnum() for char in (text or ""))
 
 
+def _redact_openai_asr_error(message: object, api_key: str = "") -> str:
+    """Remove configured and common credential forms from provider errors."""
+    redacted = str(message)
+    if api_key:
+        redacted = redacted.replace(api_key, "[redacted]")
+    redacted = re.sub(r"(?i)(\bbearer\s+)[^\s,;\]\}\\]+", r"\1[redacted]", redacted)
+    redacted = re.sub(
+        r"(?i)(\b(?:api[_ -]?key|access[_ -]?token|token)\s*[=:]\s*)[^\s,;\]\}\\]+",
+        r"\1[redacted]",
+        redacted,
+    )
+    return re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}", "[redacted]", redacted)
+
+
 def _tag_channel_segments(
     asr_segments: list[dict],
     channel_path: Optional[Path],
@@ -1261,7 +1275,7 @@ def _tag_channel_segments(
     legacy_label: str,
     allow_self_match: bool = False,
     clusters_out: Optional[dict] = None,
-) -> list[tuple[float, str, str, Optional[str]]]:
+) -> list[tuple[Optional[float], str, str, Optional[str]]]:
     """Build (start, label, text, raw_diarization_speaker_id) tuples for
     one channel's ASR segments. raw_diarization_speaker_id is the EXACT
     diarizer cluster id that produced this segment (e.g. "SPEAKER_2"), or
@@ -1303,6 +1317,15 @@ def _tag_channel_segments(
     if not asr_segments:
         return []
 
+    # Whole-channel JSON/text replies carry valid speech but no timing. Their
+    # synthetic zero offset is not usable for acoustic diarization and must
+    # never become a fabricated [00:00] transcript marker.
+    has_untimed_segments = any(
+        segment.get("has_timestamps") is False
+        or (float(segment.get("start") or 0.0) == 0.0 and float(segment.get("end") or 0.0) == 0.0)
+        for segment in asr_segments
+    )
+
     # ASR can emit punctuation-only tail content for digital silence
     # (observed as a standalone "." after macOS `say` speech). Treating any
     # non-empty string as speech lets that artifact acquire its own diarizer
@@ -1330,7 +1353,7 @@ def _tag_channel_segments(
     # Left None for a real diarization failure (nothing to look up).
     diar_segments_for_provenance: Optional[list] = None
 
-    if channel_path is not None:
+    if channel_path is not None and not has_untimed_segments:
         timeout = max(STENO_DIARIZE_TIMEOUT_FLOOR_S, int(duration_seconds or 0))
         logger.info(f"Diarizing {legacy_label} channel acoustically (up to {timeout}s)...")
         print(f"PROGRESS:diarize:{legacy_label}:start", flush=True)
@@ -1414,14 +1437,18 @@ def _tag_channel_segments(
         finally:
             print(f"PROGRESS:diarize:{legacy_label}:done", flush=True)
 
-    legacy_tagged: list[tuple[float, str, str, Optional[str]]] = []
+    legacy_tagged: list[tuple[Optional[float], str, str, Optional[str]]] = []
     for s in asr_segments:
         text = (s.get("text") or "").strip()
         if not _has_spoken_content(text):
             continue
-        start = float(s.get("start") or 0.0)
+        has_timestamps = not (
+            s.get("has_timestamps") is False
+            or (float(s.get("start") or 0.0) == 0.0 and float(s.get("end") or 0.0) == 0.0)
+        )
+        start = float(s.get("start") or 0.0) if has_timestamps else None
         raw_sid = None
-        if diar_segments_for_provenance:
+        if diar_segments_for_provenance and start is not None:
             # Looked up per-ASR-segment (not one id claimed for the whole
             # span) -- reuses the same containing/nearest-midpoint logic
             # _assign_asr_segments_to_diar_segments already relies on, but
@@ -1489,7 +1516,7 @@ class _DiarisedTurnAssembly:
 
 
 def _assemble_diarised_turns(
-    tagged: list[tuple[float, str, str, str, Optional[str]]],
+    tagged: list[tuple],
 ) -> _DiarisedTurnAssembly:
     """Build the shared transcript and provenance representation.
 
@@ -1499,32 +1526,44 @@ def _assemble_diarised_turns(
     Adjacent text is collapsed only when its visible label and full source
     provenance match; unplaceable text therefore cannot inherit a cluster.
     """
-    turns: list[tuple[float, str, list[str], str, Optional[str]]] = []
-    for start, speaker, text, channel, raw_sid in tagged:
+    turns: list[tuple[float, str, list[str], str, Optional[str], bool]] = []
+    for item in tagged:
+        if len(item) == 5:
+            start, speaker, text, channel, raw_sid = item
+            has_timestamps = True
+        else:
+            start, speaker, text, channel, raw_sid, has_timestamps = item
         if (
             turns
             and turns[-1][1] == speaker
             and turns[-1][3] == channel
             and turns[-1][4] == raw_sid
+            and turns[-1][5] == has_timestamps
         ):
             turns[-1][2].append(text)
         else:
-            turns.append((start, speaker, [text], channel, raw_sid))
+            turns.append((start, speaker, [text], channel, raw_sid, has_timestamps))
 
-    plain_parts = [' '.join(parts) for _start, _speaker, parts, _channel, _raw_sid in turns]
-    distinct_labels = {speaker for _start, speaker, _parts, _channel, _raw_sid in turns}
+    plain_parts = [' '.join(parts) for _start, _speaker, parts, _channel, _raw_sid, _has_timestamps in turns]
+    distinct_labels = {speaker for _start, speaker, _parts, _channel, _raw_sid, _has_timestamps in turns}
     is_diarised = len(distinct_labels) > 1
     if not is_diarised:
         return _DiarisedTurnAssembly(plain_parts, None, False, [])
 
     labelled_parts = [
-        f"[{_format_timestamp(start)}] [{speaker}] {' '.join(parts)}"
-        for start, speaker, parts, _channel, _raw_sid in turns
+        (f"[{_format_timestamp(start)}] " if has_timestamps else "")
+        + f"[{speaker}] {' '.join(parts)}"
+        for start, speaker, parts, _channel, _raw_sid, has_timestamps in turns
     ]
-    turn_manifest = [
-        {"start": start, "channel": channel, "diarization_speaker_id": raw_sid}
-        for start, _speaker, _parts, channel, raw_sid in turns
-    ]
+    # Exact speaker relabeling relies on visible [MM:SS] markers. Untimed
+    # provider output deliberately has none, so do not produce a misleading
+    # manifest that a later relabeler could interpret as timestamp evidence.
+    turn_manifest = (
+        [] if any(not has_timestamps for *_parts, has_timestamps in turns) else [
+            {"start": start, "channel": channel, "diarization_speaker_id": raw_sid}
+            for start, _speaker, _parts, channel, raw_sid, _has_timestamps in turns
+        ]
+    )
     return _DiarisedTurnAssembly(
         plain_parts,
         "\n\n".join(labelled_parts),
@@ -1874,7 +1913,7 @@ class WhisperTranscriber:
 
         logger.info(
             "openai-asr: POST %s  model=%s  file=%s",
-            endpoint, model, audio_filepath.name,
+            _redact_openai_asr_error(endpoint, api_key), model, audio_filepath.name,
         )
 
         if not api_key:
@@ -1969,7 +2008,11 @@ class WhisperTranscriber:
                     method="POST",
                 )
                 try:
-                    with opener.open(req, timeout=300) as resp:
+                    # urllib has no progress callback while upload/response is
+                    # blocked. Keep the parent watchdog alive during each
+                    # bounded request; the context joins its daemon helper on
+                    # every completion and error path.
+                    with _heartbeat_while_waiting("openai-asr-request"), opener.open(req, timeout=300) as resp:
                         content_type = resp.headers.get("Content-Type", "") or ""
                         return resp.read(), content_type
                 except urllib.error.HTTPError as e:
@@ -1980,18 +2023,18 @@ class WhisperTranscriber:
                         continue
                     err_body = e.read().decode(errors="replace")
                     e.close()
-                    err_body = re.sub(r"Bearer\s+\S+", "Bearer [redacted]", err_body)
-                    err_body = re.sub(
-                        r"sk-[A-Za-z0-9_\-]{8,}", "[redacted]", err_body
-                    )[:500]
+                    err_body = _redact_openai_asr_error(err_body, api_key)[:500]
                     raise RuntimeError(
                         f"openai-asr HTTP {e.code}: {err_body}"
                     ) from e
-                except urllib.error.URLError:
+                except urllib.error.URLError as error:
                     if attempt == 0:
                         time.sleep(2)
                         continue
-                    raise
+                    raise RuntimeError(
+                        "openai-asr request failed: "
+                        f"{_redact_openai_asr_error(error, api_key)}"
+                    ) from error
             raise RuntimeError("openai-asr request retry loop exhausted")
 
         def _can_fallback(error: Exception) -> bool:
@@ -2007,7 +2050,8 @@ class WhisperTranscriber:
             return {
                 "text": text or None,
                 "segments": (
-                    [{"text": text, "start": 0.0, "end": 0.0}] if text else []
+                    [{"text": text, "start": 0.0, "end": 0.0, "has_timestamps": False}]
+                    if text else []
                 ),
                 "duration_seconds": None,
                 "detected_language": detected_lang,
@@ -2037,6 +2081,9 @@ class WhisperTranscriber:
                         "'segments'"
                     )
                 raw_segs = data.get("segments") or []
+                if raw_text and not raw_segs:
+                    logger.info("openai-asr verbose_json response has text without segments")
+                    return _text_result(raw_text)
                 detected_lang = data.get("language") or (
                     None if language == "auto" else language
                 )
@@ -2179,13 +2226,21 @@ class WhisperTranscriber:
                 if chunk_text:
                     texts.append(chunk_text)
                 for segment in chunk_result.get("segments") or []:
-                    segments.append(
-                        {
-                            "text": segment["text"],
-                            "start": float(segment["start"]) + chunk_start_seconds,
-                            "end": float(segment["end"]) + chunk_start_seconds,
-                        }
-                    )
+                    has_timestamps = segment.get("has_timestamps") is not False
+                    merged_segment = {
+                        "text": segment["text"],
+                        "start": (
+                            float(segment["start"]) + chunk_start_seconds
+                            if has_timestamps else 0.0
+                        ),
+                        "end": (
+                            float(segment["end"]) + chunk_start_seconds
+                            if has_timestamps else 0.0
+                        ),
+                    }
+                    if not has_timestamps:
+                        merged_segment["has_timestamps"] = False
+                    segments.append(merged_segment)
                 if (
                     detected_language is None
                     and chunk_result.get("detected_language")
@@ -2810,9 +2865,9 @@ class WhisperTranscriber:
             identity_enabled = _identity_matching_enabled()
             mic_clusters: dict = {}
             system_clusters: dict = {}
-            tagged: list[tuple[float, str, str, str, Optional[str]]] = []
+            tagged: list[tuple[float, str, str, str, Optional[str], bool]] = []
             tagged.extend(
-                (start, label, text, "mic", raw_sid)
+                (start or 0.0, label, text, "mic", raw_sid, start is not None)
                 for start, label, text, raw_sid in _tag_channel_segments(
                     mic_segments, mic_path, duration, "You",
                     allow_self_match=identity_enabled,
@@ -2820,14 +2875,23 @@ class WhisperTranscriber:
                 )
             )
             tagged.extend(
-                (start, label, text, "system", raw_sid)
+                (start or 0.0, label, text, "system", raw_sid, start is not None)
                 for start, label, text, raw_sid in _tag_channel_segments(
                     system_segments, system_path, duration, "Others",
                     clusters_out=system_clusters if identity_enabled else None,
                 )
             )
             tagged.sort(key=lambda t: t[0])
-            tagged = _resolve_speaker_placeholders(tagged)
+            # Placeholder resolution predates the untimed bit; resolve labels
+            # without altering it, then restore the positional timing metadata.
+            resolved_labels = _resolve_speaker_placeholders([
+                (start, label, text, channel, raw_sid)
+                for start, label, text, channel, raw_sid, _has_timestamps in tagged
+            ])
+            tagged = [
+                (*resolved, original[5])
+                for resolved, original in zip(resolved_labels, tagged)
+            ]
 
             # Same {"mic"|"system": {"recording_type", "clusters"}} shape
             # write_speakers_sidecar expects -- lets the caller
@@ -2919,7 +2983,7 @@ class WhisperTranscriber:
         identity_enabled = _identity_matching_enabled()
         mono_clusters: dict = {}
         tagged = [
-            (start, label, text, "mic", raw_sid)
+            (start or 0.0, label, text, "mic", raw_sid, start is not None)
             for start, label, text, raw_sid in _tag_channel_segments(
                 asr_segments, audio_filepath, duration, "You",
                 allow_self_match=identity_enabled,
@@ -2927,7 +2991,14 @@ class WhisperTranscriber:
             )
         ]
         tagged.sort(key=lambda t: t[0])
-        tagged = _resolve_speaker_placeholders(tagged)
+        resolved_labels = _resolve_speaker_placeholders([
+            (start, label, text, channel, raw_sid)
+            for start, label, text, channel, raw_sid, _has_timestamps in tagged
+        ])
+        tagged = [
+            (*resolved, original[5])
+            for resolved, original in zip(resolved_labels, tagged)
+        ]
 
         assembled = _assemble_diarised_turns(tagged)
         result['speaker_clusters'] = {}

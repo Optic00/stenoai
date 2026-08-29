@@ -396,6 +396,7 @@ function OpenAiAsrConfig() {
   const [apiUrl, setApiUrl] = React.useState('');
   const [model, setModel] = React.useState('');
   const [apiKey, setApiKey] = React.useState('');
+  const [saveError, setSaveError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     if (config.data) {
@@ -405,6 +406,36 @@ function OpenAiAsrConfig() {
   }, [config.data?.api_url, config.data?.model]);
 
   const keySet = config.data?.api_key_set ?? false;
+
+  const saveEndpointField = (field: 'api_url' | 'model', value: string) => {
+    void setConfig.mutateAsync({ [field]: value })
+      .then((saved) => {
+        setSaveError(null);
+        if (field === 'api_url') setApiUrl(saved.api_url ?? DEFAULT_OPENAI_ASR_URL);
+        else setModel(saved.model ?? DEFAULT_OPENAI_ASR_MODEL);
+      })
+      .catch(() => {
+        // The backend rejected or failed to save the edit. Restore the
+        // displayed committed value instead of leaving a value that is not
+        // actually active, especially important for an audio-upload endpoint.
+        setSaveError('Could not save this cloud transcription setting. The previous value is still active.');
+        if (field === 'api_url') setApiUrl(config.data?.api_url ?? DEFAULT_OPENAI_ASR_URL);
+        else setModel(config.data?.model ?? DEFAULT_OPENAI_ASR_MODEL);
+      });
+  };
+
+  const saveKey = (key: string) => {
+    void setKey.mutateAsync(key)
+      .then(() => setSaveError(null))
+      .catch(() => {
+        setSaveError('Could not securely save the API key. The existing key was not changed.');
+      })
+      .finally(() => {
+        // Do not retain a plaintext credential in renderer state after either
+        // outcome. The visible error is sufficient for retry.
+        setApiKey('');
+      });
+  };
 
   return (
     <div
@@ -429,7 +460,7 @@ function OpenAiAsrConfig() {
             // otherwise the stale value would return on the next refresh.
             const next = apiUrl.trim() || DEFAULT_OPENAI_ASR_URL;
             if (next !== apiUrl) setApiUrl(next);
-            setConfig.mutate({ api_url: next });
+            saveEndpointField('api_url', next);
           }}
           className={COMPACT_INPUT}
         />
@@ -450,7 +481,7 @@ function OpenAiAsrConfig() {
             // rather than persisting a blank (which the backend rejects).
             const next = model.trim() || DEFAULT_OPENAI_ASR_MODEL;
             if (next !== model) setModel(next);
-            setConfig.mutate({ model: next });
+            saveEndpointField('model', next);
           }}
           className={COMPACT_INPUT}
         />
@@ -470,9 +501,7 @@ function OpenAiAsrConfig() {
             placeholder={keySet ? '••••••••' : 'sk-…'}
             onBlur={() => {
               if (apiKey) {
-                setKey.mutate(apiKey);
-                // Don't retain the plaintext key in component state once saved.
-                setApiKey('');
+                saveKey(apiKey);
               }
             }}
             className={cn(COMPACT_INPUT, 'flex-1')}
@@ -484,7 +513,7 @@ function OpenAiAsrConfig() {
               className={COMPACT_BTN}
               onClick={() => {
                 setApiKey('');
-                setKey.mutate('');
+                saveKey('');
               }}
             >
               Clear
@@ -496,6 +525,11 @@ function OpenAiAsrConfig() {
             ? 'A key is saved. Enter a new one to replace it, or clear it.'
             : 'Stored encrypted on your device — never written to config or sent anywhere except your chosen endpoint.'}
         </div>
+        {saveError && (
+          <p role="alert" className="mt-1 text-[11.5px]" style={{ color: 'var(--danger, #b42318)' }}>
+            {saveError}
+          </p>
+        )}
       </div>
     </div>
   );

@@ -1,5 +1,6 @@
 """Tests for the OpenAI-compatible batch transcription backend."""
 
+import contextlib
 import io
 import json
 import tempfile
@@ -163,6 +164,20 @@ class OpenAiAsrTests(unittest.TestCase):
         self.assertEqual(result["segments"][0]["start"], 0.5)
         self.assertEqual(result["detected_language"], "en")
 
+    def test_request_wait_is_guarded_by_a_heartbeat_context(self):
+        transcriber = _build_transcriber()
+        opener = _FakeOpener([_json_response({"text": "short", "segments": []})])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch("urllib.request.build_opener", return_value=opener), patch(
+                "src.transcriber._heartbeat_while_waiting",
+                return_value=contextlib.nullcontext(),
+            ) as heartbeat:
+                transcriber._run_openai_asr(audio, language="en")
+
+        heartbeat.assert_called_once_with("openai-asr-request")
+
     def test_oversized_non_wav_names_25_mb_limit(self):
         transcriber = _build_transcriber()
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -277,9 +292,27 @@ class OpenAiAsrTests(unittest.TestCase):
         self.assertIn(b'name="response_format"\r\n\r\njson\r\n', opener.requests[1]["prefix"])
         self.assertEqual(
             result["segments"],
-            [{"text": "json response", "start": 0.0, "end": 0.0}],
+            [{
+                "text": "json response", "start": 0.0, "end": 0.0,
+                "has_timestamps": False,
+            }],
         )
         self.assertEqual(result["detected_language"], "de")
+
+    def test_verbose_json_text_without_segments_is_preserved_as_untimed(self):
+        transcriber = _build_transcriber()
+        opener = _FakeOpener([_json_response({"text": "whole-channel response"})])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch("urllib.request.build_opener", return_value=opener):
+                result = transcriber._run_openai_asr(audio, language="en")
+
+        self.assertEqual(result["text"], "whole-channel response")
+        self.assertEqual(result["segments"], [{
+            "text": "whole-channel response", "start": 0.0, "end": 0.0,
+            "has_timestamps": False,
+        }])
 
     def test_429_is_retried_once_then_succeeds(self):
         transcriber = _build_transcriber()
@@ -323,6 +356,26 @@ class OpenAiAsrTests(unittest.TestCase):
         self.assertNotIn("sk-abcdefgh12345678", message)
         self.assertIn("Bearer [redacted]", message)
         self.assertIn("[redacted]", message)
+
+    def test_http_error_redacts_configured_non_openai_key_and_token_field(self):
+        transcriber = _build_transcriber()
+        configured_key = "test-provider-credential-987654"
+        transcriber._openai_asr_api_key = configured_key
+        opener = _FakeOpener([
+            _http_error(401, f"token={configured_key} api_key=other-test-token".encode())
+        ])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio = Path(tmp_dir) / "short.wav"
+            _write_pcm_wav(audio, frame_count=16000)
+            with patch("urllib.request.build_opener", return_value=opener):
+                with self.assertRaises(RuntimeError) as raised:
+                    transcriber._run_openai_asr(audio, language="en")
+
+        message = str(raised.exception)
+        self.assertNotIn(configured_key, message)
+        self.assertNotIn("other-test-token", message)
+        self.assertIn("token=[redacted]", message)
+        self.assertIn("api_key=[redacted]", message)
 
     def test_url_guard_rejects_remote_http_and_accepts_loopback_or_https(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
