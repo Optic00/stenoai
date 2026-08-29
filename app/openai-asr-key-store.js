@@ -26,12 +26,35 @@ function normalizeOpenAiAsrOrigin(apiUrl) {
   }
 }
 
-function legacyCredentialSnapshotDigest(key, apiUrl) {
+function legacyCredentialSnapshotDigest(rawKey, apiUrl) {
   // Match src.config._legacy_openai_asr_snapshot_digest exactly. The digest
-  // is a compare-and-delete capability, never a substitute credential.
-  return crypto.createHash('sha256')
-    .update(JSON.stringify([key, typeof apiUrl === 'string' ? apiUrl : null]), 'utf8')
-    .digest('hex');
+  // covers the raw on-disk values, while ``key`` below is separately
+  // normalised and validated for migration. It is a compare-and-delete
+  // capability, never a substitute credential. Do not use JSON UTF-8 here:
+  // JavaScript strings can contain unpaired UTF-16 surrogates, which JSON and
+  // Python encode differently. This versioned framing hashes the exact UTF-16
+  // code units instead, including those otherwise-invalid raw legacy values.
+  const appendString = (chunks, value) => {
+    const codeUnits = value.length;
+    if (codeUnits > 0xffffffff) throw new Error('Legacy credential snapshot is too large');
+    const length = Buffer.allocUnsafe(4);
+    length.writeUInt32BE(codeUnits);
+    const encoded = Buffer.allocUnsafe(codeUnits * 2);
+    for (let index = 0; index < codeUnits; index += 1) {
+      encoded.writeUInt16BE(value.charCodeAt(index), index * 2);
+    }
+    chunks.push(length, encoded);
+  };
+
+  const chunks = [Buffer.from('stenoai:legacy-openai-asr-snapshot:v1\0', 'ascii'), Buffer.from([1])];
+  appendString(chunks, rawKey);
+  if (typeof apiUrl === 'string') {
+    chunks.push(Buffer.from([1]));
+    appendString(chunks, apiUrl);
+  } else {
+    chunks.push(Buffer.from([0]));
+  }
+  return crypto.createHash('sha256').update(Buffer.concat(chunks)).digest('hex');
 }
 
 function readLegacyCredentialSnapshot({ fs, configPath }) {
@@ -40,10 +63,15 @@ function readLegacyCredentialSnapshot({ fs, configPath }) {
     // This single read is the authority for both fields. A later endpoint
     // change must never bind this snapshot's plaintext key to another origin.
     const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    const key = config && typeof config.openai_asr_api_key === 'string'
-      ? config.openai_asr_api_key.trim()
-      : '';
-    if (!key) return null;
+    const rawKey = config && typeof config.openai_asr_api_key === 'string'
+      ? config.openai_asr_api_key
+      : null;
+    // Every non-empty raw string gets a CAS snapshot so invalid legacy
+    // plaintext can still be removed. Only the separately normalised and
+    // printable-ASCII value may ever reach safeStorage.
+    if (rawKey === null || rawKey.length === 0) return null;
+    const normalisedKey = rawKey.trim();
+    const key = isValidOpenAiAsrApiKey(normalisedKey) ? normalisedKey : null;
     const apiUrl = config && Object.prototype.hasOwnProperty.call(config, 'openai_asr_api_url')
       ? config.openai_asr_api_url
       : OPENAI_ASR_DEFAULT_URL;
@@ -51,7 +79,7 @@ function readLegacyCredentialSnapshot({ fs, configPath }) {
     return {
       key,
       origin,
-      snapshotDigest: legacyCredentialSnapshotDigest(key, apiUrl),
+      snapshotDigest: legacyCredentialSnapshotDigest(rawKey, apiUrl),
     };
   } catch (_) {
     return null;

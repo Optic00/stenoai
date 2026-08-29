@@ -53,20 +53,39 @@ def _legacy_openai_asr_snapshot_digest(config: Dict[str, Any]) -> Optional[str]:
     Electron reads the same two fields once before invoking the cleanup CLI.
     The digest lets the CLI prove that neither the plaintext key nor its
     endpoint value changed in the intervening time, without putting the key in
-    argv, stdout, or logs. Keep this compact JSON shape aligned with
+    argv, stdout, or logs. Keep its versioned UTF-16BE framing aligned with
     ``legacyCredentialSnapshotDigest`` in app/openai-asr-key-store.js.
     """
-    legacy_key = config.get("openai_asr_api_key")
-    if not isinstance(legacy_key, str) or not legacy_key.strip():
+    raw_legacy_key = config.get("openai_asr_api_key")
+    # This is deliberately a raw snapshot, not Python's whitespace
+    # normalisation. Electron uses the same raw string for its SHA-256 value;
+    # a non-empty but invalid old key still needs CAS-bound deletion, while
+    # only Electron's separately validated normalised key can reach
+    # safeStorage.
+    if not isinstance(raw_legacy_key, str) or raw_legacy_key == "":
         return None
     api_url = config.get("openai_asr_api_url", OPENAI_ASR_DEFAULT_URL)
     if not isinstance(api_url, str):
         api_url = None
-    canonical = json.dumps(
-        [legacy_key.strip(), api_url],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    # JavaScript strings are UTF-16 code units and can contain unpaired
+    # surrogates. ``surrogatepass`` gives Python the identical code-unit bytes
+    # so every non-empty raw JSON string remains eligible for CAS cleanup.
+    def append_string(canonical: bytearray, value: str) -> None:
+        encoded = value.encode("utf-16-be", "surrogatepass")
+        code_units = len(encoded) // 2
+        if code_units > 0xFFFFFFFF:
+            raise ValueError("Legacy credential snapshot is too large")
+        canonical.extend(code_units.to_bytes(4, "big"))
+        canonical.extend(encoded)
+
+    canonical = bytearray(b"stenoai:legacy-openai-asr-snapshot:v1\0")
+    canonical.append(1)
+    append_string(canonical, raw_legacy_key)
+    if api_url is None:
+        canonical.append(0)
+    else:
+        canonical.append(1)
+        append_string(canonical, api_url)
     return hashlib.sha256(canonical).hexdigest()
 
 

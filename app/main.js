@@ -9019,7 +9019,7 @@ function readLegacyOpenAiAsrCredential() {
 
 function secureLegacyOpenAiAsrApiKey() {
   const legacy = readLegacyOpenAiAsrCredential();
-  if (!legacy || !legacy.origin) return false;
+  if (!legacy || !legacy.key || !legacy.origin) return false;
   const stored = loadOpenAiAsrKey(legacy.origin);
   const action = legacyKeyMigrationAction({
     cleared: isOpenAiAsrKeyCleared(),
@@ -9039,13 +9039,6 @@ function secureLegacyOpenAiAsrApiKey() {
 async function migrateLegacyOpenAiAsrApiKey() {
   const legacy = readLegacyOpenAiAsrCredential();
   if (!legacy) return true;
-  let stored = legacy.origin ? loadOpenAiAsrKey(legacy.origin) : null;
-  const action = legacyKeyMigrationAction({
-    cleared: isOpenAiAsrKeyCleared(),
-    legacyKey: legacy.key,
-    storedKey: stored,
-  });
-  if (action === 'none') return false;
   const removeLegacyKey = async () => {
     try {
       const raw = await runPythonScript(
@@ -9059,10 +9052,18 @@ async function migrateLegacyOpenAiAsrApiKey() {
       return false;
     }
   };
-  // An invalid legacy endpoint cannot safely receive a migrated credential.
-  // Its plaintext nevertheless must not survive forever; the digest-bound
-  // CLI cleanup removes only the exact snapshot we read above.
-  if (!legacy.origin) return removeLegacyKey();
+  // Invalid raw legacy values must never become encrypted credentials. They
+  // still have a raw-digest CAS snapshot, so remove only that exact stale
+  // plaintext instead of leaving it in config.json indefinitely.
+  if (!legacy.key || !legacy.origin) return removeLegacyKey();
+
+  let stored = loadOpenAiAsrKey(legacy.origin);
+  const action = legacyKeyMigrationAction({
+    cleared: isOpenAiAsrKeyCleared(),
+    legacyKey: legacy.key,
+    storedKey: stored,
+  });
+  if (action === 'none') return false;
   if (action === 'remove-legacy') return removeLegacyKey();
   if (action === 'secure') {
     try {

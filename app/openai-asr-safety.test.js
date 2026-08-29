@@ -141,6 +141,29 @@ test('legacy snapshot digest preserves the raw URL value across migration edge c
   });
 });
 
+test('legacy snapshots digest raw keys but expose only valid normalized credentials', () => {
+  const cases = [
+    { rawKey: '\ufefflegacy-key', key: 'legacy-key' },
+    { rawKey: '\u001clegacy-key', key: null },
+    { rawKey: ' \t ', key: null },
+    { rawKey: '\ud800legacy-key', key: null },
+  ];
+  withKeyDirectory((keyPath) => {
+    const configPath = path.join(path.dirname(keyPath), 'config.json');
+    for (const { rawKey, key } of cases) {
+      fs.writeFileSync(configPath, JSON.stringify({
+        openai_asr_api_key: rawKey,
+      }));
+      const snapshot = readLegacyCredentialSnapshot({ fs, configPath });
+      assert.strictEqual(snapshot.key, key);
+      assert.strictEqual(
+        snapshot.snapshotDigest,
+        legacyCredentialSnapshotDigest(rawKey, 'https://api.openai.com/v1'),
+      );
+    }
+  });
+});
+
 test('main sends only the legacy snapshot digest to the cleanup CLI', () => {
   const migration = source.slice(
     source.indexOf('async function migrateLegacyOpenAiAsrApiKey()'),
@@ -148,6 +171,7 @@ test('main sends only the legacy snapshot digest to the cleanup CLI', () => {
   );
   assert.match(migration, /STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST: legacy\.snapshotDigest/);
   assert.doesNotMatch(migration, /\['remove-legacy-openai-asr-api-key',\s*legacy\.key\]/);
+  assert.match(migration, /if \(!legacy\.key \|\| !legacy\.origin\) return removeLegacyKey\(\)/);
 });
 
 test('API key validation rejects controls, whitespace, non-ASCII, and oversized values', () => {

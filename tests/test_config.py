@@ -14,20 +14,24 @@ from src.config import Config
 class OpenAiAsrCredentialMigrationTests(unittest.TestCase):
     def test_snapshot_digest_matches_node_for_raw_url_edge_cases(self):
         # These are SHA-256 vectors produced by
-        # app/openai-asr-key-store.js's JSON.stringify([key, apiUrl]) form.
-        # The raw value, not a normalised origin, makes a concurrent endpoint
-        # replacement fail the CLI's compare-and-delete.
+        # app/openai-asr-key-store.js's versioned UTF-16BE framing. The raw
+        # value, not a normalised origin, makes a concurrent endpoint
+        # replacement fail the CLI's compare-and-delete. UTF-16 code units
+        # include unpaired surrogates so invalid legacy text remains cleanable.
         cases = (
-            ({}, "d57807b16ec55d7997156550640a33efad503cc8ccb26183638a5f11b41cad9a"),
-            ({"openai_asr_api_url": ""}, "01cc88e9c6d1714d089017816bb5edc1ce27bc81789833bfbedff2435188a10f"),
-            ({"openai_asr_api_url": 42}, "bc014f8501b79187463391288983100365e7d3723d3a397d0dd323445fe5a97f"),
-            ({"openai_asr_api_url": "  https://api.example/v1  "}, "3e07ed0ad794fc7bf7fc674dc1b06832d3ebc5f0cc04cadde8d963f77cfab3b6"),
+            ("legacy-key", {}, "2bc3e2811d497bd32c5e13a204d9facd2cb88103f8155b911429c9cddb3d55f0"),
+            ("legacy-key", {"openai_asr_api_url": ""}, "7918deaa64299ed799179fb64a17eba5b5de952762d5e15a16c533595a948c00"),
+            ("legacy-key", {"openai_asr_api_url": 42}, "8db495143b6300cc8328119233e8dfaa7a855f10e2f8277f565e93b53c546a17"),
+            ("legacy-key", {"openai_asr_api_url": "  https://api.example/v1  "}, "3c5006d608c0b37eb38a392b8d177b49fd78f16025f40f96ee432f3d9535bab0"),
+            ("\ufefflegacy-key", {}, "77d67fa01f41e32f0c3868e741ec59d6fb7e88cf00c607823948a9940eb37344"),
+            ("\x1clegacy-key", {}, "42452496c22c0ae4e32d3aabc6e66f9f55c43e0e9f14f3b17aaa7c031725adee"),
+            ("\ud800legacy", {}, "6d7fca01597fc2361653d27d2036b08df282564737641f0ce48fafc6acc3592d"),
         )
-        for config, expected_digest in cases:
-            with self.subTest(config=config):
+        for raw_key, config, expected_digest in cases:
+            with self.subTest(raw_key=raw_key, config=config):
                 self.assertEqual(
                     config_mod._legacy_openai_asr_snapshot_digest({
-                        "openai_asr_api_key": "legacy-key", **config,
+                        "openai_asr_api_key": raw_key, **config,
                     }),
                     expected_digest,
                 )
@@ -94,6 +98,36 @@ class OpenAiAsrCredentialMigrationTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
             self.assertTrue(json.loads(result.output)["success"])
             self.assertNotIn("openai_asr_api_key", json.loads(config_path.read_text()))
+
+    def test_cli_removes_unicode_whitespace_raw_keys_by_raw_snapshot_digest(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = Path(tmp_dir) / "config.json"
+            for raw_key in (
+                "\ufefflegacy-key",
+                "\x1cnot-a-valid-credential",
+                " \t ",
+                "\ud800not-a-valid-credential",
+            ):
+                with self.subTest(raw_key=raw_key):
+                    contents = {
+                        "openai_asr_api_key": raw_key,
+                        "openai_asr_api_url": "https://api.example/v1",
+                    }
+                    config_path.write_text(json.dumps(contents))
+                    config = Config(config_path=config_path)
+                    digest = config_mod._legacy_openai_asr_snapshot_digest(contents)
+
+                    with patch("src.config.get_config", return_value=config):
+                        result = CliRunner().invoke(
+                            simple_recorder.remove_legacy_openai_asr_api_key_cmd,
+                            env={"STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST": digest},
+                        )
+
+                    self.assertEqual(result.exit_code, 0, result.output)
+                    self.assertTrue(json.loads(result.output)["success"])
+                    self.assertNotIn(
+                        "openai_asr_api_key", json.loads(config_path.read_text())
+                    )
 
     def test_digest_bound_removal_keeps_a_concurrent_replacement(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
