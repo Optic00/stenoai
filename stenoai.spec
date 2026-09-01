@@ -37,6 +37,7 @@ if SPECPATH not in sys.path:
     sys.path.insert(0, SPECPATH)
 
 from scripts.diarize_bundle_guard import require_diarize_sidecar
+from scripts.apple_lm_bundle_guard import resolve_apple_lm_sidecar
 
 # Apple Silicon uses parakeet-mlx for ASR; Windows / Linux use onnx-asr via
 # ONNX Runtime. The two backends live in src/_parakeet_{mlx,onnx}.py and
@@ -251,10 +252,16 @@ _OLLAMA_GPU_MARKERS = ('lib/ollama/cuda', 'lib/ollama/rocm', 'lib/ollama/vulkan'
 #   executable. Windows keeps the old `binaries` path (no libmlx collision there
 #   - the GPU runner libs are pruned above and there's no pip-mlx build).
 ollama_datas: list[tuple[str, str, str]] = []
+apple_lm_datas: list[tuple[str, str, str]] = []
 ollama_bin_dir = os.path.join(SPECPATH, 'bin')
 required_diarize_sidecar = require_diarize_sidecar(
     Path(ollama_bin_dir) / 'steno-diarize',
     platform=sys.platform,
+)
+apple_lm_sidecar = resolve_apple_lm_sidecar(
+    Path(ollama_bin_dir) / 'steno-apple-lm',
+    platform=sys.platform,
+    required=os.environ.get('STENOAI_REQUIRE_APPLE_LM_SIDECAR') == '1',
 )
 if os.path.exists(ollama_bin_dir):
     for root, _dirs, files in os.walk(ollama_bin_dir):
@@ -283,10 +290,13 @@ if os.path.exists(ollama_bin_dir):
             elif (
                 base == 'steno-apple-lm'
                 and _IS_DARWIN
+                and apple_lm_sidecar is not None
             ):
                 # macOS-only Swift SystemLanguageModel sidecar (built by
-                # scripts/build-apple-lm-sidecar.sh).
-                binaries.append((filepath, '.'))
+                # scripts/build-apple-lm-sidecar.sh). Keep it out of Analysis:
+                # a macOS 14 build runner cannot resolve FoundationModels, and
+                # PyInstaller must not rewrite or ad-hoc re-sign this artifact.
+                apple_lm_datas.append(('steno-apple-lm', filepath, 'DATA'))
             elif _IS_DARWIN:
                 # COLLECT DATA TOC 3-tuple: (dest_path_including_filename,
                 # abs_src_path, 'DATA'). Everything lives under ollama/,
@@ -376,6 +386,9 @@ coll = COLLECT(
     # this is an unconditional no-op there). See the ollama_datas rationale
     # above for why these MUST bypass Analysis and land at the COLLECT stage.
     ollama_datas,
+    # The separately-built Apple LM sidecar, copied verbatim for the same
+    # reason as Ollama's runner tree above.
+    apple_lm_datas,
     strip=False,
     upx=_USE_UPX,
     upx_exclude=[],

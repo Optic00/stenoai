@@ -4501,12 +4501,21 @@ def setup_check(as_json):
     else:
         checks.append(("⚠️ whisper-model", "will download on first use (~500MB)"))
 
-    # Check if LLM model is available (Apple System Language Model or ~/.ollama/models/)
-    from src.apple_lm import apple_lm_available, apple_lm_status
-    if sys.platform == "darwin" and apple_lm_available():
+    # Check the configured LLM. Apple availability only satisfies setup when
+    # the user explicitly selected that model; it never changes the selection.
+    from src.apple_lm import (
+        apple_lm_status,
+        apple_lm_unavailable_message,
+        is_apple_system_model,
+    )
+    from src.config import get_config
+    configured_model = get_config().get_model()
+    if is_apple_system_model(configured_model):
         status = apple_lm_status()
-        variant = status.get("variant") or "available"
-        checks.append(("✅ llm-model", f"Apple System Language Model ({variant})"))
+        if status.get("available"):
+            checks.append(("✅ llm-model", "Apple System Language Model (available)"))
+        else:
+            checks.append(("❌ llm-model", apple_lm_unavailable_message(status)))
     else:
         try:
             ollama_models_path = Path.home() / ".ollama" / "models" / "manifests" / "registry.ollama.ai" / "library"
@@ -4731,7 +4740,8 @@ def set_model(model_name):
     config = get_config()
 
     # Validate model
-    if model_name not in config.SUPPORTED_MODELS:
+    from src.apple_lm import is_apple_system_model
+    if model_name not in config.SUPPORTED_MODELS and not is_apple_system_model(model_name):
         print(f"WARNING: Model '{model_name}' is not in the recommended list.")
         print(f"Supported models: {', '.join(config.SUPPORTED_MODELS.keys())}")
         print(f"Setting anyway (make sure it's installed with 'ollama pull {model_name}')")
@@ -9459,11 +9469,6 @@ def resolve_setup_model():
     whether to download. Uses the HTTP API (ollama package), not the binary.
     """
     from src.config import get_config, Config
-    from src.apple_lm import apple_lm_available, APPLE_SYSTEM_MODEL
-
-    if apple_lm_available():
-        print(json.dumps({"installed": APPLE_SYSTEM_MODEL, "pull_target": None}))
-        return
 
     from src.ollama_manager import start_ollama_server
     from src.config import is_apple_silicon

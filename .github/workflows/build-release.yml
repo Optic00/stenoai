@@ -54,8 +54,39 @@ jobs:
         working-directory: app
         run: xvfb-run -a npm run test:e2e -- --project=t1 --grep-invert @perf
 
-  build-macos:
+  build-apple-lm-sidecar:
+    name: Build Apple LM sidecar (macOS 26 SDK)
     needs: gate-smoke
+    runs-on: macos-26
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify selected macOS SDK
+        run: |
+          SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+          SDK_MAJOR="${SDK_VERSION%%.*}"
+          test "$SDK_MAJOR" -ge 26
+          echo "Building with macOS SDK ${SDK_VERSION}"
+
+      - name: Build Apple SystemLanguageModel sidecar
+        run: |
+          chmod +x scripts/build-apple-lm-sidecar.sh
+          ./scripts/build-apple-lm-sidecar.sh arm64
+          test -x bin/steno-apple-lm
+          file bin/steno-apple-lm | grep -q "arm64"
+          vtool -show-build bin/steno-apple-lm | grep -Eq 'minos 26(\.0)?'
+
+      - name: Upload Apple LM sidecar
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-lm-sidecar-arm64
+          path: bin/steno-apple-lm
+          if-no-files-found: error
+          retention-days: 1
+
+  build-macos:
+    needs: [gate-smoke, build-apple-lm-sidecar]
     # Apple-Silicon only as of v0.4.0. macOS 26 (Tahoe) drops Intel and
     # our headline transcription engine (Parakeet TDT v3 via MLX) is
     # Apple-Silicon only, so the Intel build was shipping a degraded
@@ -68,8 +99,12 @@ jobs:
         include:
           - arch: arm64
             build_cmd: build:arm64
+            # Keep the application and Python extension compatibility floor on
+            # Sonoma. The macOS 26-only Apple helper is built in its own job.
             runner: macos-14
     runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.4'
 
     steps:
     - name: Checkout code
@@ -119,6 +154,19 @@ jobs:
         file bin/ollama
         file bin/ollama | grep -q "arm64"
 
+    - name: Download Apple LM sidecar
+      uses: actions/download-artifact@v4
+      with:
+        name: apple-lm-sidecar-arm64
+        path: bin
+
+    - name: Validate Apple LM sidecar artifact
+      run: |
+        chmod +x bin/steno-apple-lm
+        test -x bin/steno-apple-lm
+        file bin/steno-apple-lm | grep -q "arm64"
+        vtool -show-build bin/steno-apple-lm | grep -Eq 'minos 26(\.0)?'
+
     - name: Build mic-monitor helper (Swift)
       run: |
         chmod +x scripts/build-mic-monitor.sh
@@ -137,6 +185,8 @@ jobs:
         file bin/steno-diarize | grep -q "arm64"
 
     - name: Build Python backend with PyInstaller
+      env:
+        STENOAI_REQUIRE_APPLE_LM_SIDECAR: '1'
       run: |
         pyinstaller stenoai.spec --noconfirm
         # Verify build and architecture
@@ -144,6 +194,8 @@ jobs:
         file dist/stenoai/stenoai
         test -x dist/stenoai/_internal/steno-diarize
         file dist/stenoai/_internal/steno-diarize | grep -q "arm64"
+        test -x dist/stenoai/_internal/steno-apple-lm
+        file dist/stenoai/_internal/steno-apple-lm | grep -q "arm64"
         echo "Expected arch: ${{ matrix.arch }}"
         echo "Backend built successfully"
 
@@ -178,6 +230,17 @@ jobs:
         APPLE_ID: ${{ secrets.APPLE_ID }}
         APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+    - name: Verify signed Apple LM sidecar in packaged app
+      run: |
+        SIDECAR="app/dist/mac-arm64/Steno.app/Contents/Resources/stenoai/_internal/steno-apple-lm"
+        test -x "$SIDECAR"
+        file "$SIDECAR" | grep -q "arm64"
+        codesign --verify --strict --verbose=2 "$SIDECAR"
+        SIGNATURE_INFO="$(codesign -dvv "$SIDECAR" 2>&1)"
+        grep -q 'Authority=Developer ID Application' <<< "$SIGNATURE_INFO"
+        grep -Eq 'flags=.*runtime' <<< "$SIGNATURE_INFO"
+        codesign --verify --deep --strict --verbose=2 app/dist/mac-arm64/Steno.app
 
     # Write the macOS floor into the update manifest (#432). The runtime gate in
     # app/update-os-gate.js cannot protect the installs that are actually at

@@ -48,22 +48,13 @@ private func printStatus() throws {
     let model = SystemLanguageModel.default
     switch model.availability {
     case .available:
-        var payload: [String: Any] = ["available": true]
-        if #available(macOS 27.0, *) {
-            let variant = model.variant
-            if variant == .coreAdvanced3 {
-                payload["variant"] = "coreAdvanced3"
-            } else if variant == .core3 {
-                payload["variant"] = "core3"
-            } else {
-                payload["variant"] = "unknown"
-            }
-            payload["display_name"] = variant.displayName
-        } else {
-            payload["variant"] = "core3"
-            payload["display_name"] = "Apple Intelligence"
-        }
-        try printJSON(payload)
+        // Build against the macOS 26 SDK used by the release runner. Variant
+        // inspection is a macOS 27 SDK API, and #available cannot make that
+        // symbol compile against an older SDK. The OS still chooses the model.
+        try printJSON([
+            "available": true,
+            "display_name": "Apple Intelligence",
+        ])
     case .unavailable(let reason):
         try printJSON([
             "available": false,

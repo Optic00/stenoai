@@ -9,14 +9,16 @@ After transcription, Steno passes the transcript to a language model to generate
 
 | Model | Size | Notes |
 |-------|------|-------|
-| `apple:system` (Apple Intelligence) | Built-in | Default on macOS when available. Uses SystemLanguageModel Advanced with automatic 3B Core fallback. |
-| `gemma4:e2b-it-qat` | ~4.3GB (~6.5GB on Apple Silicon) | Default Ollama fallback. Fast, 128K context. |
+| `apple:system` (Apple Intelligence) | Built-in | Optional on macOS 26+. The OS manages the on-device SystemLanguageModel. |
+| `gemma4:e2b-it-qat` | ~4.3GB (~6.5GB on Apple Silicon) | Default local model. Fast, 128K context. |
 | `gemma4:e4b-it-qat` | ~6.1GB (~8.8GB on Apple Silicon) | Higher quality, modest footprint. |
 | `qwen3.5:9b` | ~6.6GB | Strong at structured output and action items. |
 | `gemma4:12b-it-qat` | ~7.2GB (~7.7GB on Apple Silicon) | 256K context, best for long meetings. |
 | `gpt-oss:20b` | ~14GB | Highest quality, reasoning. |
 
-On Apple Silicon with Apple Intelligence available, Steno uses the built-in `SystemLanguageModel` (preferring Advanced and falling back to 3B Core). Otherwise, local summarization runs via Ollama with `gemma4:e2b-it-qat` as the default.
+Local summarization runs via Ollama with `gemma4:e2b-it-qat` by default.
+On macOS 26 or later, users can explicitly select Apple's built-in `SystemLanguageModel` when Apple Intelligence is available.
+Steno does not silently change an existing model selection or fall back to another provider if Apple becomes unavailable.
 ## How to change models
 
 1. Open **Settings → AI**

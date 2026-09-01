@@ -172,8 +172,8 @@ Have questions or suggestions? [Join our Discord](https://discord.gg/DZ6vcQnxxu)
 - `Whisper Large V3 Turbo` (1.6 GB): Best-accuracy Whisper engine for the languages Parakeet can't speak (Chinese, Japanese, Korean, Arabic, Hindi, and 94 others). Post-stop only.
 
 **Summarization Models:**
-- `Apple Intelligence (SystemLanguageModel)`: Built-in on-device System Language Model — Advanced wherever available, automatically falling back to 3B Core. **(default on macOS when available)**
-- `gemma4:e2b-it-qat` (4.3GB): Lightest Gemma 4 via Ollama, quantization-aware, with a real 128K context **(default fallback / non-Apple)**
+- `Apple Intelligence (SystemLanguageModel)`: Optional built-in on-device System Language Model on macOS 26 or later. The OS manages the model. Steno never switches to it automatically.
+- `gemma4:e2b-it-qat` (4.3GB): Lightest Gemma 4 via Ollama, quantization-aware, with a real 128K context **(default)**
 - `gemma4:e4b-it-qat` (6.1GB): Quantization-aware E4B — higher quality than E2B at a modest footprint
 - `qwen3.5:9b` (6.6GB): Excellent at structured output and action items
 - `gemma4:12b-it-qat` (7.2GB): Gemma 4 (quantization-aware) with a 256K context — best for long meetings

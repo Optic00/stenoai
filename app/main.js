@@ -7299,7 +7299,21 @@ ipcMain.handle('setup-ollama-and-model', async () => {
       sendDebugLog(`Could not read AI provider, proceeding with local setup: ${e.message}`);
     }
 
-    // Check if Apple Intelligence or an already-installed model is available
+    // Re-running the setup wizard must not replace an explicit Apple
+    // Intelligence choice with whichever Ollama model happens to be installed.
+    // Availability is reported in Settings; setup only preserves the choice.
+    try {
+      const currentRaw = await runPythonScript('simple_recorder.py', ['get-model'], true);
+      const current = JSON.parse(currentRaw.trim());
+      if (current.model === 'apple:system') {
+        sendDebugLog('Apple Intelligence is already selected - skipping Ollama model setup');
+        return { success: true, skipped: true, message: 'Apple Intelligence remains selected' };
+      }
+    } catch (e) {
+      sendDebugLog(`Could not read current summary model, proceeding with local setup: ${e.message}`);
+    }
+
+    // Check whether an already-installed Ollama model can be reused.
     let pullTarget = DEFAULT_AI_MODEL;
     try {
       const resolvedRaw = await runPythonScript('simple_recorder.py', ['resolve-setup-model'], true);
@@ -7308,21 +7322,6 @@ ipcMain.handle('setup-ollama-and-model', async () => {
         pullTarget = resolved.pull_target;
       }
       if (resolved && resolved.installed) {
-        if (resolved.installed === 'apple:system') {
-          sendDebugLog('Using Apple Intelligence for on-device summaries');
-          try {
-            const setRaw = await runPythonScript('simple_recorder.py', ['set-model', 'apple:system'], true);
-            const jsonLine = setRaw.trim().split('\n').reverse().find((l) => l.trim().startsWith('{'));
-            const setRes = jsonLine ? JSON.parse(jsonLine) : null;
-            if (!setRes || setRes.success !== true) {
-              return { success: false, error: (setRes && setRes.error) || 'Failed to save Apple Intelligence as the selected model.' };
-            }
-          } catch (e) {
-            return { success: false, error: `Failed to save Apple Intelligence as the selected model: ${e.message}` };
-          }
-          trackEvent('setup_completed', { step: 'apple_intelligence' });
-          return { success: true, message: 'Using Apple Intelligence' };
-        }
         sendDebugLog(`Found already-installed model "${resolved.installed}" — skipping download`);
         try {
           const setRaw = await runPythonScript('simple_recorder.py', ['set-model', resolved.installed], true);

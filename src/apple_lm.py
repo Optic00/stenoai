@@ -1,10 +1,8 @@
-"""Apple SystemLanguageModel sidecar: Advanced when the OS has it, else 3B Core.
+"""Apple SystemLanguageModel sidecar for optional on-device summarization.
 
-The public FoundationModels API exposes ``SystemLanguageModel.default`` plus an
-inspect-only ``variant`` (``coreAdvanced3`` / ``core3``). There is no
-``init(variant:)`` — the OS picks Advanced where it is available and otherwise
-serves the 3B Core model. This module probes that default and, when it is
-available, is the local summarization default on Darwin.
+The sidecar wraps ``SystemLanguageModel.default`` and leaves model selection to
+the OS. Steno exposes it as an explicit local-model choice; availability never
+changes the configured model during config loading.
 """
 
 from __future__ import annotations
@@ -12,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 import queue
 import subprocess
 import sys
@@ -38,6 +37,7 @@ APPLE_LM_NUM_CTX = 8192
 
 _DISABLE_ENV = "STENOAI_DISABLE_APPLE_LM"
 _BIN_ENV = "STENOAI_APPLE_LM_BIN"
+_E2E_ENV = "STENOAI_E2E"
 
 _STATUS_LOCK = threading.Lock()
 _STATUS_CACHE: Optional[Dict[str, Any]] = None
@@ -92,6 +92,20 @@ def apple_lm_status() -> Dict[str, Any]:
         return {"available": False, "reason": "disabled"}
     if sys.platform != "darwin":
         return {"available": False, "reason": "unsupported_os"}
+    try:
+        macos_major = int(platform.mac_ver()[0].split(".", 1)[0])
+    except (TypeError, ValueError):
+        macos_major = 0
+    # T2 runs on the normal macOS app runner, which may predate Tahoe. Its
+    # explicitly supplied mock sidecar still needs to exercise the integration
+    # path. Production cannot bypass the OS gate: both the E2E marker and an
+    # explicit test binary are required.
+    test_sidecar = (
+        os.environ.get(_E2E_ENV) == "1"
+        and bool(os.environ.get(_BIN_ENV))
+    )
+    if macos_major < 26 and not test_sidecar:
+        return {"available": False, "reason": "unsupported_os"}
     binary = resolve_apple_lm_bin()
     if not binary:
         return {"available": False, "reason": "sidecar_missing"}
@@ -116,31 +130,42 @@ def apple_lm_available() -> bool:
     return bool(apple_lm_status().get("available"))
 
 
-def resolve_default_summary_model() -> str:
-    """Apple system model when the sidecar reports available, else Ollama default."""
-    from src.config import Config
+_UNAVAILABLE_MESSAGES = {
+    "disabled": "Apple Intelligence is disabled for this run.",
+    "unsupported_os": "Apple Intelligence requires macOS 26 or later.",
+    "sidecar_missing": "This Steno build does not include the Apple Intelligence helper.",
+    "sidecar_error": "Steno could not check Apple Intelligence availability.",
+    "deviceNotEligible": "Apple Intelligence is not supported on this Mac.",
+    "appleIntelligenceNotEnabled": "Enable Apple Intelligence in System Settings before selecting this model.",
+    "modelNotReady": "Apple Intelligence is still downloading or preparing its model.",
+    "unavailable": "Apple Intelligence is not available on this system.",
+}
 
-    if apple_lm_available():
-        return APPLE_SYSTEM_MODEL
-    return Config.DEFAULT_MODEL
+
+def apple_lm_unavailable_message(status: Optional[Dict[str, Any]] = None) -> str:
+    """Return user-safe copy for the sidecar's fixed availability reasons."""
+    payload = status if status is not None else apple_lm_status()
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return _UNAVAILABLE_MESSAGES.get(
+        reason,
+        "Apple Intelligence is not available on this system.",
+    )
 
 
 def apple_system_model_info(*, is_default: bool = False) -> Dict[str, str]:
     status = apple_lm_status()
-    variant = status.get("variant")
-    if variant == "coreAdvanced3":
-        quality_bit = "Advanced"
-    elif variant == "core3":
-        quality_bit = "3B Core"
-    else:
-        quality_bit = "Advanced when available, else 3B Core"
-    default_bit = " (default)" if is_default else ""
+    default_bit = " (selected)" if is_default else ""
     display = status.get("display_name") or "Apple Intelligence"
+    availability_bit = (
+        "OS-managed on-device model"
+        if status.get("available")
+        else apple_lm_unavailable_message(status)
+    )
     return {
         "name": display if isinstance(display, str) and display.strip() else "Apple Intelligence",
         "size": "",
-        "params": "3B",
-        "description": f"On-device System Language Model — {quality_bit}{default_bit}",
+        "params": "OS-managed",
+        "description": f"On-device System Language Model - {availability_bit}{default_bit}",
         "speed": "fast",
         "quality": "good",
     }

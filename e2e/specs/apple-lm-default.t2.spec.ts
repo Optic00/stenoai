@@ -6,12 +6,12 @@ import { realUserDataDir, fileSig } from '../fixtures/real-user-data';
 import { readUserConfig } from '../fixtures/user-config';
 
 /**
- * T2 — Apple System Language Model (Advanced / 3B Core) default resolution.
+ * T2 - Apple System Language Model explicit opt-in.
  *
  * Model-free: uses a lightweight mock script pointed to via STENOAI_APPLE_LM_BIN
  * with STENOAI_DISABLE_APPLE_LM: '0'. Verifies that on Darwin, when Apple LM is
- * reported available, a fresh launch defaults to `apple:system`, surfaces it via
- * the preload bridge, lists it in supported_models, and persists to disk.
+ * reported available, a fresh launch keeps the Ollama default, lists Apple in
+ * supported_models, and only persists `apple:system` after an explicit choice.
  */
 
 type ListResult = {
@@ -20,7 +20,8 @@ type ListResult = {
   supported_models?: Record<string, { installed?: boolean; name?: string; description?: string }>;
 };
 
-type CurrentModel = { success: boolean; model?: string };
+type CurrentModel = { success: boolean; model?: string; error?: string };
+type SetupResult = { success?: boolean; skipped?: boolean };
 
 type StenoWindow = Window & {
   stenoai: {
@@ -32,10 +33,13 @@ type StenoWindow = Window & {
     ai: {
       getProvider: () => Promise<{ success: boolean; model?: string; ai_provider?: string }>;
     };
+    setup: {
+      ollamaAndModel: () => Promise<SetupResult>;
+    };
   };
 };
 
-test('fresh install defaults to apple:system when Apple Intelligence is available', async ({
+test('fresh install offers Apple Intelligence without selecting it', async ({
   launchApp,
   userDataDir,
 }) => {
@@ -53,7 +57,7 @@ test('fresh install defaults to apple:system when Apple Intelligence is availabl
       'cmd="${1:-status}"',
       'case "$cmd" in',
       '  status)',
-      '    echo \'{"available":true,"variant":"coreAdvanced3","display_name":"Apple Intelligence"}\'',
+      '    echo \'{"available":true,"display_name":"Apple Intelligence"}\'',
       '    ;;',
       '  complete)',
       '    echo \'{"text":"Mocked response"}\'',
@@ -78,25 +82,24 @@ test('fresh install defaults to apple:system when Apple Intelligence is availabl
     },
   });
 
-  // Preload get-current-model returns apple:system
+  // A fresh install keeps the existing Ollama default.
   const current = await page.evaluate(() =>
     (window as StenoWindow).stenoai.models.getCurrent(),
   );
-  expect(current.success).toBe(true);
-  expect(current.model).toBe('apple:system');
+  expect(current.success, current.error).toBe(true);
+  expect(current.model).not.toBe('apple:system');
 
-  // getProvider also returns model: apple:system
+  // Provider output agrees with the persisted selection.
   const provider = await page.evaluate(() =>
     (window as StenoWindow).stenoai.ai.getProvider(),
   );
   expect(provider.success).toBe(true);
-  expect(provider.model).toBe('apple:system');
+  expect(provider.model).toBe(current.model);
 
-  // On-disk config reflects apple:system with auto source
+  // Apple is available, but config is unchanged until the explicit selection.
   await expect
     .poll(() => readUserConfig(userDataDir).model)
-    .toBe('apple:system');
-  expect(readUserConfig(userDataDir).summary_model_source).toBe('auto');
+    .not.toBe('apple:system');
 
   // models.list includes apple:system as installed
   const listed = await page.evaluate(() =>
@@ -104,16 +107,28 @@ test('fresh install defaults to apple:system when Apple Intelligence is availabl
   );
   expect(listed.success).toBe(true);
   expect(listed.supported_models?.['apple:system']?.installed).toBe(true);
-  expect(listed.supported_models?.['apple:system']?.description).toContain('Advanced');
+  expect(listed.supported_models?.['apple:system']?.description).toContain('OS-managed');
 
-  // Explicit user switch to another model updates config and sets source to user
+  // Explicit user switch opts into Apple and records user provenance.
   await page.evaluate(() =>
-    (window as StenoWindow).stenoai.models.set('gemma4:e2b-it-qat'),
+    (window as StenoWindow).stenoai.models.set('apple:system'),
   );
   await expect
     .poll(() => readUserConfig(userDataDir).model)
-    .toBe('gemma4:e2b-it-qat');
+    .toBe('apple:system');
   expect(readUserConfig(userDataDir).summary_model_source).toBe('user');
+
+  // Re-running first-run setup must preserve that explicit Apple choice.
+  const repeatedSetup = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.setup.ollamaAndModel(),
+  );
+  expect(repeatedSetup.success).toBe(true);
+  expect(repeatedSetup.skipped).toBe(true);
+  const afterRepeatedSetup = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.models.getCurrent(),
+  );
+  expect(afterRepeatedSetup.model).toBe('apple:system');
+  expect(readUserConfig(userDataDir).model).toBe('apple:system');
 
   expect(fileSig(realUserDataDir())).toBe(realDirBefore);
 });

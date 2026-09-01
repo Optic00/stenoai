@@ -255,18 +255,23 @@ class OllamaSummarizer:
                     logger.warning(f"Failed to load model from config: {e}, using default")
                     model_name = config.DEFAULT_MODEL
 
-            from src.apple_lm import is_apple_system_model, AppleLMClient, apple_lm_available
-            if is_apple_system_model(model_name) and apple_lm_available():
+            from src.apple_lm import (
+                AppleLMClient,
+                apple_lm_status,
+                apple_lm_unavailable_message,
+                is_apple_system_model,
+            )
+            if is_apple_system_model(model_name):
+                status = apple_lm_status()
+                if not status.get("available"):
+                    # The user explicitly selected Apple. A silent provider or
+                    # model change would make provenance and privacy claims
+                    # false, so surface the fixed availability reason instead.
+                    raise RuntimeError(apple_lm_unavailable_message(status))
                 self.model_name = model_name
                 self.client = AppleLMClient()
                 logger.info("Apple System Language Model initialized")
             else:
-                if is_apple_system_model(model_name):
-                    logger.warning(
-                        "Apple System Language Model configured but not available on this platform/device; falling back to %s",
-                        config.DEFAULT_MODEL,
-                    )
-                    model_name = config.DEFAULT_MODEL
                 if not OLLAMA_AVAILABLE:
                     raise ImportError("Ollama is not installed. Please install ollama-python.")
                 self.model_name = resolve_runtime_tag(model_name)
@@ -1755,10 +1760,11 @@ TRANSCRIPT:
     
     def cleanup(self):
         """Clean up Ollama process if we started it."""
-        if self.ollama_process:
+        process = getattr(self, "ollama_process", None)
+        if process:
             try:
-                self.ollama_process.terminate()
-                self.ollama_process.wait(timeout=10)
+                process.terminate()
+                process.wait(timeout=10)
                 logger.info("Ollama service process terminated")
             except (subprocess.TimeoutExpired, ProcessLookupError, OSError) as e:
                 # terminate didn't take (or the process is already gone) —
@@ -1766,7 +1772,7 @@ TRANSCRIPT:
                 # try just means it died in the gap, which is fine.
                 logger.warning(f"Ollama terminate failed ({e}); escalating to kill")
                 try:
-                    self.ollama_process.kill()
+                    process.kill()
                     logger.info("Ollama service process killed")
                 except (ProcessLookupError, OSError):
                     pass
