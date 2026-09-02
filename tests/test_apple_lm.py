@@ -498,10 +498,18 @@ class AppleLMConfigOptInTests(BaseAppleLMTest):
 
     def test_existing_auto_config_is_not_changed_when_apple_is_available(self):
         cfg_path = Path(self._tmp_dir.name) / "config.json"
-        cfg_path.write_text(json.dumps({"model": Config.DEFAULT_MODEL, "summary_model_source": "auto"}))
-        with mock.patch("src.apple_lm.apple_lm_available", return_value=True):
+        cfg_path.write_text(json.dumps({
+            "model": Config.DEFAULT_MODEL,
+            "summary_model_source": "auto",
+        }))
+        with mock.patch(
+            "src.apple_lm.apple_lm_available",
+            return_value=True,
+        ) as available, mock.patch("src.apple_lm.apple_lm_status") as status:
             config = Config(config_path=cfg_path)
         self.assertEqual(config.get_model(), Config.DEFAULT_MODEL)
+        available.assert_not_called()
+        status.assert_not_called()
 
     def test_existing_config_without_model_source_is_preserved_as_user_choice(self):
         cfg_path = Path(self._tmp_dir.name) / "config.json"
@@ -934,23 +942,22 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
         input_budget = summarizer._apple_input_budget_chars()
         self.assertLessEqual(len(final_prompts[0]), input_budget)
 
-    def test_snapshot_slice_budget_reserves_full_snapshot_response(self):
+    def test_max_snapshot_update_prompt_reserves_full_snapshot_response(self):
         summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
         summarizer.model_name = APPLE_SYSTEM_MODEL
         from src.summarizer import (
             _CHUNK_SAFETY_CHARS_PER_TOKEN,
             _SNAPSHOT_MAX_CHARS,
-            _SNAPSHOT_PROMPT_OVERHEAD_CHARS,
         )
 
-        total = (
-            _SNAPSHOT_MAX_CHARS
-            + _SNAPSHOT_PROMPT_OVERHEAD_CHARS
-            + summarizer._snapshot_slice_budget_chars()
-            + _SNAPSHOT_MAX_CHARS
+        prompt = summarizer._create_snapshot_update_prompt(
+            "S" * _SNAPSHOT_MAX_CHARS,
+            "T" * summarizer._snapshot_slice_budget_chars(),
+            999,
+            999,
         )
         self.assertLessEqual(
-            total,
+            len(prompt) + _SNAPSHOT_MAX_CHARS,
             resolve_num_ctx(APPLE_SYSTEM_MODEL) * _CHUNK_SAFETY_CHARS_PER_TOKEN,
         )
 
