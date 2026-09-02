@@ -15,12 +15,16 @@ from src.apple_lm import (
     APPLE_SYSTEM_MODEL,
     APPLE_LM_NUM_CTX,
     AppleLMClient,
+    _helper_app_for_binary,
+    _run_apple_lm_app,
     apple_lm_generation_error_message,
+    apple_lm_status,
     apple_lm_should_list,
     apple_system_model_info,
     apple_lm_unavailable_message,
     complete,
     is_apple_system_model,
+    resolve_apple_lm_bin,
     reset_apple_lm_cache,
     stream_complete,
 )
@@ -49,6 +53,58 @@ class AppleLMResolutionTests(BaseAppleLMTest):
         self.assertTrue(is_apple_system_model("apple:system"))
         self.assertFalse(is_apple_system_model("gemma4:e2b-it-qat"))
         self.assertFalse(is_apple_system_model(None))
+
+    def test_helper_app_is_recognized_from_canonical_executable(self):
+        binary = (
+            Path("/Applications/Steno.app/Contents/Helpers")
+            / "Steno Apple LM.app"
+            / "Contents"
+            / "MacOS"
+            / "steno-apple-lm"
+        )
+
+        self.assertEqual(
+            _helper_app_for_binary(str(binary)),
+            Path("/Applications/Steno.app/Contents/Helpers/Steno Apple LM.app"),
+        )
+        self.assertIsNone(_helper_app_for_binary("/tmp/mock-steno-apple-lm"))
+
+    def test_frozen_backend_resolves_nested_helper(self):
+        executable = (
+            "/Applications/Steno.app/Contents/Helpers/Steno Apple LM.app/"
+            "Contents/MacOS/steno-apple-lm"
+        )
+        with mock.patch("src.apple_lm.sys.platform", "darwin"), mock.patch.object(
+            sys,
+            "frozen",
+            True,
+            create=True,
+        ), mock.patch(
+            "src.apple_lm.sys.executable",
+            "/Applications/Steno.app/Contents/Resources/stenoai/stenoai",
+        ), mock.patch(
+            "src.apple_lm.os.access",
+            side_effect=lambda path, _mode: str(path) == executable,
+        ), mock.patch.dict(
+            os.environ,
+            {"STENOAI_DISABLE_APPLE_LM": "0"},
+        ):
+            self.assertEqual(resolve_apple_lm_bin(), executable)
+
+    def test_relative_override_is_canonicalized(self):
+        override = Path(self._tmp_dir.name) / "mock-steno-apple-lm"
+        override.write_bytes(b"mock")
+        override.chmod(0o755)
+        relative = os.path.relpath(override, Path.cwd())
+
+        with mock.patch("src.apple_lm.sys.platform", "darwin"), mock.patch.dict(
+            os.environ,
+            {
+                "STENOAI_APPLE_LM_BIN": relative,
+                "STENOAI_DISABLE_APPLE_LM": "0",
+            },
+        ):
+            self.assertEqual(resolve_apple_lm_bin(), str(override.resolve()))
 
     def test_unavailable_message_maps_fixed_reason(self):
         self.assertIn(
@@ -88,6 +144,29 @@ class AppleLMResolutionTests(BaseAppleLMTest):
             self.assertEqual(apple_lm_status(), {"available": True})
         run_sidecar.assert_called_once_with(["status"], timeout=15)
 
+    def test_transient_status_failure_is_not_cached(self):
+        env = {"STENOAI_DISABLE_APPLE_LM": "0"}
+        with mock.patch("src.apple_lm.sys.platform", "darwin"), mock.patch(
+            "src.apple_lm.platform.mac_ver",
+            return_value=("27.0", ("", "", ""), ""),
+        ), mock.patch.dict(os.environ, env, clear=False), mock.patch(
+            "src.apple_lm.resolve_apple_lm_bin",
+            return_value="/tmp/steno-apple-lm",
+        ), mock.patch(
+            "src.apple_lm._run_apple_lm",
+            side_effect=[
+                RuntimeError("temporary launch failure"),
+                json.dumps({"available": True}),
+            ],
+        ) as run_sidecar:
+            self.assertEqual(
+                apple_lm_status(),
+                {"available": False, "reason": "sidecar_error"},
+            )
+            self.assertEqual(apple_lm_status(), {"available": True})
+
+        self.assertEqual(run_sidecar.call_count, 2)
+
     def test_apple_system_model_info_describes_os_managed_model(self):
         with mock.patch("src.apple_lm.apple_lm_status", return_value={"available": True, "display_name": "Apple Intelligence"}):
             info = apple_system_model_info(is_default=True)
@@ -113,6 +192,73 @@ class AppleLMResolutionTests(BaseAppleLMTest):
         with mock.patch("src.apple_lm._run_apple_lm", return_value=payload):
             with self.assertRaisesRegex(RuntimeError, "declined"):
                 complete("synthetic prompt")
+
+    def test_launch_services_preserves_helper_error_payload(self):
+        payload = json.dumps(
+            {"error": "apple_lm_failed", "reason": "guardrail"}
+        )
+        invocation = mock.Mock()
+        invocation.iter_lines.return_value = iter([payload])
+        invocation.wait.side_effect = RuntimeError("launcher failed")
+
+        with mock.patch(
+            "src.apple_lm._AppleLMAppInvocation",
+            return_value=invocation,
+        ):
+            self.assertEqual(
+                _run_apple_lm_app(
+                    Path("/tmp/Steno Apple LM.app"),
+                    ["complete"],
+                    stdin="synthetic prompt",
+                    timeout=30,
+                ),
+                payload,
+            )
+
+        invocation.close.assert_called_once_with()
+
+    def test_launch_services_preserves_launcher_failure(self):
+        invocation = mock.Mock()
+        invocation.iter_lines.return_value = iter([])
+        invocation.wait.side_effect = RuntimeError("launcher failed")
+
+        with mock.patch(
+            "src.apple_lm._AppleLMAppInvocation",
+            return_value=invocation,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "launcher failed"):
+                _run_apple_lm_app(
+                    Path("/tmp/Steno Apple LM.app"),
+                    ["status"],
+                    stdin=None,
+                    timeout=30,
+                )
+
+        invocation.close.assert_called_once_with()
+
+    def test_complete_uses_launch_services_for_helper_app(self):
+        app = Path(self._tmp_dir.name) / "Steno Apple LM.app"
+        binary = app / "Contents" / "MacOS" / "steno-apple-lm"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"helper")
+        binary.chmod(0o755)
+
+        with mock.patch(
+            "src.apple_lm.resolve_apple_lm_bin",
+            return_value=str(binary),
+        ), mock.patch(
+            "src.apple_lm._run_apple_lm_app",
+            return_value=json.dumps({"text": "Sandboxed response"}),
+        ) as run_app, mock.patch("src.apple_lm.subprocess.run") as run_direct:
+            self.assertEqual(complete("synthetic prompt"), "Sandboxed response")
+
+        run_app.assert_called_once_with(
+            app,
+            ["complete"],
+            stdin="synthetic prompt",
+            timeout=7200,
+        )
+        run_direct.assert_not_called()
 
     def test_nonzero_sidecar_preserves_fixed_guardrail_reason(self):
         failed = subprocess.CompletedProcess(
@@ -153,6 +299,25 @@ class AppleLMResolutionTests(BaseAppleLMTest):
 
         self.assertEqual(len(captured), 1)
         self.assertIsNotNone(captured[0].poll())
+
+    def test_stream_uses_launch_services_for_helper_app(self):
+        app = Path(self._tmp_dir.name) / "Steno Apple LM.app"
+        binary = app / "Contents" / "MacOS" / "steno-apple-lm"
+
+        with mock.patch(
+            "src.apple_lm.resolve_apple_lm_bin",
+            return_value=str(binary),
+        ), mock.patch(
+            "src.apple_lm._stream_apple_lm_app",
+            return_value=iter(["Hello", " world"]),
+        ) as stream_app, mock.patch("src.apple_lm.subprocess.Popen") as popen:
+            self.assertEqual(
+                list(stream_complete("synthetic prompt")),
+                ["Hello", " world"],
+            )
+
+        stream_app.assert_called_once_with(app, "synthetic prompt", 7200)
+        popen.assert_not_called()
 
 
 class AppleLMConfigOptInTests(BaseAppleLMTest):

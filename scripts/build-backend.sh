@@ -64,10 +64,10 @@ if [ "$(uname -s)" = "Darwin" ]; then
         exit 1
     fi
     echo ""
-    echo "Building Apple LM sidecar (needs macOS 26+ SDK)..."
+    echo "Building sandboxed Apple LM helper app (needs macOS 26+ SDK)..."
     if ! "$SCRIPT_DIR/build-apple-lm-sidecar.sh" "$(uname -m)"; then
-        echo "Warning: Apple LM sidecar was not built at bin/steno-apple-lm." >&2
-        echo "Summaries will use Ollama until a host with the macOS 26+ SDK produces that binary." >&2
+        echo "Warning: Apple LM helper was not built at bin/Steno Apple LM.app." >&2
+        echo "The Apple model choice will be unavailable; other local summaries continue to use Ollama." >&2
     fi
 fi
 

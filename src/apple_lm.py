@@ -1,4 +1,4 @@
-"""Apple SystemLanguageModel sidecar for optional on-device summarization.
+"""Apple SystemLanguageModel helper for optional on-device summarization.
 
 The sidecar wraps ``SystemLanguageModel.default`` and leaves model selection to
 the OS. Steno exposes it as an explicit local-model choice; availability never
@@ -12,8 +12,10 @@ import logging
 import os
 import platform
 import queue
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -39,6 +41,11 @@ _DISABLE_ENV = "STENOAI_DISABLE_APPLE_LM"
 _BIN_ENV = "STENOAI_APPLE_LM_BIN"
 _E2E_ENV = "STENOAI_E2E"
 
+_HELPER_APP_NAME = "Steno Apple LM.app"
+_HELPER_EXECUTABLE = "steno-apple-lm"
+_HELPER_PID_PREFIX = "steno-apple-lm-pid:"
+_HELPER_PID_GRACE_SECONDS = 5
+
 _STATUS_LOCK = threading.Lock()
 _STATUS_CACHE: Optional[Dict[str, Any]] = None
 _STATUS_CACHE_BIN: Optional[str] = None
@@ -61,7 +68,7 @@ def reset_apple_lm_cache() -> None:
 
 
 def resolve_apple_lm_bin() -> Optional[str]:
-    """Locate ``steno-apple-lm``. Darwin only; None when disabled or missing."""
+    """Locate the Apple LM helper executable. Darwin only."""
     if apple_lm_disabled() or sys.platform != "darwin":
         return None
     candidates: list[str] = []
@@ -70,23 +77,53 @@ def resolve_apple_lm_bin() -> Optional[str]:
         candidates.append(override)
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).parent
-        candidates.extend(
-            [
-                str(exe_dir / "steno-apple-lm"),
-                str(exe_dir / "_internal" / "steno-apple-lm"),
-            ]
+        try:
+            contents_dir = exe_dir.parents[1]
+        except IndexError:
+            contents_dir = exe_dir
+        candidates.append(
+            str(
+                contents_dir
+                / "Helpers"
+                / _HELPER_APP_NAME
+                / "Contents"
+                / "MacOS"
+                / _HELPER_EXECUTABLE
+            )
         )
     else:
         repo_root = Path(__file__).resolve().parent.parent
-        candidates.append(str(repo_root / "bin" / "steno-apple-lm"))
+        candidates.append(
+            str(
+                repo_root
+                / "bin"
+                / _HELPER_APP_NAME
+                / "Contents"
+                / "MacOS"
+                / _HELPER_EXECUTABLE
+            )
+        )
     for cand in candidates:
         if os.access(cand, os.X_OK):
-            return cand
+            return str(Path(cand).resolve())
     return None
 
 
+def _helper_app_for_binary(binary: str) -> Optional[Path]:
+    """Return the enclosing helper app for a canonical bundled executable."""
+    path = Path(binary)
+    try:
+        app = path.parents[2]
+    except IndexError:
+        return None
+    expected = app / "Contents" / "MacOS" / _HELPER_EXECUTABLE
+    if app.name != _HELPER_APP_NAME or path != expected:
+        return None
+    return app
+
+
 def apple_lm_status() -> Dict[str, Any]:
-    """Probe sidecar ``status``. Cached per process + binary path."""
+    """Probe helper ``status``. Cached per process and executable path."""
     global _STATUS_CACHE, _STATUS_CACHE_BIN
     if apple_lm_disabled():
         return {"available": False, "reason": "disabled"}
@@ -120,9 +157,10 @@ def apple_lm_status() -> Dict[str, Any]:
     except Exception as exc:
         logger.info("apple-lm status failed: %s", type(exc).__name__)
         payload = {"available": False, "reason": "sidecar_error"}
-    with _STATUS_LOCK:
-        _STATUS_CACHE = dict(payload)
-        _STATUS_CACHE_BIN = binary
+    if payload.get("reason") != "sidecar_error":
+        with _STATUS_LOCK:
+            _STATUS_CACHE = dict(payload)
+            _STATUS_CACHE_BIN = binary
     return dict(payload)
 
 
@@ -152,6 +190,7 @@ _GENERATION_ERROR_MESSAGES = {
     "rate_limited": "Apple Intelligence is temporarily busy. Try again shortly.",
     "concurrent_requests": "Apple Intelligence is already processing another request.",
     "timeout": "Apple Intelligence timed out.",
+    "invalid_input": "Apple Intelligence received no content to process.",
 }
 
 
@@ -208,6 +247,199 @@ def apple_system_model_info(
     }
 
 
+class _AppleLMAppInvocation:
+    """One LaunchServices invocation using private FIFOs for content-free IPC."""
+
+    def __init__(self, app: Path, args: list[str], prompt: str):
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="steno-apple-lm-")
+        root = Path(self._temp_dir.name)
+        os.chmod(root, 0o700)
+        self._stdin_path = root / "stdin"
+        self._stdout_path = root / "stdout"
+        self._stderr_path = root / "stderr"
+        for fifo in (self._stdin_path, self._stdout_path, self._stderr_path):
+            os.mkfifo(fifo, 0o600)
+
+        self._lines: queue.Queue[Optional[str]] = queue.Queue()
+        self._helper_pid: Optional[int] = None
+        self._helper_pid_ready = threading.Event()
+        self._threads = [
+            threading.Thread(
+                target=self._write_prompt,
+                args=(prompt,),
+                daemon=True,
+            ),
+            threading.Thread(target=self._read_stdout, daemon=True),
+            threading.Thread(target=self._read_stderr, daemon=True),
+        ]
+        for thread in self._threads:
+            thread.start()
+
+        command = [
+            "/usr/bin/open",
+            "-W",
+            "-n",
+            "-g",
+            "-i",
+            str(self._stdin_path),
+            "-o",
+            str(self._stdout_path),
+            "--stderr",
+            str(self._stderr_path),
+            "--env",
+            "STENOAI_APPLE_LM_REPORT_PID=1",
+            "-a",
+            str(app),
+            "--args",
+            *args,
+        ]
+        try:
+            self._launcher = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception:
+            self._unblock_fifos()
+            self._join_threads()
+            self._temp_dir.cleanup()
+            raise
+
+    def _write_prompt(self, prompt: str) -> None:
+        try:
+            with self._stdin_path.open("w", encoding="utf-8") as handle:
+                handle.write(prompt)
+        except OSError:
+            pass
+
+    def _read_stdout(self) -> None:
+        try:
+            with self._stdout_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    self._lines.put(line)
+        except OSError:
+            pass
+        finally:
+            self._lines.put(None)
+
+    def _read_stderr(self) -> None:
+        try:
+            with self._stderr_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if stripped.startswith(_HELPER_PID_PREFIX):
+                        try:
+                            self._helper_pid = int(
+                                stripped.removeprefix(_HELPER_PID_PREFIX)
+                            )
+                        except ValueError:
+                            pass
+                        else:
+                            self._helper_pid_ready.set()
+        except OSError:
+            pass
+
+    def iter_lines(self, timeout: float) -> Iterator[str]:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Apple Intelligence timed out")
+            try:
+                line = self._lines.get(timeout=min(remaining, 0.1))
+            except queue.Empty:
+                if self._launcher.poll() is not None:
+                    self._unblock_fifos()
+                continue
+            if line is None:
+                break
+            yield line
+
+    def wait(self, timeout: float = 5) -> None:
+        try:
+            return_code = self._launcher.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError("Apple Intelligence timed out") from exc
+        if return_code != 0:
+            launcher_error = ""
+            if self._launcher.stderr is not None:
+                launcher_error = self._launcher.stderr.read().strip()
+            logger.info(
+                "apple-lm LaunchServices failed (%s): %s",
+                return_code,
+                launcher_error or "no diagnostic",
+            )
+            raise RuntimeError("Apple Intelligence request failed")
+
+    def close(self) -> None:
+        if self._launcher.poll() is None:
+            self._helper_pid_ready.wait(timeout=_HELPER_PID_GRACE_SECONDS)
+            if self._helper_pid is not None:
+                try:
+                    os.kill(self._helper_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                logger.warning(
+                    "apple-lm helper PID was not reported before cleanup"
+                )
+            try:
+                self._launcher.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                if self._helper_pid is not None:
+                    try:
+                        os.kill(self._helper_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                self._launcher.kill()
+                try:
+                    self._launcher.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        self._unblock_fifos()
+        self._join_threads()
+        if self._launcher.stderr is not None:
+            self._launcher.stderr.close()
+        self._temp_dir.cleanup()
+
+    def _unblock_fifos(self) -> None:
+        for fifo in (self._stdin_path, self._stdout_path, self._stderr_path):
+            try:
+                fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+            except OSError:
+                continue
+            os.close(fd)
+
+    def _join_threads(self) -> None:
+        for thread in self._threads:
+            thread.join(timeout=1)
+
+
+def _run_apple_lm_app(
+    app: Path,
+    args: list[str],
+    *,
+    stdin: Optional[str],
+    timeout: float,
+) -> str:
+    invocation = _AppleLMAppInvocation(app, args, stdin or "")
+    try:
+        output = "".join(invocation.iter_lines(timeout)).strip()
+        try:
+            invocation.wait()
+        except RuntimeError as launch_error:
+            try:
+                payload = json.loads(output)
+            except json.JSONDecodeError:
+                raise launch_error
+            if not isinstance(payload, dict) or not payload.get("error"):
+                raise launch_error
+        return output
+    finally:
+        invocation.close()
+
+
 def complete(prompt: str, timeout: float = 7200) -> str:
     raw = _run_apple_lm(["complete"], stdin=prompt, timeout=timeout)
     try:
@@ -227,7 +459,11 @@ def complete(prompt: str, timeout: float = 7200) -> str:
 def stream_complete(prompt: str, timeout: float = 7200) -> Iterator[str]:
     binary = resolve_apple_lm_bin()
     if not binary:
-        raise RuntimeError("Apple Intelligence sidecar is not available")
+        raise RuntimeError("Apple Intelligence helper is not available")
+    helper_app = _helper_app_for_binary(binary)
+    if helper_app is not None:
+        yield from _stream_apple_lm_app(helper_app, prompt, timeout)
+        return
     proc = subprocess.Popen(
         [binary, "stream"],
         stdin=subprocess.PIPE,
@@ -294,6 +530,44 @@ def stream_complete(prompt: str, timeout: float = 7200) -> Iterator[str]:
         if proc.stderr is not None:
             proc.stderr.close()
 
+
+def _stream_apple_lm_app(
+    app: Path,
+    prompt: str,
+    timeout: float,
+) -> Iterator[str]:
+    invocation = _AppleLMAppInvocation(app, ["stream"], prompt)
+    saw_done = False
+    try:
+        for line in invocation.iter_lines(timeout):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "Apple Intelligence returned invalid output"
+                ) from exc
+            if not isinstance(rec, dict):
+                raise RuntimeError("Apple Intelligence request failed")
+            if rec.get("error"):
+                raise RuntimeError(
+                    apple_lm_generation_error_message(rec.get("reason"))
+                )
+            if rec.get("done"):
+                saw_done = True
+                break
+            delta = rec.get("delta") or ""
+            if delta:
+                yield delta
+        invocation.wait()
+        if not saw_done:
+            raise RuntimeError("Apple Intelligence request failed")
+    finally:
+        invocation.close()
+
+
 def _run_apple_lm(
     args: list[str],
     *,
@@ -304,6 +578,14 @@ def _run_apple_lm(
     if not binary:
         raise FileNotFoundError("steno-apple-lm not found")
     logger.info("apple-lm %s (%s chars stdin)", args[0] if args else "?", len(stdin or ""))
+    helper_app = _helper_app_for_binary(binary)
+    if helper_app is not None:
+        return _run_apple_lm_app(
+            helper_app,
+            args,
+            stdin=stdin,
+            timeout=timeout,
+        )
     try:
         proc = subprocess.run(
             [binary, *args],

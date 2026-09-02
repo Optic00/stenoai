@@ -55,7 +55,7 @@ jobs:
         run: xvfb-run -a npm run test:e2e -- --project=t1 --grep-invert @perf
 
   build-apple-lm-sidecar:
-    name: Build Apple LM sidecar (Xcode 27)
+    name: Build Apple LM helper app (Xcode 27)
     needs: gate-smoke
     runs-on: xcode-27
     steps:
@@ -69,19 +69,23 @@ jobs:
           test "$SDK_MAJOR" -ge 27
           echo "Building with macOS SDK ${SDK_VERSION}"
 
-      - name: Build Apple SystemLanguageModel sidecar
+      - name: Build sandboxed Apple SystemLanguageModel helper app
         run: |
           chmod +x scripts/build-apple-lm-sidecar.sh
           ./scripts/build-apple-lm-sidecar.sh arm64
-          test -x bin/steno-apple-lm
-          file bin/steno-apple-lm | grep -q "arm64"
-          vtool -show-build bin/steno-apple-lm | grep -Eq 'minos 26(\.0)?'
+          HELPER="bin/Steno Apple LM.app"
+          EXECUTABLE="$HELPER/Contents/MacOS/steno-apple-lm"
+          test -x "$EXECUTABLE"
+          file "$EXECUTABLE" | grep -q "arm64"
+          vtool -show-build "$EXECUTABLE" | grep -Eq 'minos 26(\.0)?'
+          codesign --verify --deep --strict --verbose=2 "$HELPER"
+          codesign -d --entitlements :- "$HELPER" 2>&1 | grep -q 'com.apple.security.app-sandbox'
 
-      - name: Upload Apple LM sidecar
+      - name: Upload Apple LM helper app
         uses: actions/upload-artifact@v4
         with:
           name: apple-lm-sidecar-arm64
-          path: bin/steno-apple-lm
+          path: bin/Steno Apple LM.app
           if-no-files-found: error
           retention-days: 1
 
@@ -154,18 +158,22 @@ jobs:
         file bin/ollama
         file bin/ollama | grep -q "arm64"
 
-    - name: Download Apple LM sidecar
+    - name: Download Apple LM helper app
       uses: actions/download-artifact@v4
       with:
         name: apple-lm-sidecar-arm64
-        path: bin
+        path: bin/Steno Apple LM.app
 
-    - name: Validate Apple LM sidecar artifact
+    - name: Validate Apple LM helper app artifact
       run: |
-        chmod +x bin/steno-apple-lm
-        test -x bin/steno-apple-lm
-        file bin/steno-apple-lm | grep -q "arm64"
-        vtool -show-build bin/steno-apple-lm | grep -Eq 'minos 26(\.0)?'
+        HELPER="bin/Steno Apple LM.app"
+        EXECUTABLE="$HELPER/Contents/MacOS/steno-apple-lm"
+        chmod +x "$EXECUTABLE"
+        test -x "$EXECUTABLE"
+        file "$EXECUTABLE" | grep -q "arm64"
+        vtool -show-build "$EXECUTABLE" | grep -Eq 'minos 26(\.0)?'
+        codesign --verify --deep --strict --verbose=2 "$HELPER"
+        codesign -d --entitlements :- "$HELPER" 2>&1 | grep -q 'com.apple.security.app-sandbox'
 
     - name: Build mic-monitor helper (Swift)
       run: |
@@ -194,8 +202,7 @@ jobs:
         file dist/stenoai/stenoai
         test -x dist/stenoai/_internal/steno-diarize
         file dist/stenoai/_internal/steno-diarize | grep -q "arm64"
-        test -x dist/stenoai/_internal/steno-apple-lm
-        file dist/stenoai/_internal/steno-apple-lm | grep -q "arm64"
+        test ! -e dist/stenoai/_internal/steno-apple-lm
         echo "Expected arch: ${{ matrix.arch }}"
         echo "Backend built successfully"
 
@@ -231,16 +238,22 @@ jobs:
         APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
-    - name: Verify signed Apple LM sidecar in packaged app
+    - name: Verify signed sandboxed Apple LM helper in packaged app
       run: |
-        SIDECAR="app/dist/mac-arm64/Steno.app/Contents/Resources/stenoai/_internal/steno-apple-lm"
-        test -x "$SIDECAR"
-        file "$SIDECAR" | grep -q "arm64"
-        codesign --verify --strict --verbose=2 "$SIDECAR"
-        SIGNATURE_INFO="$(codesign -dvv "$SIDECAR" 2>&1)"
+        HELPER="app/dist/mac-arm64/Steno.app/Contents/Helpers/Steno Apple LM.app"
+        EXECUTABLE="$HELPER/Contents/MacOS/steno-apple-lm"
+        test -x "$EXECUTABLE"
+        file "$EXECUTABLE" | grep -q "arm64"
+        codesign --verify --deep --strict --verbose=2 "$HELPER"
+        SIGNATURE_INFO="$(codesign -dvv "$HELPER" 2>&1)"
         grep -q 'Authority=Developer ID Application' <<< "$SIGNATURE_INFO"
         grep -Eq 'flags=.*runtime' <<< "$SIGNATURE_INFO"
-        codesign --verify --deep --strict --verbose=2 app/dist/mac-arm64/Steno.app
+        HELPER_SANDBOX="$(codesign -d --entitlements :- "$HELPER" 2>/dev/null | plutil -extract 'com\.apple\.security\.app-sandbox' raw -o - -)"
+        test "$HELPER_SANDBOX" = "true"
+        APP="app/dist/mac-arm64/Steno.app"
+        OUTER_ENTITLEMENTS="$(codesign -d --entitlements :- "$APP" 2>/dev/null)"
+        ! grep -q 'com.apple.security.app-sandbox' <<< "$OUTER_ENTITLEMENTS"
+        codesign --verify --deep --strict --verbose=2 "$APP"
 
     # Write the macOS floor into the update manifest (#432). The runtime gate in
     # app/update-os-gate.js cannot protect the installs that are actually at

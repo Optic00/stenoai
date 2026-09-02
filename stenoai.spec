@@ -252,19 +252,22 @@ _OLLAMA_GPU_MARKERS = ('lib/ollama/cuda', 'lib/ollama/rocm', 'lib/ollama/vulkan'
 #   executable. Windows keeps the old `binaries` path (no libmlx collision there
 #   - the GPU runner libs are pruned above and there's no pip-mlx build).
 ollama_datas: list[tuple[str, str, str]] = []
-apple_lm_datas: list[tuple[str, str, str]] = []
 ollama_bin_dir = os.path.join(SPECPATH, 'bin')
 required_diarize_sidecar = require_diarize_sidecar(
     Path(ollama_bin_dir) / 'steno-diarize',
     platform=sys.platform,
 )
-apple_lm_sidecar = resolve_apple_lm_sidecar(
-    Path(ollama_bin_dir) / 'steno-apple-lm',
+_apple_lm_sidecar = resolve_apple_lm_sidecar(
+    Path(ollama_bin_dir) / 'Steno Apple LM.app',
     platform=sys.platform,
     required=os.environ.get('STENOAI_REQUIRE_APPLE_LM_SIDECAR') == '1',
 )
 if os.path.exists(ollama_bin_dir):
-    for root, _dirs, files in os.walk(ollama_bin_dir):
+    for root, dirs, files in os.walk(ollama_bin_dir):
+        if Path(root) == Path(ollama_bin_dir):
+            # The sandboxed Apple helper is packaged as a nested app by
+            # electron-builder, not inside the unsandboxed Python backend.
+            dirs[:] = [item for item in dirs if item != 'Steno Apple LM.app']
         for filename in files:
             filepath = os.path.join(root, filename)
             rel = os.path.relpath(filepath, ollama_bin_dir)
@@ -287,16 +290,6 @@ if os.path.exists(ollama_bin_dir):
                 # resolver probes. The guard above intentionally fails a
                 # macOS build when this required release artifact is absent.
                 binaries.append((filepath, '.'))
-            elif (
-                base == 'steno-apple-lm'
-                and _IS_DARWIN
-                and apple_lm_sidecar is not None
-            ):
-                # macOS-only Swift SystemLanguageModel sidecar (built by
-                # scripts/build-apple-lm-sidecar.sh). Keep it out of Analysis:
-                # a macOS 14 build runner cannot resolve FoundationModels, and
-                # PyInstaller must not rewrite or ad-hoc re-sign this artifact.
-                apple_lm_datas.append(('steno-apple-lm', filepath, 'DATA'))
             elif _IS_DARWIN:
                 # COLLECT DATA TOC 3-tuple: (dest_path_including_filename,
                 # abs_src_path, 'DATA'). Everything lives under ollama/,
@@ -386,9 +379,6 @@ coll = COLLECT(
     # this is an unconditional no-op there). See the ollama_datas rationale
     # above for why these MUST bypass Analysis and land at the COLLECT stage.
     ollama_datas,
-    # The separately-built Apple LM sidecar, copied verbatim for the same
-    # reason as Ollama's runner tree above.
-    apple_lm_datas,
     strip=False,
     upx=_USE_UPX,
     upx_exclude=[],

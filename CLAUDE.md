@@ -77,21 +77,23 @@ tests; `STENOAI_DIARIZE_MODEL_DIR` is the lower-level sidecar override.
 ### Apple System Language Model (macOS only)
 
 Apple Intelligence is offered as an explicit model choice; availability never changes an existing or fresh configuration automatically.
-On-device summarization uses `bin/steno-apple-lm`, a Swift sidecar (`apple-lm-sidecar/`) wrapping `FoundationModels.SystemLanguageModel.default`.
+On-device summarization uses `bin/Steno Apple LM.app`, a minimal sandboxed Swift helper app (`apple-lm-sidecar/`) wrapping `FoundationModels.SystemLanguageModel.default`.
 The OS manages the concrete model behind that API.
-Python talks to the sidecar via `src.apple_lm` (`status` / `complete` / `stream`); prompts go on stdin, and errors are fixed strings.
+Python launches the helper through LaunchServices and talks to it through private named pipes via `src.apple_lm` (`status` / `complete` / `stream`).
+Prompts are not written to disk, and errors are fixed strings.
 Build it before `pyinstaller` when the macOS 26+ SDK is present:
 
 ```
-scripts/build-apple-lm-sidecar.sh   # outputs bin/steno-apple-lm
+scripts/build-apple-lm-sidecar.sh   # outputs bin/Steno Apple LM.app
 ```
 
-`stenoai.spec` bundles the binary only when it exists and only on Darwin.
+`stenoai.spec` validates the helper on Darwin but deliberately leaves it out of the unsandboxed Python backend.
+A custom electron-builder signing hook gives only the nested helper its App Sandbox entitlement and packages it under `Steno.app/Contents/Helpers/`.
 A development host without the SDK omits it and the app keeps Ollama `gemma4:e2b-it-qat`.
 Release builds set `STENOAI_REQUIRE_APPLE_LM_SIDECAR=1`, so a missing helper fails the build.
-The release workflow builds the helper separately with Xcode 27 and copies it verbatim into the backend built on macOS 14, preserving the application's Sonoma compatibility floor.
+The release workflow builds the helper separately with Xcode 27 and packages it beside the backend built on macOS 14, preserving the application's Sonoma compatibility floor.
 Tests isolate with `STENOAI_DISABLE_APPLE_LM=1`; a fake binary can be injected via `STENOAI_APPLE_LM_BIN`.
-Windows/Linux never resolve the sidecar.
+Windows/Linux never resolve the helper.
 
 
 ### End-to-end tests (Playwright)
