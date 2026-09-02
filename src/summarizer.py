@@ -1921,7 +1921,11 @@ TRANSCRIPT:
             is_apple_system_model,
         )
 
-        if self.ai_provider == "local" and is_apple_system_model(model_name):
+        if is_apple_system_model(model_name) and self.ai_provider != "local":
+            logger.error("Apple Intelligence can only be used with the local AI provider")
+            return False
+
+        if is_apple_system_model(model_name):
             if apple_lm_status().get("available") is not True:
                 logger.error("Apple Intelligence is not available")
                 return False

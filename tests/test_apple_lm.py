@@ -347,6 +347,7 @@ class AppleLMResolutionTests(BaseAppleLMTest):
             finally:
                 invocation.close()
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX kill-signal fixture")
     def test_cleanup_finds_token_process_when_pid_report_is_missing(self):
         invocation = _AppleLMAppInvocation.__new__(_AppleLMAppInvocation)
         invocation._helper_pid = None
@@ -607,6 +608,17 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
 
         self.assertEqual(summarizer.model_name, APPLE_SYSTEM_MODEL)
         self.assertIsInstance(summarizer.client, AppleLMClient)
+
+    def test_set_model_rejects_apple_for_remote_provider(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.ai_provider = "remote"
+        summarizer.model_name = "qwen3.5:9b"
+        summarizer.client = mock.Mock()
+
+        self.assertFalse(summarizer.set_model(APPLE_SYSTEM_MODEL))
+
+        self.assertEqual(summarizer.model_name, "qwen3.5:9b")
+        summarizer.client.list.assert_not_called()
 
     def test_set_model_keeps_apple_when_ollama_switch_fails(self):
         summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
