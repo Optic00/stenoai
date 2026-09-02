@@ -1008,7 +1008,7 @@ function ModelList() {
       <ModelCard
         key={m.name}
         icon={getOllamaModelIcon(m.name)}
-        name={modelDisplayName(m.name, m.displayName)}
+        name={m.managed ? modelDisplayName(m.name, m.displayName) : m.name}
         sizeLabel={sizeLabel}
         note={note}
         isCurrent={isCurrent}
