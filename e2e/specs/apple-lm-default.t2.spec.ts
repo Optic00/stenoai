@@ -50,73 +50,73 @@ test('fresh install offers Apple Intelligence without selecting it', async ({
   const unavailableMarker = path.join(fixtureDir, 'unavailable');
 
   try {
-  const { page } = await launchApp({
-    env: {
-      STENOAI_DISABLE_APPLE_LM: '0',
-      STENOAI_APPLE_LM_STATE_FILE: unavailableMarker,
-    },
-  });
+    const { page } = await launchApp({
+      env: {
+        STENOAI_DISABLE_APPLE_LM: '0',
+        STENOAI_APPLE_LM_STATE_FILE: unavailableMarker,
+      },
+    });
 
-  // A fresh install keeps the existing Ollama default.
-  const current = await page.evaluate(() =>
-    (window as StenoWindow).stenoai.models.getCurrent(),
-  );
-  expect(current.success, current.error).toBe(true);
-  expect(current.model).not.toBe('apple:system');
+    // A fresh install keeps the existing Ollama default.
+    const current = await page.evaluate(() =>
+      (window as StenoWindow).stenoai.models.getCurrent(),
+    );
+    expect(current.success, current.error).toBe(true);
+    expect(current.model).not.toBe('apple:system');
 
-  // Provider output agrees with the persisted selection.
-  const provider = await page.evaluate(() =>
-    (window as StenoWindow).stenoai.ai.getProvider(),
-  );
-  expect(provider.success).toBe(true);
-  expect(provider.model).toBe(current.model);
+    // Provider output agrees with the persisted selection.
+    const provider = await page.evaluate(() =>
+      (window as StenoWindow).stenoai.ai.getProvider(),
+    );
+    expect(provider.success).toBe(true);
+    expect(provider.model).toBe(current.model);
 
-  // Apple is available, but config is unchanged until the explicit selection.
-  await expect
-    .poll(() => readUserConfig(userDataDir).model)
-    .not.toBe('apple:system');
+    // Apple is available, but config is unchanged until the explicit selection.
+    await expect
+      .poll(() => readUserConfig(userDataDir).model)
+      .not.toBe('apple:system');
 
-  // models.list includes apple:system as installed
-  const listed = await page.evaluate(() =>
-    (window as StenoWindow).stenoai.models.list(),
-  );
-  expect(listed.success).toBe(true);
-  expect(listed.supported_models?.['apple:system']?.installed).toBe(true);
-  expect(listed.supported_models?.['apple:system']?.description).toContain('OS-managed');
+    // models.list includes apple:system as installed
+    const listed = await page.evaluate(() =>
+      (window as StenoWindow).stenoai.models.list(),
+    );
+    expect(listed.success).toBe(true);
+    expect(listed.supported_models?.['apple:system']?.installed).toBe(true);
+    expect(listed.supported_models?.['apple:system']?.description).toContain('OS-managed');
 
-  // Explicit user switch opts into Apple and records user provenance.
-  await page.evaluate(() =>
-    (window as StenoWindow).stenoai.models.set('apple:system'),
-  );
-  await expect
-    .poll(() => readUserConfig(userDataDir).model)
-    .toBe('apple:system');
-  expect(readUserConfig(userDataDir).summary_model_source).toBe('user');
+    // Explicit user switch opts into Apple and records user provenance.
+    await page.evaluate(() =>
+      (window as StenoWindow).stenoai.models.set('apple:system'),
+    );
+    await expect
+      .poll(() => readUserConfig(userDataDir).model)
+      .toBe('apple:system');
+    expect(readUserConfig(userDataDir).summary_model_source).toBe('user');
 
-  // A later OS availability change must not silently replace the selection.
-  writeFileSync(unavailableMarker, '');
+    // A later OS availability change must not silently replace the selection.
+    writeFileSync(unavailableMarker, '');
 
-  // Re-running first-run setup must preserve that explicit Apple choice.
-  const repeatedSetup = await page.evaluate(() =>
-    (window as StenoWindow).stenoai.setup.ollamaAndModel(),
-  );
-  expect(repeatedSetup.success).toBe(true);
-  expect(repeatedSetup.skipped).toBe(true);
-  const afterRepeatedSetup = await page.evaluate(() =>
-    (window as StenoWindow).stenoai.models.getCurrent(),
-  );
-  expect(afterRepeatedSetup.model).toBe('apple:system');
-  expect(readUserConfig(userDataDir).model).toBe('apple:system');
+    // Re-running first-run setup must preserve that explicit Apple choice.
+    const repeatedSetup = await page.evaluate(() =>
+      (window as StenoWindow).stenoai.setup.ollamaAndModel(),
+    );
+    expect(repeatedSetup.success).toBe(true);
+    expect(repeatedSetup.skipped).toBe(true);
+    const afterRepeatedSetup = await page.evaluate(() =>
+      (window as StenoWindow).stenoai.models.getCurrent(),
+    );
+    expect(afterRepeatedSetup.model).toBe('apple:system');
+    expect(readUserConfig(userDataDir).model).toBe('apple:system');
 
-  const unavailable = await page.evaluate(() =>
-    (window as StenoWindow).stenoai.models.list(),
-  );
-  expect(unavailable.supported_models?.['apple:system']?.installed).toBe(false);
-  expect(unavailable.supported_models?.['apple:system']?.description).toContain(
-    'Enable Apple Intelligence',
-  );
+    const unavailable = await page.evaluate(() =>
+      (window as StenoWindow).stenoai.models.list(),
+    );
+    expect(unavailable.supported_models?.['apple:system']?.installed).toBe(false);
+    expect(unavailable.supported_models?.['apple:system']?.description).toContain(
+      'Enable Apple Intelligence',
+    );
 
-  expect(fileSig(realUserDataDir())).toBe(realDirBefore);
+    expect(fileSig(realUserDataDir())).toBe(realDirBefore);
   } finally {
     rmSync(fixtureDir, { recursive: true, force: true });
   }

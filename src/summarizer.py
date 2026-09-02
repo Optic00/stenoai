@@ -120,6 +120,7 @@ _OVERLAP_RATIO = 0.05             # last 5% of previous chunk prepended to next
 _SNAPSHOT_MAX_CHARS = 2800
 _SNAPSHOT_PROMPT_OVERHEAD_CHARS = 900
 _SNAPSHOT_HEAD_RATIO = 0.6
+_SNAPSHOT_NOTES_TRUNCATION_MARKER = "\n...[notes truncated]"
 
 
 def resolve_num_ctx(model_name: str) -> int:
@@ -638,6 +639,45 @@ class OllamaSummarizer:
             raise ValueError("Snapshot update returned an empty result")
         return self._hard_trim_snapshot(text)
 
+    def _create_snapshot_final_prompt(
+        self,
+        snapshot: str,
+        language: str,
+        notes: Optional[str],
+        template_prompt: Optional[str],
+    ) -> str:
+        """Build the Apple format prompt without exceeding its input budget."""
+        def create(notes_value: Optional[str]) -> str:
+            if template_prompt:
+                return self._create_template_report_prompt(
+                    snapshot, template_prompt, language, notes=notes_value
+                )
+            return self._create_markdown_prompt(snapshot, language, notes=notes_value)
+
+        clean_notes = (notes or "").strip()
+        if not clean_notes:
+            return create(None)
+
+        prompt = create(clean_notes)
+        input_budget = (
+            resolve_num_ctx(self.model_name) * _CHUNK_SAFETY_CHARS_PER_TOKEN
+            - MAP_OUTPUT_MAX_TOKENS * _CHUNK_SAFETY_CHARS_PER_TOKEN
+        )
+        if len(prompt) <= input_budget:
+            return prompt
+
+        base_prompt = create(None)
+        one_char_prompt = create("x")
+        notes_wrapper_chars = len(one_char_prompt) - len(base_prompt) - 1
+        notes_budget = max(0, input_budget - len(base_prompt) - notes_wrapper_chars)
+        if notes_budget <= len(_SNAPSHOT_NOTES_TRUNCATION_MARKER):
+            return base_prompt
+        bounded_notes = (
+            clean_notes[:notes_budget - len(_SNAPSHOT_NOTES_TRUNCATION_MARKER)]
+            + _SNAPSHOT_NOTES_TRUNCATION_MARKER
+        )
+        return create(bounded_notes)
+
     def _snapshot_compact_streaming(
         self,
         transcript: str,
@@ -658,12 +698,9 @@ class OllamaSummarizer:
             )
         if progress_callback:
             progress_callback(n + 1, n)
-        if template_prompt:
-            prompt = self._create_template_report_prompt(
-                snapshot, template_prompt, language, notes=notes
-            )
-        else:
-            prompt = self._create_markdown_prompt(snapshot, language, notes=notes)
+        prompt = self._create_snapshot_final_prompt(
+            snapshot, language, notes, template_prompt
+        )
         yielded = []
         for chunk in self._stream_direct(prompt):
             if chunk:

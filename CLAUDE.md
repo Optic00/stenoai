@@ -92,7 +92,7 @@ A custom electron-builder signing hook gives only the nested helper its App Sand
 A development host without the SDK omits it and the app keeps Ollama `gemma4:e2b-it-qat`.
 Release builds set `STENOAI_REQUIRE_APPLE_LM_SIDECAR=1`, so a missing helper fails the build.
 The release workflow builds the helper separately with Xcode 27 and packages it beside the backend built on macOS 14, preserving the application's Sonoma compatibility floor.
-Tests isolate with `STENOAI_DISABLE_APPLE_LM=1`; a fake binary can be injected via `STENOAI_APPLE_LM_BIN`.
+Tests isolate with `STENOAI_DISABLE_APPLE_LM=1`; an unfrozen E2E process can inject a fake binary via `STENOAI_APPLE_LM_BIN` only when `STENOAI_E2E=1`.
 Windows/Linux never resolve the helper.
 
 

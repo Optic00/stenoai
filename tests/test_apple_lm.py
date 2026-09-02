@@ -613,7 +613,7 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
         self.assertTrue(trimmed.endswith("T"))
         self.assertIn("...", trimmed)
 
-    def test_snapshot_compaction_bounds_initial_notes_and_preserves_final_notes(self):
+    def test_snapshot_compaction_bounds_initial_and_final_notes(self):
         summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
         summarizer.model_name = APPLE_SYSTEM_MODEL
         prompts = []
@@ -627,14 +627,26 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
             side_effect=lambda prompt: final_prompts.append(prompt) or iter(["summary"])
         )
 
-        notes = "N" * 10_000
+        notes = "N" * 40_000
         self.assertEqual(
             "".join(summarizer._snapshot_compact_streaming("text", notes=notes)),
             "summary",
         )
         self.assertLess(len(prompts[0]), len(notes))
         self.assertEqual(len(final_prompts), 1)
-        self.assertIn(notes, final_prompts[0])
+        self.assertNotIn(notes, final_prompts[0])
+        self.assertIn("N" * 1_000, final_prompts[0])
+        self.assertIn("...[notes truncated]", final_prompts[0])
+        from src.summarizer import (
+            _CHUNK_SAFETY_CHARS_PER_TOKEN,
+            MAP_OUTPUT_MAX_TOKENS,
+            resolve_num_ctx,
+        )
+        input_budget = (
+            resolve_num_ctx(APPLE_SYSTEM_MODEL) * _CHUNK_SAFETY_CHARS_PER_TOKEN
+            - MAP_OUTPUT_MAX_TOKENS * _CHUNK_SAFETY_CHARS_PER_TOKEN
+        )
+        self.assertLessEqual(len(final_prompts[0]), input_budget)
 
 
 class AppleLMCLITests(BaseAppleLMTest):
