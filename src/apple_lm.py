@@ -141,6 +141,19 @@ _UNAVAILABLE_MESSAGES = {
     "unavailable": "Apple Intelligence is not available on this system.",
 }
 
+_HIDDEN_UNAVAILABLE_REASONS = {"disabled", "unsupported_os"}
+
+_GENERATION_ERROR_MESSAGES = {
+    "guardrail": "Apple Intelligence could not process this content.",
+    "refusal": "Apple Intelligence declined to process this content.",
+    "context_window": "This meeting is too long for Apple Intelligence to process in one request.",
+    "assets_unavailable": "Apple Intelligence model assets are unavailable.",
+    "unsupported_language": "Apple Intelligence does not support the selected language or locale.",
+    "rate_limited": "Apple Intelligence is temporarily busy. Try again shortly.",
+    "concurrent_requests": "Apple Intelligence is already processing another request.",
+    "timeout": "Apple Intelligence timed out.",
+}
+
 
 def apple_lm_unavailable_message(status: Optional[Dict[str, Any]] = None) -> str:
     """Return user-safe copy for the sidecar's fixed availability reasons."""
@@ -152,8 +165,32 @@ def apple_lm_unavailable_message(status: Optional[Dict[str, Any]] = None) -> str
     )
 
 
-def apple_system_model_info(*, is_default: bool = False) -> Dict[str, str]:
-    status = apple_lm_status()
+def apple_lm_should_list(
+    status: Optional[Dict[str, Any]] = None,
+    *,
+    selected: bool = False,
+) -> bool:
+    """Show actionable Tahoe availability states without advertising on older OSes."""
+    payload = status if status is not None else apple_lm_status()
+    if selected or payload.get("available"):
+        return True
+    return payload.get("reason") not in _HIDDEN_UNAVAILABLE_REASONS
+
+
+def apple_lm_generation_error_message(reason: Optional[str]) -> str:
+    """Return user-safe copy for fixed sidecar generation failure reasons."""
+    return _GENERATION_ERROR_MESSAGES.get(
+        reason,
+        "Apple Intelligence request failed",
+    )
+
+
+def apple_system_model_info(
+    *,
+    is_default: bool = False,
+    status: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    status = status if status is not None else apple_lm_status()
     default_bit = " (selected)" if is_default else ""
     display = status.get("display_name") or "Apple Intelligence"
     availability_bit = (
@@ -177,8 +214,10 @@ def complete(prompt: str, timeout: float = 7200) -> str:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise RuntimeError("Apple Intelligence returned invalid output") from exc
-    if not isinstance(payload, dict) or payload.get("error"):
+    if not isinstance(payload, dict):
         raise RuntimeError("Apple Intelligence request failed")
+    if payload.get("error"):
+        raise RuntimeError(apple_lm_generation_error_message(payload.get("reason")))
     text = payload.get("text") or ""
     if not isinstance(text, str) or not text.strip():
         raise RuntimeError("Apple Intelligence returned an empty response")
@@ -198,6 +237,7 @@ def stream_complete(prompt: str, timeout: float = 7200) -> Iterator[str]:
     )
     assert proc.stdin is not None
     assert proc.stdout is not None
+    reader_thread: Optional[threading.Thread] = None
     try:
         proc.stdin.write(prompt)
         proc.stdin.close()
@@ -233,8 +273,10 @@ def stream_complete(prompt: str, timeout: float = 7200) -> Iterator[str]:
                 rec = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise RuntimeError("Apple Intelligence returned invalid output") from exc
-            if not isinstance(rec, dict) or rec.get("error"):
+            if not isinstance(rec, dict):
                 raise RuntimeError("Apple Intelligence request failed")
+            if rec.get("error"):
+                raise RuntimeError(apple_lm_generation_error_message(rec.get("reason")))
             if rec.get("done"):
                 return
             delta = rec.get("delta") or ""
@@ -246,6 +288,11 @@ def stream_complete(prompt: str, timeout: float = 7200) -> Iterator[str]:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+        if reader_thread is not None:
+            reader_thread.join(timeout=1)
+        proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()
 
 def _run_apple_lm(
     args: list[str],
@@ -269,7 +316,12 @@ def _run_apple_lm(
     except subprocess.TimeoutExpired as exc:
         raise TimeoutError("Apple Intelligence timed out") from exc
     if proc.returncode != 0:
-        raise RuntimeError("Apple Intelligence request failed")
+        try:
+            payload = json.loads(proc.stdout or "")
+        except json.JSONDecodeError:
+            payload = None
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        raise RuntimeError(apple_lm_generation_error_message(reason))
     return (proc.stdout or "").strip()
 
 

@@ -48,6 +48,7 @@ test('fresh install offers Apple Intelligence without selecting it', async ({
   const realDirBefore = fileSig(realUserDataDir());
   const fixtureDir = mkdtempSync(path.join(tmpdir(), 'stenoai-apple-lm-'));
   const mockScript = path.join(fixtureDir, 'mock-steno-apple-lm.sh');
+  const unavailableMarker = path.join(fixtureDir, 'unavailable');
 
   writeFileSync(
     mockScript,
@@ -57,7 +58,11 @@ test('fresh install offers Apple Intelligence without selecting it', async ({
       'cmd="${1:-status}"',
       'case "$cmd" in',
       '  status)',
-      '    echo \'{"available":true,"display_name":"Apple Intelligence"}\'',
+      '    if [[ -f "${STENOAI_APPLE_LM_STATE_FILE:-}" ]]; then',
+      '      echo \'{"available":false,"reason":"appleIntelligenceNotEnabled"}\'',
+      '    else',
+      '      echo \'{"available":true,"display_name":"Apple Intelligence"}\'',
+      '    fi',
       '    ;;',
       '  complete)',
       '    echo \'{"text":"Mocked response"}\'',
@@ -79,6 +84,7 @@ test('fresh install offers Apple Intelligence without selecting it', async ({
     env: {
       STENOAI_DISABLE_APPLE_LM: '0',
       STENOAI_APPLE_LM_BIN: mockScript,
+      STENOAI_APPLE_LM_STATE_FILE: unavailableMarker,
     },
   });
 
@@ -118,6 +124,9 @@ test('fresh install offers Apple Intelligence without selecting it', async ({
     .toBe('apple:system');
   expect(readUserConfig(userDataDir).summary_model_source).toBe('user');
 
+  // A later OS availability change must not silently replace the selection.
+  writeFileSync(unavailableMarker, '');
+
   // Re-running first-run setup must preserve that explicit Apple choice.
   const repeatedSetup = await page.evaluate(() =>
     (window as StenoWindow).stenoai.setup.ollamaAndModel(),
@@ -129,6 +138,14 @@ test('fresh install offers Apple Intelligence without selecting it', async ({
   );
   expect(afterRepeatedSetup.model).toBe('apple:system');
   expect(readUserConfig(userDataDir).model).toBe('apple:system');
+
+  const unavailable = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.models.list(),
+  );
+  expect(unavailable.supported_models?.['apple:system']?.installed).toBe(false);
+  expect(unavailable.supported_models?.['apple:system']?.description).toContain(
+    'Enable Apple Intelligence',
+  );
 
   expect(fileSig(realUserDataDir())).toBe(realDirBefore);
 });

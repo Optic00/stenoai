@@ -75,6 +75,8 @@ the Steno user-data directory and therefore honors `STENOAI_USER_DATA_DIR` in
 tests; `STENOAI_DIARIZE_MODEL_DIR` is the lower-level sidecar override.
 
 ### Apple System Language Model (macOS only)
+
+Apple Intelligence is offered as an explicit model choice; availability never changes an existing or fresh configuration automatically.
 On-device summarization uses `bin/steno-apple-lm`, a Swift sidecar (`apple-lm-sidecar/`) wrapping `FoundationModels.SystemLanguageModel.default`.
 The OS manages the concrete model behind that API.
 Python talks to the sidecar via `src.apple_lm` (`status` / `complete` / `stream`); prompts go on stdin, and errors are fixed strings.
@@ -87,7 +89,7 @@ scripts/build-apple-lm-sidecar.sh   # outputs bin/steno-apple-lm
 `stenoai.spec` bundles the binary only when it exists and only on Darwin.
 A development host without the SDK omits it and the app keeps Ollama `gemma4:e2b-it-qat`.
 Release builds set `STENOAI_REQUIRE_APPLE_LM_SIDECAR=1`, so a missing helper fails the build.
-The release workflow builds the helper separately on macOS 26 and copies it verbatim into the backend built on macOS 14, preserving the application's Sonoma compatibility floor.
+The release workflow builds the helper separately with Xcode 27 and copies it verbatim into the backend built on macOS 14, preserving the application's Sonoma compatibility floor.
 Tests isolate with `STENOAI_DISABLE_APPLE_LM=1`; a fake binary can be injected via `STENOAI_APPLE_LM_BIN`.
 Windows/Linux never resolve the sidecar.
 

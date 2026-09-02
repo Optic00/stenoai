@@ -18,7 +18,7 @@ struct StenoAppleLM {
                 exit(2)
             }
         } catch {
-            emitError()
+            emitError(error)
             exit(1)
         }
     }
@@ -35,9 +35,109 @@ private func printJSON(_ object: [String: Any]) throws {
     FileHandle.standardOutput.write(Data("\n".utf8))
 }
 
-private func emitError() {
+private func emitError(_ error: Error) {
     // Fixed keys only — never echo the prompt or model output.
-    try? printJSON(["error": "apple_lm_failed"])
+    var reason = "generation_failed"
+#if compiler(>=6.4)
+    if #available(macOS 27.0, *) {
+        if let modelError = error as? LanguageModelError {
+            reason = languageModelErrorReason(modelError)
+        } else if let modelError = error as? SystemLanguageModel.Error {
+            reason = systemLanguageModelErrorReason(modelError)
+        } else if let sessionError = error as? LanguageModelSession.Error {
+            reason = languageModelSessionErrorReason(sessionError)
+        } else if let generationError = error as? LanguageModelSession.GenerationError {
+            reason = generationErrorReason(generationError)
+        }
+    } else if #available(macOS 26.0, *),
+              let generationError = error as? LanguageModelSession.GenerationError {
+        reason = generationErrorReason(generationError)
+    }
+#else
+    if #available(macOS 26.0, *),
+       let generationError = error as? LanguageModelSession.GenerationError {
+        reason = generationErrorReason(generationError)
+    }
+#endif
+    try? printJSON(["error": "apple_lm_failed", "reason": reason])
+}
+
+#if compiler(>=6.4)
+@available(macOS 27.0, *)
+private func languageModelErrorReason(_ error: LanguageModelError) -> String {
+    switch error {
+    case .contextSizeExceeded:
+        return "context_window"
+    case .rateLimited:
+        return "rate_limited"
+    case .guardrailViolation:
+        return "guardrail"
+    case .refusal:
+        return "refusal"
+    case .unsupportedLanguageOrLocale:
+        return "unsupported_language"
+    case .timeout:
+        return "timeout"
+    case .unsupportedCapability,
+         .unsupportedTranscriptContent,
+         .unsupportedGenerationGuide:
+        return "generation_failed"
+    @unknown default:
+        return "generation_failed"
+    }
+}
+
+@available(macOS 27.0, *)
+private func systemLanguageModelErrorReason(
+    _ error: SystemLanguageModel.Error
+) -> String {
+    switch error {
+    case .assetsUnavailable:
+        return "assets_unavailable"
+    @unknown default:
+        return "generation_failed"
+    }
+}
+
+@available(macOS 27.0, *)
+private func languageModelSessionErrorReason(
+    _ error: LanguageModelSession.Error
+) -> String {
+    switch error {
+    case .concurrentRequests:
+        return "concurrent_requests"
+    case .transcriptMutationWhileResponding:
+        return "generation_failed"
+    @unknown default:
+        return "generation_failed"
+    }
+}
+#endif
+
+@available(macOS 26.0, *)
+private func generationErrorReason(
+    _ error: LanguageModelSession.GenerationError
+) -> String {
+    switch error {
+    case .exceededContextWindowSize:
+        return "context_window"
+    case .assetsUnavailable:
+        return "assets_unavailable"
+    case .guardrailViolation:
+        return "guardrail"
+    case .unsupportedGuide, .decodingFailure:
+        return "generation_failed"
+    case .unsupportedLanguageOrLocale:
+        return "unsupported_language"
+    case .rateLimited:
+        return "rate_limited"
+    case .concurrentRequests:
+        return "concurrent_requests"
+    case .refusal:
+        return "refusal"
+    @unknown default:
+        return "generation_failed"
+    }
 }
 
 private func printStatus() throws {

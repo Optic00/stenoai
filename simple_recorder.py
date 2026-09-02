@@ -4690,18 +4690,24 @@ def list_models():
                         info['installed'] = True
         from src.apple_lm import (
             APPLE_SYSTEM_MODEL,
-            apple_lm_available,
+            apple_lm_should_list,
+            apple_lm_status,
             apple_system_model_info,
             is_apple_system_model,
         )
-        if provider == "local" and (apple_lm_available() or is_apple_system_model(current_model)):
-            is_def = (current_model == APPLE_SYSTEM_MODEL)
-            apple_info = {
-                **apple_system_model_info(is_default=is_def),
-                "installed": apple_lm_available(),
-                "gguf_installed": False,
-            }
-            models = {APPLE_SYSTEM_MODEL: apple_info, **models}
+        if provider == "local":
+            apple_status = apple_lm_status()
+            apple_selected = is_apple_system_model(current_model)
+            if apple_lm_should_list(apple_status, selected=apple_selected):
+                apple_info = {
+                    **apple_system_model_info(
+                        is_default=apple_selected,
+                        status=apple_status,
+                    ),
+                    "installed": bool(apple_status.get("available")),
+                    "gguf_installed": False,
+                }
+                models = {APPLE_SYSTEM_MODEL: apple_info, **models}
         result = {
             "current_model": current_model,
             "supported_models": models,

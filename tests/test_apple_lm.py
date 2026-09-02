@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,10 +15,14 @@ from src.apple_lm import (
     APPLE_SYSTEM_MODEL,
     APPLE_LM_NUM_CTX,
     AppleLMClient,
+    apple_lm_generation_error_message,
+    apple_lm_should_list,
     apple_system_model_info,
     apple_lm_unavailable_message,
+    complete,
     is_apple_system_model,
     reset_apple_lm_cache,
+    stream_complete,
 )
 from src.config import Config
 from src.summarizer import OllamaSummarizer, resolve_num_ctx
@@ -87,6 +93,66 @@ class AppleLMResolutionTests(BaseAppleLMTest):
             info = apple_system_model_info(is_default=True)
             self.assertIn("OS-managed", info["description"])
             self.assertIn("(selected)", info["description"])
+
+    def test_actionable_unavailability_is_listed(self):
+        status = {"available": False, "reason": "appleIntelligenceNotEnabled"}
+        self.assertTrue(apple_lm_should_list(status))
+        self.assertFalse(
+            apple_lm_should_list({"available": False, "reason": "unsupported_os"})
+        )
+
+    def test_generation_error_maps_fixed_reason(self):
+        self.assertIn("declined", apple_lm_generation_error_message("refusal"))
+        self.assertEqual(
+            apple_lm_generation_error_message("unknown"),
+            "Apple Intelligence request failed",
+        )
+
+    def test_complete_preserves_fixed_refusal_reason(self):
+        payload = json.dumps({"error": "apple_lm_failed", "reason": "refusal"})
+        with mock.patch("src.apple_lm._run_apple_lm", return_value=payload):
+            with self.assertRaisesRegex(RuntimeError, "declined"):
+                complete("synthetic prompt")
+
+    def test_nonzero_sidecar_preserves_fixed_guardrail_reason(self):
+        failed = subprocess.CompletedProcess(
+            args=["steno-apple-lm", "complete"],
+            returncode=1,
+            stdout=json.dumps(
+                {"error": "apple_lm_failed", "reason": "guardrail"}
+            ),
+            stderr="",
+        )
+        with mock.patch("src.apple_lm.resolve_apple_lm_bin", return_value="sidecar"), \
+             mock.patch("src.apple_lm.subprocess.run", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "could not process"):
+                complete("synthetic prompt")
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX executable fixture")
+    def test_stream_timeout_terminates_sidecar_process(self):
+        script = Path(self._tmp_dir.name) / "slow-apple-lm"
+        script.write_text(
+            f"#!{sys.executable}\n"
+            "import sys, time\n"
+            "sys.stdin.read()\n"
+            "time.sleep(30)\n"
+        )
+        script.chmod(0o755)
+        captured = []
+        real_popen = subprocess.Popen
+
+        def capture_process(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            captured.append(proc)
+            return proc
+
+        with mock.patch("src.apple_lm.resolve_apple_lm_bin", return_value=str(script)), \
+             mock.patch("src.apple_lm.subprocess.Popen", side_effect=capture_process):
+            with self.assertRaisesRegex(TimeoutError, "stream timed out"):
+                list(stream_complete("synthetic prompt", timeout=0.05))
+
+        self.assertEqual(len(captured), 1)
+        self.assertIsNotNone(captured[0].poll())
 
 
 class AppleLMConfigOptInTests(BaseAppleLMTest):
@@ -269,7 +335,7 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
 
 class AppleLMCLITests(BaseAppleLMTest):
     def test_list_models_prepends_apple_system_when_available(self):
-        with mock.patch("src.apple_lm.apple_lm_available", return_value=True), \
+        with mock.patch("src.apple_lm.apple_lm_status", return_value={"available": True}), \
              mock.patch("src.config.Config.get_model", return_value=APPLE_SYSTEM_MODEL):
             runner = CliRunner()
             result = runner.invoke(simple_recorder.list_models)
@@ -279,7 +345,8 @@ class AppleLMCLITests(BaseAppleLMTest):
             self.assertTrue(data["supported_models"][APPLE_SYSTEM_MODEL]["installed"])
 
     def test_list_models_shows_apple_system_not_installed_when_unavailable(self):
-        with mock.patch("src.apple_lm.apple_lm_available", return_value=False), \
+        status = {"available": False, "reason": "appleIntelligenceNotEnabled"}
+        with mock.patch("src.apple_lm.apple_lm_status", return_value=status), \
              mock.patch("src.config.Config.get_model", return_value=APPLE_SYSTEM_MODEL):
             runner = CliRunner()
             result = runner.invoke(simple_recorder.list_models)
@@ -287,6 +354,28 @@ class AppleLMCLITests(BaseAppleLMTest):
             data = json.loads(result.output)
             self.assertIn(APPLE_SYSTEM_MODEL, data["supported_models"])
             self.assertFalse(data["supported_models"][APPLE_SYSTEM_MODEL]["installed"])
+
+    def test_list_models_offers_actionable_unavailable_apple_system(self):
+        status = {"available": False, "reason": "appleIntelligenceNotEnabled"}
+        with mock.patch("src.apple_lm.apple_lm_status", return_value=status), \
+             mock.patch("src.config.Config.get_model", return_value=Config.DEFAULT_MODEL):
+            runner = CliRunner()
+            result = runner.invoke(simple_recorder.list_models)
+            self.assertEqual(result.exit_code, 0)
+            data = json.loads(result.output)
+            apple = data["supported_models"][APPLE_SYSTEM_MODEL]
+            self.assertFalse(apple["installed"])
+            self.assertIn("Enable Apple Intelligence", apple["description"])
+
+    def test_list_models_hides_apple_system_on_unsupported_os(self):
+        status = {"available": False, "reason": "unsupported_os"}
+        with mock.patch("src.apple_lm.apple_lm_status", return_value=status), \
+             mock.patch("src.config.Config.get_model", return_value=Config.DEFAULT_MODEL):
+            runner = CliRunner()
+            result = runner.invoke(simple_recorder.list_models)
+            self.assertEqual(result.exit_code, 0)
+            data = json.loads(result.output)
+            self.assertNotIn(APPLE_SYSTEM_MODEL, data["supported_models"])
 
     def test_check_model_for_apple_system(self):
         with mock.patch("src.apple_lm.apple_lm_available", return_value=True):
