@@ -23,7 +23,7 @@ describe('ModelCard delete button', () => {
     ).toBeTruthy();
   });
 
-  test('a managed unavailable model cannot be selected or deleted', () => {
+  test('a disabled non-deletable card cannot be selected or deleted', () => {
     render(
       <ModelCard
         name="Apple Intelligence"

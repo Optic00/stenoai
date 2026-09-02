@@ -236,7 +236,7 @@ jobs:
           from src.apple_lm import apple_lm_status
 
           status = apple_lm_status()
-          assert "available" in status, status
+          assert isinstance(status.get("available"), bool), status
           assert status.get("reason") != "sidecar_error", status
           print(status)
           PY

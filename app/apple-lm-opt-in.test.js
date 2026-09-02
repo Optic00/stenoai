@@ -51,19 +51,20 @@ test('re-running setup preserves an explicit Apple Intelligence choice', () => {
 
 test('setup fails closed when the current model cannot be read', () => {
   const setup = handlerBody('setup-ollama-and-model');
-  const failureLog = setup.indexOf('Could not read current summary model:');
-  const retryError = setup.indexOf('Please retry setup.', failureLog);
-
-  assert.notStrictEqual(failureLog, -1);
-  assert.ok(retryError > failureLog);
+  assert.match(
+    setup,
+    /catch \(e\) \{\s*sendDebugLog\(`Could not read current summary model:[\s\S]*?return \{ success: false, error: 'Could not read current summary model\. Please retry setup\.' \};\s*\}/,
+  );
   assert.doesNotMatch(setup, /Could not read current summary model, proceeding/);
 });
 
 test('setup fails closed when the provider cannot be read', () => {
   const setup = handlerBody('setup-ollama-and-model');
 
-  assert.match(setup, /Could not read AI provider:/);
-  assert.match(setup, /Could not read the AI provider\. Please retry setup\./);
+  assert.match(
+    setup,
+    /catch \(e\) \{\s*sendDebugLog\(`Could not read AI provider:[\s\S]*?return \{ success: false, error: 'Could not read the AI provider\. Please retry setup\.' \};\s*\}/,
+  );
   assert.doesNotMatch(setup, /Could not read AI provider, proceeding/);
 });
 

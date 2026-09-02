@@ -4785,7 +4785,8 @@ def set_model_if_current(expected_model, model_name):
 
     try:
         current_model = config.get_model()
-        if current_model != expected_model:
+        current_source = config.get("summary_model_source")
+        if current_model != expected_model or current_source == "user":
             config.rollback_transaction()
             print(json.dumps({
                 "success": True,

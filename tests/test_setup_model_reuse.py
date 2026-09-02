@@ -188,6 +188,26 @@ class SetModelIfCurrentTests(unittest.TestCase):
         fake_config.rollback_transaction.assert_called_once_with()
         fake_config.set_model.assert_not_called()
 
+    def test_preserves_same_model_after_user_aba_change(self):
+        fake_config = mock.Mock()
+        fake_config.begin_transaction.return_value = True
+        fake_config.get_model.return_value = "gemma4:e2b-it-qat"
+        fake_config.get.return_value = "user"
+
+        result = self._invoke(fake_config)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            json.loads(result.output),
+            {
+                "success": True,
+                "updated": False,
+                "model": "gemma4:e2b-it-qat",
+            },
+        )
+        fake_config.rollback_transaction.assert_called_once_with()
+        fake_config.set_model.assert_not_called()
+
     def test_updates_matching_selection_as_setup_provenance(self):
         fake_config = mock.Mock()
         fake_config.begin_transaction.return_value = True
