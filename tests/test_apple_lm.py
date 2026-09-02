@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -11,10 +12,12 @@ from unittest import mock
 from click.testing import CliRunner
 
 import simple_recorder
+import src.config as config_module
 from src.apple_lm import (
     APPLE_SYSTEM_MODEL,
     APPLE_LM_NUM_CTX,
     AppleLMClient,
+    _AppleLMAppInvocation,
     _helper_app_for_binary,
     _run_apple_lm_app,
     apple_lm_generation_error_message,
@@ -35,12 +38,15 @@ from src.summarizer import OllamaSummarizer, resolve_num_ctx
 class BaseAppleLMTest(unittest.TestCase):
     def setUp(self):
         reset_apple_lm_cache()
+        self._old_config_instance = config_module._config_instance
+        config_module._config_instance = None
         self._tmp_dir = tempfile.TemporaryDirectory()
         self._old_user_data = os.environ.get("STENOAI_USER_DATA_DIR")
         os.environ["STENOAI_USER_DATA_DIR"] = self._tmp_dir.name
 
     def tearDown(self):
         reset_apple_lm_cache()
+        config_module._config_instance = self._old_config_instance
         if self._old_user_data is not None:
             os.environ["STENOAI_USER_DATA_DIR"] = self._old_user_data
         else:
@@ -289,6 +295,63 @@ class AppleLMResolutionTests(BaseAppleLMTest):
 
         invocation.close.assert_called_once_with()
 
+    @unittest.skipIf(sys.platform == "win32", "LaunchServices fixture uses FIFOs")
+    def test_launch_services_adds_private_cleanup_identity(self):
+        launcher = mock.Mock()
+        launcher.poll.return_value = 0
+        launcher.stderr = None
+        with mock.patch.object(_AppleLMAppInvocation, "_write_prompt"), \
+             mock.patch.object(_AppleLMAppInvocation, "_read_stdout"), \
+             mock.patch.object(_AppleLMAppInvocation, "_read_stderr"), \
+             mock.patch("src.apple_lm.subprocess.Popen", return_value=launcher) as popen:
+            invocation = _AppleLMAppInvocation(
+                Path("/tmp/Steno Apple LM.app"),
+                ["complete"],
+                "synthetic prompt",
+            )
+            command = popen.call_args.args[0]
+            try:
+                self.assertIn(
+                    f"STENOAI_APPLE_LM_LEASE_FILE={invocation._lease_path}",
+                    command,
+                )
+                self.assertIn(invocation._invocation_token, command)
+            finally:
+                invocation.close()
+
+    def test_cleanup_finds_token_process_when_pid_report_is_missing(self):
+        invocation = _AppleLMAppInvocation.__new__(_AppleLMAppInvocation)
+        invocation._helper_pid = None
+        invocation._helper_pid_ready = mock.Mock()
+        invocation._launcher = mock.Mock()
+        invocation._launcher.poll.return_value = None
+        invocation._launcher.wait.side_effect = [
+            subprocess.TimeoutExpired("open", 2),
+            None,
+        ]
+        invocation._launcher.stderr = None
+        invocation._matching_invocation_pids = mock.Mock(
+            side_effect=[{4321}, {4321}]
+        )
+        invocation._unblock_fifos = mock.Mock()
+        invocation._join_threads = mock.Mock()
+        invocation._temp_dir = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            invocation._lease_path = Path(tmp) / "lease"
+            invocation._lease_path.write_text("active", encoding="utf-8")
+            with mock.patch("src.apple_lm.os.kill") as kill:
+                invocation.close()
+
+        self.assertFalse(invocation._lease_path.exists())
+        self.assertEqual(
+            kill.call_args_list,
+            [
+                mock.call(4321, signal.SIGTERM),
+                mock.call(4321, signal.SIGKILL),
+            ],
+        )
+        invocation._launcher.kill.assert_called_once_with()
+
     def test_launch_services_preserves_launcher_failure(self):
         invocation = mock.Mock()
         invocation.iter_lines.return_value = iter([])
@@ -464,6 +527,46 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
             chunks = [c["message"]["content"] for c in stream]
             self.assertEqual(chunks, ["Hello", " world"])
 
+    def test_apple_failure_does_not_retry_ignored_think_option(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.ai_provider = "local"
+        summarizer.model_name = APPLE_SYSTEM_MODEL
+        client = mock.Mock()
+        client.chat.side_effect = RuntimeError("synthetic failure")
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic failure"):
+            summarizer._chat_no_think(
+                client,
+                model=APPLE_SYSTEM_MODEL,
+                messages=[{"role": "user", "content": "prompt"}],
+            )
+
+        client.chat.assert_called_once()
+        self.assertNotIn("think", client.chat.call_args.kwargs)
+
+    def test_apple_stream_failure_does_not_retry_ignored_think_option(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.ai_provider = "local"
+        summarizer.model_name = APPLE_SYSTEM_MODEL
+        client = mock.Mock()
+
+        def failed_stream():
+            raise RuntimeError("synthetic stream failure")
+            yield
+
+        client.chat.return_value = failed_stream()
+        with self.assertRaisesRegex(RuntimeError, "synthetic stream failure"):
+            list(
+                summarizer._chat_stream_no_think(
+                    client,
+                    model=APPLE_SYSTEM_MODEL,
+                    messages=[{"role": "user", "content": "prompt"}],
+                )
+            )
+
+        client.chat.assert_called_once()
+        self.assertNotIn("think", client.chat.call_args.kwargs)
+
     def test_generate_title_routes_through_apple_lm(self):
         cfg = mock.Mock()
         cfg.get_ai_provider.return_value = "local"
@@ -527,7 +630,6 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
                 "chat",
                 side_effect=[
                     RuntimeError("first call failed"),
-                    RuntimeError("compatibility retry failed"),
                     {"message": {"content": payload}},
                 ],
             ) as chat:
@@ -535,8 +637,53 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
 
         self.assertIsNotNone(result)
         self.assertEqual(result.overview, "Summary")
-        self.assertEqual(chat.call_count, 3)
+        self.assertEqual(chat.call_count, 2)
         ollama_client.assert_not_called()
+
+    def test_long_legacy_batch_summary_uses_bounded_snapshot_prompt(self):
+        cfg = mock.Mock()
+        cfg.get_ai_provider.return_value = "local"
+        cfg.get_remote_ollama_url.return_value = None
+        cfg.get_model.return_value = APPLE_SYSTEM_MODEL
+        payload = json.dumps({"overview": "Summary", "participants": []})
+
+        with mock.patch(
+            "src.apple_lm.apple_lm_status",
+            return_value={"available": True},
+        ):
+            summarizer = OllamaSummarizer(config=cfg)
+        summarizer._build_apple_snapshot = mock.Mock(
+            return_value="BOUNDED SNAPSHOT"
+        )
+        summarizer.client.chat = mock.Mock(
+            return_value={"message": {"content": payload}}
+        )
+
+        transcript = "HEAD\n" + "M" * 30_000 + "\nTAIL"
+        result = summarizer.summarize_transcript(transcript, 30)
+
+        self.assertIsNotNone(result)
+        summarizer._build_apple_snapshot.assert_called_once_with(
+            transcript,
+            None,
+        )
+        prompt = summarizer.client.chat.call_args.kwargs["messages"][0]["content"]
+        self.assertIn("BOUNDED SNAPSHOT", prompt)
+        self.assertNotIn("M" * 10_000, prompt)
+        self.assertLessEqual(len(prompt), summarizer._apple_input_budget_chars())
+
+    def test_legacy_snapshot_prompt_bounds_large_notes(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.model_name = APPLE_SYSTEM_MODEL
+
+        prompt = summarizer._create_snapshot_permissive_prompt(
+            "bounded snapshot",
+            "en",
+            "N" * 40_000,
+        )
+
+        self.assertLessEqual(len(prompt), summarizer._apple_input_budget_chars())
+        self.assertIn("...[notes truncated]", prompt)
 
     def test_connection_checks_apple_availability_without_ollama_list(self):
         cfg = mock.Mock()

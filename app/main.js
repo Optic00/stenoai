@@ -80,6 +80,7 @@ const {
 } = require('./shortcut-url');
 const { parseSetupCheckOutput } = require('./setup-check-parse');
 const { parseSpeakerModelStatusOutput } = require('./speaker-model-status');
+const { assertOllamaSetupModel, modelSetupSaveError } = require('./model-setup-guard');
 const { isDiagnosticStdoutLine, sanitizeArgsForLog } = require('./diagnostics-filter');
 // Pure analytics bucketing/classification/sanitization lives in
 // ./analytics-helpers (unit-tested). trackEvent() itself and every IPC
@@ -7285,6 +7286,14 @@ function forwardDiagnosticStdout(line, source) { // eslint-disable-line no-unuse
   if (isDiagnosticStdoutLine(line)) sendDebugLog(line.trim());
 }
 
+async function setOllamaSetupModelIfCurrent(expectedModel, targetModel) {
+  return runPythonScript(
+    'simple_recorder.py',
+    ['set-model-if-current', expectedModel, assertOllamaSetupModel(targetModel)],
+    true,
+  );
+}
+
 ipcMain.handle('setup-ollama-and-model', async () => {
   try {
     // Check AI provider -- skip local Ollama setup for remote/cloud
@@ -7441,10 +7450,9 @@ ipcMain.handle('setup-ollama-and-model', async () => {
     if (resolved && resolved.installed) {
       try {
         sendDebugLog(`Found already-installed model "${resolved.installed}" - skipping download`);
-        const setRaw = await runPythonScript(
-          'simple_recorder.py',
-          ['set-model-if-current', setupModelAtStart, resolved.installed],
-          true,
+        const setRaw = await setOllamaSetupModelIfCurrent(
+          setupModelAtStart,
+          resolved.installed,
         );
         const jsonLine = setRaw.trim().split('\n').reverse().find((l) => l.trim().startsWith('{'));
         const setRes = jsonLine ? JSON.parse(jsonLine) : null;
@@ -7457,7 +7465,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
         trackEvent('setup_completed', { step: 'ollama_existing_model' });
         return { success: true, message: `Using already-installed model ${resolved.installed}` };
       } catch (e) {
-        return { success: false, error: `Failed to save the selected model: ${e.message}` };
+        return { success: false, error: modelSetupSaveError(e) };
       }
     }
 
@@ -7612,10 +7620,9 @@ ipcMain.handle('setup-ollama-and-model', async () => {
           if (res.statusCode === 200) {
             sendDebugLog('AI model download completed successfully');
             try {
-              const setRaw = await runPythonScript(
-                'simple_recorder.py',
-                ['set-model-if-current', setupModelAtStart, DEFAULT_AI_MODEL],
-                true,
+              const setRaw = await setOllamaSetupModelIfCurrent(
+                setupModelAtStart,
+                DEFAULT_AI_MODEL,
               );
               const jsonLine = setRaw.trim().split('\n').reverse().find((l) => l.trim().startsWith('{'));
               const setRes = jsonLine ? JSON.parse(jsonLine) : null;
@@ -7628,7 +7635,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
                 return;
               }
             } catch (e) {
-              settle({ success: false, error: `Failed to save the selected model: ${e.message}` });
+              settle({ success: false, error: modelSetupSaveError(e) });
               return;
             }
             trackEvent('setup_completed', { step: 'ollama_and_model' });

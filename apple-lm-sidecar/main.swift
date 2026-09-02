@@ -5,9 +5,12 @@ import FoundationModels
 @main
 struct StenoAppleLM {
   static func main() async {
+    guard invocationLeaseIsActive() else {
+      return
+    }
+    reportProcessIDIfRequested()
     let app = NSApplication.shared
     app.setActivationPolicy(.prohibited)
-    reportProcessIDIfRequested()
     let command = CommandLine.arguments.dropFirst().first ?? "status"
     do {
       switch command {
@@ -27,6 +30,15 @@ struct StenoAppleLM {
       exit(1)
     }
   }
+}
+
+private func invocationLeaseIsActive() -> Bool {
+  guard
+    let path = ProcessInfo.processInfo.environment["STENOAI_APPLE_LM_LEASE_FILE"]
+  else {
+    return true
+  }
+  return FileManager.default.fileExists(atPath: path)
 }
 
 private func reportProcessIDIfRequested() {

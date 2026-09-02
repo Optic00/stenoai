@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
@@ -46,6 +47,7 @@ _HELPER_APP_NAME = "Steno Apple LM.app"
 _HELPER_EXECUTABLE = "steno-apple-lm"
 _HELPER_PID_PREFIX = "steno-apple-lm-pid:"
 _HELPER_PID_GRACE_SECONDS = 5
+_HELPER_LEASE_ENV = "STENOAI_APPLE_LM_LEASE_FILE"
 
 _STATUS_LOCK = threading.Lock()
 _STATUS_CACHE: Optional[Dict[str, Any]] = None
@@ -287,6 +289,10 @@ class _AppleLMAppInvocation:
         self._stdin_path = root / "stdin"
         self._stdout_path = root / "stdout"
         self._stderr_path = root / "stderr"
+        self._lease_path = root / "lease"
+        self._lease_path.write_text("active", encoding="utf-8")
+        os.chmod(self._lease_path, 0o600)
+        self._invocation_token = f"steno-apple-lm-invocation={uuid.uuid4()}"
         for fifo in (self._stdin_path, self._stdout_path, self._stderr_path):
             os.mkfifo(fifo, 0o600)
 
@@ -318,10 +324,13 @@ class _AppleLMAppInvocation:
             str(self._stderr_path),
             "--env",
             "STENOAI_APPLE_LM_REPORT_PID=1",
+            "--env",
+            f"{_HELPER_LEASE_ENV}={self._lease_path}",
             "-a",
             str(app),
             "--args",
             *args,
+            self._invocation_token,
         ]
         try:
             self._launcher = subprocess.Popen(
@@ -403,25 +412,22 @@ class _AppleLMAppInvocation:
             raise RuntimeError("Apple Intelligence request failed")
 
     def close(self) -> None:
+        # Prevent a launch request that is still queued in LaunchServices from
+        # beginning model work after this invocation has timed out.
+        try:
+            self._lease_path.unlink()
+        except OSError:
+            pass
         if self._launcher.poll() is None:
             self._helper_pid_ready.wait(timeout=_HELPER_PID_GRACE_SECONDS)
-            if self._helper_pid is not None:
-                try:
-                    os.kill(self._helper_pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            else:
+            if not self._signal_helper_processes(signal.SIGTERM):
                 logger.warning(
                     "apple-lm helper PID was not reported before cleanup"
                 )
             try:
                 self._launcher.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                if self._helper_pid is not None:
-                    try:
-                        os.kill(self._helper_pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                self._signal_helper_processes(signal.SIGKILL)
                 self._launcher.kill()
                 try:
                     self._launcher.wait(timeout=2)
@@ -432,6 +438,45 @@ class _AppleLMAppInvocation:
         if self._launcher.stderr is not None:
             self._launcher.stderr.close()
         self._temp_dir.cleanup()
+
+    def _matching_invocation_pids(self) -> set[int]:
+        """Find only processes carrying this invocation's unguessable token."""
+        try:
+            result = subprocess.run(
+                ["/usr/bin/pgrep", "-f", self._invocation_token],
+                capture_output=True,
+                text=True,
+                timeout=1,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return set()
+        if result.returncode not in (0, 1):
+            return set()
+        pids = set()
+        for line in result.stdout.splitlines():
+            try:
+                pid = int(line.strip())
+            except ValueError:
+                continue
+            if pid > 0 and pid != os.getpid():
+                pids.add(pid)
+        return pids
+
+    def _signal_helper_processes(self, sig: signal.Signals) -> bool:
+        pids = (
+            {self._helper_pid}
+            if self._helper_pid is not None
+            else self._matching_invocation_pids()
+        )
+        signaled = False
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                continue
+            signaled = True
+        return signaled
 
     def _unblock_fifos(self) -> None:
         for fifo in (self._stdin_path, self._stdout_path, self._stderr_path):

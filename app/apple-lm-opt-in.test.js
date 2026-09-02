@@ -4,6 +4,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
+const { assertOllamaSetupModel, modelSetupSaveError } = require('./model-setup-guard');
 
 const MAIN = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 
@@ -22,6 +23,16 @@ test('first-run Ollama setup cannot silently select Apple Intelligence', () => {
     /\['set-model',\s*'apple:system'\]|apple_intelligence/,
     'Apple Intelligence must remain an explicit Settings choice',
   );
+  assert.throws(
+    () => assertOllamaSetupModel('apple:system'),
+    /cannot select Apple Intelligence/,
+  );
+  assert.strictEqual(
+    assertOllamaSetupModel('gemma4:e2b-it-qat'),
+    'gemma4:e2b-it-qat',
+  );
+  assert.match(setup, /setOllamaSetupModelIfCurrent\(/);
+  assert.doesNotMatch(setup, /\['set-model-if-current'/);
 });
 
 test('re-running setup preserves an explicit Apple Intelligence choice', () => {
@@ -66,7 +77,7 @@ test('setup enforces bundled Ollama and atomically preserves newer choices', () 
     bundledCheck < ollamaResolution,
     'installed-model resolution must not bypass the bundled binary requirement',
   );
-  assert.match(setup, /\['set-model-if-current',\s*setupModelAtStart,/);
+  assert.match(setup, /setOllamaSetupModelIfCurrent\(\s*setupModelAtStart,/);
   assert.doesNotMatch(setup, /\['set-model',\s*resolved\.installed\]/);
 });
 
@@ -81,4 +92,21 @@ test('setup owns Ollama before probing installed models', () => {
   assert.notStrictEqual(modelResolution, -1, 'setup must probe installed models');
   assert.ok(serviceStart < modelResolution, 'model probing must not start Ollama before Electron owns it');
   assert.ok(readinessGate < modelResolution, 'model probing must happen after the readiness gate');
+});
+
+test('setup model-save errors expose only fixed messages', () => {
+  assert.strictEqual(
+    modelSetupSaveError({ stdout: '{"success":false,"error":"Could not lock config"}\n' }),
+    'Could not lock config',
+  );
+  assert.strictEqual(
+    modelSetupSaveError({
+      stdout: '{"success":false,"error":"permission denied: /Users/example/config.json"}\n',
+      message: 'backend failed at /Users/example/config.json',
+    }),
+    'Failed to save the selected model.',
+  );
+  const setup = handlerBody('setup-ollama-and-model');
+  assert.match(setup, /error:\s*modelSetupSaveError\(e\)/);
+  assert.doesNotMatch(setup, /Failed to save the selected model:\s*\$\{e\.message\}/);
 });

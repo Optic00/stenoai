@@ -9,7 +9,7 @@ import logging
 import re
 import subprocess
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 from .models import MeetingTranscript, ActionItem, Decision
 from .config import Config, resolve_runtime_tag, BEDROCK_REGION_RE
 from . import ollama_manager
@@ -382,6 +382,10 @@ class OllamaSummarizer:
         without it, then re-raise the ORIGINAL error if the retry also fails so a
         genuine failure (OOM, model missing) isn't masked as a ``think`` problem.
         """
+        if self._using_apple_lm():
+            # ``think`` is an Ollama compatibility option. AppleLMClient ignores
+            # it, so the fallback would repeat the same on-device generation.
+            return client.chat(stream=False, **kwargs)
         try:
             return client.chat(stream=False, think=False, **kwargs)
         except Exception as original:
@@ -398,6 +402,11 @@ class OllamaSummarizer:
         guard the first token and, if it fails, restart the stream without
         ``think`` — done before yielding anything, so no token is duplicated.
         """
+        if self._using_apple_lm():
+            # See _chat_no_think: retrying without an ignored option would
+            # duplicate the same Apple request.
+            yield from client.chat(stream=True, **kwargs)
+            return
         try:
             stream = iter(client.chat(stream=True, think=False, **kwargs))
             first = next(stream)
@@ -667,14 +676,25 @@ class OllamaSummarizer:
                 )
             return self._create_markdown_prompt(snapshot, language, notes=notes_value)
 
+        return self._fit_apple_final_prompt(
+            create,
+            notes,
+            "Template instructions are too long for Apple Intelligence. "
+            "Shorten the template and try again.",
+        )
+
+    def _fit_apple_final_prompt(
+        self,
+        create: Callable[[Optional[str]], str],
+        notes: Optional[str],
+        oversized_error: str,
+    ) -> str:
+        """Fit optional notes around an already-bounded snapshot prompt."""
         clean_notes = (notes or "").strip()
         input_budget = self._apple_input_budget_chars()
         base_prompt = create(None)
         if len(base_prompt) > input_budget:
-            raise ValueError(
-                "Template instructions are too long for Apple Intelligence. "
-                "Shorten the template and try again."
-            )
+            raise ValueError(oversized_error)
         if not clean_notes:
             return base_prompt
 
@@ -711,16 +731,17 @@ class OllamaSummarizer:
                 "Shorten the template and try again."
             )
 
-    def _snapshot_compact_streaming(
+    def _build_apple_snapshot(
         self,
         transcript: str,
-        language: str = "en",
-        notes: str = None,
+        notes: Optional[str] = None,
         progress_callback=None,
-        template_prompt: Optional[str] = None,
-    ):
-        """Sequential snapshot updates, then one format pass. Apple on-device path."""
-        slices = self._split_into_chunks(transcript, budget=self._snapshot_slice_budget_chars())
+    ) -> str:
+        """Fold a long transcript into one bounded Apple meeting snapshot."""
+        slices = self._split_into_chunks(
+            transcript,
+            budget=self._snapshot_slice_budget_chars(),
+        )
         n = len(slices)
         snapshot = self._hard_trim_snapshot((notes or "").strip())
         for i, slice_text in enumerate(slices):
@@ -731,6 +752,42 @@ class OllamaSummarizer:
             )
         if progress_callback:
             progress_callback(n + 1, n)
+        return snapshot
+
+    def _create_snapshot_permissive_prompt(
+        self,
+        snapshot: str,
+        language: str,
+        notes: Optional[str],
+    ) -> str:
+        """Build the legacy JSON summary prompt inside Apple's input budget."""
+        def create(notes_value: Optional[str]) -> str:
+            return self._create_permissive_prompt(
+                snapshot,
+                language,
+                notes=notes_value,
+            )
+
+        return self._fit_apple_final_prompt(
+            create,
+            notes,
+            "Apple Intelligence JSON summary prompt is too large",
+        )
+
+    def _snapshot_compact_streaming(
+        self,
+        transcript: str,
+        language: str = "en",
+        notes: str = None,
+        progress_callback=None,
+        template_prompt: Optional[str] = None,
+    ):
+        """Sequential snapshot updates, then one format pass. Apple on-device path."""
+        snapshot = self._build_apple_snapshot(
+            transcript,
+            notes,
+            progress_callback,
+        )
         prompt = self._create_snapshot_final_prompt(
             snapshot, language, notes, template_prompt
         )
@@ -1357,6 +1414,16 @@ Return ONLY the response in this exact JSON format:
                 )
             
             prompt = self._create_permissive_prompt(transcript, language, notes=notes)
+            if (
+                self._using_apple_lm()
+                and len(prompt) > self._apple_input_budget_chars()
+            ):
+                snapshot = self._build_apple_snapshot(transcript, notes)
+                prompt = self._create_snapshot_permissive_prompt(
+                    snapshot,
+                    language,
+                    notes,
+                )
             logger.info(f"Sending transcript to {self.ai_provider} model: {self.model_name}")
             logger.info(f"Transcript length: {len(transcript)} characters")
 
