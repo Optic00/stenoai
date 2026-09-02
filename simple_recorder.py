@@ -4757,6 +4757,12 @@ def set_model(model_name):
         is_apple_system_model,
     )
     apple_model = is_apple_system_model(model_name)
+    if apple_model and config.get_ai_provider() == "remote":
+        print(json.dumps({
+            "success": False,
+            "error": "Apple Intelligence can only be used with the local AI provider.",
+        }))
+        sys.exit(1)
     if apple_model:
         status = apple_lm_status()
         if status.get("available") is not True:
@@ -9084,6 +9090,14 @@ def set_ai_provider(provider):
         print(json.dumps({
             "success": False,
             "error": f"Invalid provider: {provider}. Must be one of: {', '.join(config.VALID_AI_PROVIDERS)}"
+        }))
+        return
+
+    from src.apple_lm import is_apple_system_model
+    if provider == "remote" and is_apple_system_model(config.get_model()):
+        print(json.dumps({
+            "success": False,
+            "error": "Choose an Ollama model before switching to the remote AI provider.",
         }))
         return
 

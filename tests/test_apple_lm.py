@@ -1034,10 +1034,19 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
         )
         self.assertTrue(all("middle of transcript omitted" in prompt for prompt in prompts))
 
+    def test_query_prompt_preserves_uncertainty_and_empty_content_rules(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+
+        prompt = summarizer._build_query_prompt("Transcript", "Question?")
+
+        self.assertIn("Only say you don't know if the topic truly wasn't discussed", prompt)
+        self.assertIn("contains no speech", prompt)
+
 
 class AppleLMCLITests(BaseAppleLMTest):
     def test_set_model_rejects_unavailable_apple_system(self):
         config = mock.Mock()
+        config.get_ai_provider.return_value = "local"
         status = {"available": False, "reason": "appleIntelligenceNotEnabled"}
         with mock.patch("src.config.get_config", return_value=config), mock.patch(
             "src.apple_lm.apple_lm_status", return_value=status
@@ -1059,6 +1068,7 @@ class AppleLMCLITests(BaseAppleLMTest):
 
     def test_set_model_accepts_available_apple_system(self):
         config = mock.Mock()
+        config.get_ai_provider.return_value = "local"
         config.SUPPORTED_MODELS = {}
         config.set_model.return_value = True
         with mock.patch("src.config.get_config", return_value=config), mock.patch(
@@ -1071,6 +1081,48 @@ class AppleLMCLITests(BaseAppleLMTest):
 
         self.assertEqual(result.exit_code, 0, result.output)
         config.set_model.assert_called_once_with(APPLE_SYSTEM_MODEL)
+
+    def test_set_model_rejects_apple_system_for_remote_provider(self):
+        config = mock.Mock()
+        config.get_ai_provider.return_value = "remote"
+        with mock.patch("src.config.get_config", return_value=config), mock.patch(
+            "src.apple_lm.apple_lm_status"
+        ) as status:
+            result = CliRunner().invoke(
+                simple_recorder.set_model,
+                [APPLE_SYSTEM_MODEL],
+            )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(
+            json.loads(result.output),
+            {
+                "success": False,
+                "error": "Apple Intelligence can only be used with the local AI provider.",
+            },
+        )
+        status.assert_not_called()
+        config.set_model.assert_not_called()
+
+    def test_set_ai_provider_rejects_remote_while_apple_system_is_selected(self):
+        config = mock.Mock()
+        config.VALID_AI_PROVIDERS = {"local", "remote", "cloud"}
+        config.get_model.return_value = APPLE_SYSTEM_MODEL
+        with mock.patch("src.config.get_config", return_value=config):
+            result = CliRunner().invoke(
+                simple_recorder.set_ai_provider,
+                ["remote"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            json.loads(result.output),
+            {
+                "success": False,
+                "error": "Choose an Ollama model before switching to the remote AI provider.",
+            },
+        )
+        config.set_ai_provider.assert_not_called()
 
     def test_list_models_prepends_apple_system_when_available(self):
         with mock.patch("src.apple_lm.apple_lm_status", return_value={"available": True}), \

@@ -51,7 +51,12 @@ const path = require('path');
 // Backend CLI seam (spawn wrapper, process-tree kill, bundled-backend paths,
 // runPythonScript), the debug-log sink, and the quit teardown registry are
 // carved out of this file (RFC #327, Phase 0); wired once below via factories.
-const { spawn, killProcessTree, createBackendCli } = require('./backend-cli');
+const {
+  spawn,
+  killProcessTree,
+  createBackendCli,
+  parsePythonFailureJson,
+} = require('./backend-cli');
 const { createDebugLog } = require('./debug-log');
 const { createTeardownRegistry } = require('./teardown');
 const { registerFoldersIpc } = require('./folders-ipc');
@@ -2485,22 +2490,6 @@ ipcMain.handle('get-system-audio-support', async () => {
 // Backend communication - always uses bundled stenoai executable
 // runPythonScript is provided by createBackendCli(...) wired near the top of
 // this file (verbatim body moved to ./backend-cli).
-
-// Recovers a graceful {"success": false, "error": ...} a CLI command printed
-// to stdout right before exiting non-zero (see runPythonScript's err.stdout
-// above) -- without this, a real "already exists"/"not found" message gets
-// discarded in favor of a generic "Python script failed with code 1: <stderr>"
-// wrapper that's useless to a human. Falls back to that generic message when
-// stdout wasn't valid JSON (an actual crash, not a graceful failure).
-function parsePythonFailureJson(error) {
-  try {
-    const parsed = JSON.parse(error.stdout || '');
-    if (parsed && typeof parsed === 'object' && parsed.success === false) return parsed;
-  } catch (_) {
-    // stdout wasn't JSON -- fall through to the generic error below.
-  }
-  return { success: false, error: error.message };
-}
 
 async function getBackendStatusInternal(silent = true) {
   const result = await runPythonScript('simple_recorder.py', ['status'], silent);
