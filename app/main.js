@@ -80,7 +80,11 @@ const {
 } = require('./shortcut-url');
 const { parseSetupCheckOutput } = require('./setup-check-parse');
 const { parseSpeakerModelStatusOutput } = require('./speaker-model-status');
-const { assertOllamaSetupModel, modelSetupSaveError } = require('./model-setup-guard');
+const {
+  assertOllamaSetupModel,
+  modelSetupSaveError,
+  cleanupFailedOllamaSetup,
+} = require('./model-setup-guard');
 const { isDiagnosticStdoutLine, sanitizeArgsForLog } = require('./diagnostics-filter');
 // Pure analytics bucketing/classification/sanitization lives in
 // ./analytics-helpers (unit-tested). trackEvent() itself and every IPC
@@ -7370,27 +7374,32 @@ ipcMain.handle('setup-ollama-and-model', async () => {
     let ollamaExited = false;
     let ollamaExitCode = null;
     let ollamaDyldError = false;
+    let setupStartedOllamaProcess = null;
+    let setupStartedOllamaPid = null;
     if (!ollamaAlreadyRunning) {
       sendDebugLog('Starting Ollama service...');
       sendDebugLog(`$ ${finalOllamaPath} serve`);
-      ollamaProcess = spawn(finalOllamaPath, ['serve'], { detached: true, stdio: ['ignore', 'ignore', 'pipe'], env: getOllamaEnv() });
-      ollamaPid = ollamaProcess.pid;
+      setupStartedOllamaProcess = spawn(finalOllamaPath, ['serve'], { detached: true, stdio: ['ignore', 'ignore', 'pipe'], env: getOllamaEnv() });
+      setupStartedOllamaPid = setupStartedOllamaProcess.pid;
+      ollamaProcess = setupStartedOllamaProcess;
+      ollamaPid = setupStartedOllamaPid;
       // Write PID file so quit handler can find the process
       try { require('fs').writeFileSync(path.join(getBackendCwd(), '_internal', 'ollama.pid'), String(ollamaPid)); } catch (_) {}
-      ollamaProcess.stderr.on('data', (data) => {
+      setupStartedOllamaProcess.stderr.on('data', (data) => {
         const msg = data.toString().trim();
         if (msg) sendDebugLog(`Ollama: ${msg}`);
         if (msg.includes('Symbol not found') || msg.includes('dyld')) ollamaDyldError = true;
       });
-      ollamaProcess.on('exit', (code) => {
+      setupStartedOllamaProcess.on('exit', (code) => {
         ollamaExited = true;
         ollamaExitCode = code;
-        ollamaPid = null;
+        if (ollamaProcess === setupStartedOllamaProcess) ollamaProcess = null;
+        if (ollamaPid === setupStartedOllamaPid) ollamaPid = null;
         if (code !== 0 && code !== null) {
           sendDebugLog(`Ollama process exited with code ${code}`);
         }
       });
-      ollamaProcess.unref();
+      setupStartedOllamaProcess.unref();
     }
 
     // Wait for Ollama to be ready (poll with early exit detection).
@@ -7423,6 +7432,18 @@ ipcMain.handle('setup-ollama-and-model', async () => {
     }
 
     if (!ready) {
+      const cleaned = cleanupFailedOllamaSetup({
+        startedProcess: setupStartedOllamaProcess,
+        startedPid: setupStartedOllamaPid,
+        currentProcess: ollamaProcess,
+        currentPid: ollamaPid,
+        pidFile: path.join(getBackendCwd(), '_internal', 'ollama.pid'),
+        killProcessTree,
+        fs: require('fs'),
+        processExited: ollamaExited,
+      });
+      ollamaProcess = cleaned.ollamaProcess;
+      ollamaPid = cleaned.ollamaPid;
       if (ollamaExited) {
         if (ollamaDyldError) {
           return { success: false, error: 'Ollama crashed due to incompatible macOS version. Steno requires macOS 14 (Sonoma) or later for local AI. Please update macOS or use a remote Ollama server in Settings.' };

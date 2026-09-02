@@ -4,7 +4,11 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
-const { assertOllamaSetupModel, modelSetupSaveError } = require('./model-setup-guard');
+const {
+  assertOllamaSetupModel,
+  modelSetupSaveError,
+  cleanupFailedOllamaSetup,
+} = require('./model-setup-guard');
 
 const MAIN = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 
@@ -94,7 +98,7 @@ test('setup enforces bundled Ollama and atomically preserves newer choices', () 
 
 test('setup owns Ollama before probing installed models', () => {
   const setup = handlerBody('setup-ollama-and-model');
-  const serviceStart = setup.indexOf("ollamaProcess = spawn(finalOllamaPath, ['serve']");
+  const serviceStart = setup.indexOf("setupStartedOllamaProcess = spawn(finalOllamaPath, ['serve']");
   const readinessGate = setup.indexOf('if (!ready)');
   const modelResolution = setup.indexOf("['resolve-setup-model']");
 
@@ -105,9 +109,70 @@ test('setup owns Ollama before probing installed models', () => {
   assert.ok(readinessGate < modelResolution, 'model probing must happen after the readiness gate');
   assert.match(
     setup,
-    /if \(!ready\) \{[\s\S]*?return \{ success: false, error: 'Ollama did not become ready\. Please retry setup\.' \};[\s\S]*?\}/,
-    'setup must fail before model resolution when Ollama never becomes ready',
+    /if \(!ready\) \{[\s\S]*?cleanupFailedOllamaSetup\([\s\S]*?return \{ success: false, error: 'Ollama did not become ready\. Please retry setup\.' \};[\s\S]*?\}/,
+    'setup must stop its process and fail before model resolution when Ollama never becomes ready',
   );
+});
+
+test('failed Ollama setup kills only its own process and clears its PID file', () => {
+  const killed = [];
+  const unlinked = [];
+  const startedProcess = {};
+  const result = cleanupFailedOllamaSetup({
+    startedProcess,
+    startedPid: 123,
+    currentProcess: startedProcess,
+    currentPid: 123,
+    pidFile: '/tmp/ollama.pid',
+    killProcessTree: (pid) => killed.push(pid),
+    fs: {
+      readFileSync: () => '123',
+      unlinkSync: (file) => unlinked.push(file),
+    },
+  });
+
+  assert.deepStrictEqual(killed, [123]);
+  assert.deepStrictEqual(unlinked, ['/tmp/ollama.pid']);
+  assert.deepStrictEqual(result, { ollamaProcess: null, ollamaPid: null });
+});
+
+test('failed Ollama setup preserves newer process state', () => {
+  const killed = [];
+  const newerProcess = {};
+  const result = cleanupFailedOllamaSetup({
+    startedProcess: {},
+    startedPid: 123,
+    currentProcess: newerProcess,
+    currentPid: 456,
+    pidFile: '/tmp/ollama.pid',
+    killProcessTree: (pid) => killed.push(pid),
+    fs: {
+      readFileSync: () => '456',
+      unlinkSync: () => assert.fail('newer PID file must be preserved'),
+    },
+  });
+
+  assert.deepStrictEqual(killed, [123]);
+  assert.deepStrictEqual(result, { ollamaProcess: newerProcess, ollamaPid: 456 });
+});
+
+test('failed Ollama setup does not re-kill a process that already exited', () => {
+  const unlinked = [];
+  cleanupFailedOllamaSetup({
+    startedProcess: {},
+    startedPid: 123,
+    currentProcess: null,
+    currentPid: null,
+    pidFile: '/tmp/ollama.pid',
+    killProcessTree: () => assert.fail('exited process must not be killed again'),
+    fs: {
+      readFileSync: () => '123',
+      unlinkSync: (file) => unlinked.push(file),
+    },
+    processExited: true,
+  });
+
+  assert.deepStrictEqual(unlinked, ['/tmp/ollama.pid']);
 });
 
 test('setup model-save errors expose only fixed messages', () => {

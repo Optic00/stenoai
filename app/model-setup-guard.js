@@ -29,4 +29,33 @@ function modelSetupSaveError(error) {
   return 'Failed to save the selected model.';
 }
 
-module.exports = { assertOllamaSetupModel, modelSetupSaveError };
+function cleanupFailedOllamaSetup({
+  startedProcess,
+  startedPid,
+  currentProcess,
+  currentPid,
+  pidFile,
+  killProcessTree,
+  fs,
+  processExited = false,
+}) {
+  if (startedPid && !processExited) {
+    killProcessTree(startedPid);
+  }
+  if (startedPid) {
+    try {
+      const recordedPid = Number.parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
+      if (recordedPid === startedPid) fs.unlinkSync(pidFile);
+    } catch (_) {}
+  }
+  return {
+    ollamaProcess: currentProcess === startedProcess ? null : currentProcess,
+    ollamaPid: currentPid === startedPid ? null : currentPid,
+  };
+}
+
+module.exports = {
+  assertOllamaSetupModel,
+  modelSetupSaveError,
+  cleanupFailedOllamaSetup,
+};

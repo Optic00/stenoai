@@ -1927,13 +1927,15 @@ TRANSCRIPT:
         previous_model = self.model_name
         previous_client = self.client
         switching_from_apple = self.ai_provider == "local" and self._using_apple_lm()
+        candidate = resolve_runtime_tag(model_name) if switching_from_apple else model_name
         if switching_from_apple:
             if not OLLAMA_AVAILABLE:
                 logger.error("Ollama client is not available")
                 return False
-            self.model_name = resolve_runtime_tag(model_name)
+            self.model_name = candidate
             try:
-                self._ensure_ollama_ready()
+                if not self._is_ollama_running() and not self._start_ollama_service():
+                    raise RuntimeError("Failed to start Ollama service")
                 self.client = ollama.Client()
             except Exception as e:
                 self.model_name = previous_model
@@ -1945,7 +1947,6 @@ TRANSCRIPT:
             models = self.client.list()
             available_models = [model.model for model in models.models]
 
-            candidate = self.model_name if switching_from_apple else model_name
             if candidate in available_models:
                 self.model_name = candidate
                 logger.info(f"Model changed to: {model_name}")

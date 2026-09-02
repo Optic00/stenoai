@@ -582,13 +582,13 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
         with mock.patch("src.summarizer.OLLAMA_AVAILABLE", True), mock.patch(
             "src.summarizer.resolve_runtime_tag", return_value="qwen3.5:9b"
         ), mock.patch.object(
-            summarizer, "_ensure_ollama_ready", return_value=True
-        ) as ensure, mock.patch(
+            summarizer, "_is_ollama_running", return_value=True
+        ) as running, mock.patch(
             "src.summarizer.ollama.Client", return_value=next_client
         ):
             self.assertTrue(summarizer.set_model("qwen3.5:9b"))
 
-        ensure.assert_called_once_with()
+        running.assert_called_once_with()
         self.assertEqual(summarizer.model_name, "qwen3.5:9b")
         self.assertIs(summarizer.client, next_client)
 
@@ -616,9 +616,32 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
         with mock.patch("src.summarizer.OLLAMA_AVAILABLE", True), mock.patch(
             "src.summarizer.resolve_runtime_tag", return_value="qwen3.5:9b"
         ), mock.patch.object(
-            summarizer, "_ensure_ollama_ready", side_effect=RuntimeError("offline")
+            summarizer, "_is_ollama_running", return_value=False
+        ), mock.patch.object(
+            summarizer, "_start_ollama_service", return_value=False
         ):
             self.assertFalse(summarizer.set_model("qwen3.5:9b"))
+
+        self.assertEqual(summarizer.model_name, APPLE_SYSTEM_MODEL)
+        self.assertIs(summarizer.client, apple_client)
+
+    def test_set_model_does_not_substitute_fallback_when_leaving_apple(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.ai_provider = "local"
+        summarizer.model_name = APPLE_SYSTEM_MODEL
+        apple_client = AppleLMClient()
+        summarizer.client = apple_client
+        next_client = mock.Mock()
+        next_client.list.return_value.models = [mock.Mock(model="gemma4:e2b-it-qat")]
+
+        with mock.patch("src.summarizer.OLLAMA_AVAILABLE", True), mock.patch(
+            "src.summarizer.resolve_runtime_tag", return_value="missing:model"
+        ), mock.patch.object(
+            summarizer, "_is_ollama_running", return_value=True
+        ), mock.patch(
+            "src.summarizer.ollama.Client", return_value=next_client
+        ):
+            self.assertFalse(summarizer.set_model("missing:model"))
 
         self.assertEqual(summarizer.model_name, APPLE_SYSTEM_MODEL)
         self.assertIs(summarizer.client, apple_client)
