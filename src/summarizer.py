@@ -242,6 +242,12 @@ class OllamaSummarizer:
             if model_name is None:
                 model_name = config.get_model()
                 logger.info(f"Using configured model: {model_name}")
+            from src.apple_lm import is_apple_system_model
+            if is_apple_system_model(model_name):
+                raise ValueError(
+                    "Apple Intelligence can only be used with the local AI provider. "
+                    "Select a model installed on the remote Ollama server."
+                )
             self.model_name = model_name
 
             if not self.remote_url:

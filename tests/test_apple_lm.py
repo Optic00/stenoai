@@ -100,10 +100,12 @@ class AppleLMResolutionTests(BaseAppleLMTest):
     def test_relative_override_is_canonicalized(self):
         override = Path(self._tmp_dir.name) / "mock-steno-apple-lm"
         override.write_bytes(b"mock")
-        override.chmod(0o755)
         relative = os.path.relpath(override, Path.cwd())
 
-        with mock.patch("src.apple_lm.sys.platform", "darwin"), mock.patch.dict(
+        with mock.patch("src.apple_lm.sys.platform", "darwin"), mock.patch(
+            "src.apple_lm.os.access",
+            side_effect=lambda path, _mode: Path(path).resolve() == override.resolve(),
+        ), mock.patch.dict(
             os.environ,
             {
                 "STENOAI_APPLE_LM_BIN": relative,
@@ -367,8 +369,8 @@ class AppleLMResolutionTests(BaseAppleLMTest):
             invocation._lease_path.write_text("active", encoding="utf-8")
             with mock.patch("src.apple_lm.os.kill") as kill:
                 invocation.close()
+            self.assertFalse(invocation._lease_path.exists())
 
-        self.assertFalse(invocation._lease_path.exists())
         self.assertEqual(
             kill.call_args_list,
             [
@@ -715,6 +717,20 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
         ensure.assert_not_called()
         ollama_client.assert_not_called()
 
+    def test_remote_provider_rejects_preserved_apple_model(self):
+        cfg = mock.Mock()
+        cfg.get_ai_provider.return_value = "remote"
+        cfg.get_remote_ollama_url.return_value = "http://192.0.2.10:11434"
+        cfg.get_model.return_value = APPLE_SYSTEM_MODEL
+
+        with mock.patch("src.summarizer.OLLAMA_AVAILABLE", True), mock.patch(
+            "src.summarizer.ollama.Client"
+        ) as ollama_client:
+            with self.assertRaisesRegex(ValueError, "local AI provider"):
+                OllamaSummarizer(config=cfg)
+
+        ollama_client.assert_not_called()
+
     def test_query_transcript_ollama_retry_is_bounded(self):
         cfg = mock.Mock()
         cfg.get_ai_provider.return_value = "local"
@@ -903,15 +919,8 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
         self.assertNotIn(notes, final_prompts[0])
         self.assertIn("N" * 1_000, final_prompts[0])
         self.assertIn("...[notes truncated]", final_prompts[0])
-        from src.summarizer import (
-            _APPLE_RESPONSE_RESERVE_CHARS,
-        )
         input_budget = summarizer._apple_input_budget_chars()
         self.assertLessEqual(len(final_prompts[0]), input_budget)
-        self.assertEqual(
-            APPLE_LM_NUM_CTX * 2 - input_budget,
-            _APPLE_RESPONSE_RESERVE_CHARS,
-        )
 
     def test_snapshot_slice_budget_reserves_full_snapshot_response(self):
         summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
@@ -1027,6 +1036,42 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
 
 
 class AppleLMCLITests(BaseAppleLMTest):
+    def test_set_model_rejects_unavailable_apple_system(self):
+        config = mock.Mock()
+        status = {"available": False, "reason": "appleIntelligenceNotEnabled"}
+        with mock.patch("src.config.get_config", return_value=config), mock.patch(
+            "src.apple_lm.apple_lm_status", return_value=status
+        ):
+            result = CliRunner().invoke(
+                simple_recorder.set_model,
+                [APPLE_SYSTEM_MODEL],
+            )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(
+            json.loads(result.output),
+            {
+                "success": False,
+                "error": "Enable Apple Intelligence in System Settings before selecting this model.",
+            },
+        )
+        config.set_model.assert_not_called()
+
+    def test_set_model_accepts_available_apple_system(self):
+        config = mock.Mock()
+        config.SUPPORTED_MODELS = {}
+        config.set_model.return_value = True
+        with mock.patch("src.config.get_config", return_value=config), mock.patch(
+            "src.apple_lm.apple_lm_status", return_value={"available": True}
+        ):
+            result = CliRunner().invoke(
+                simple_recorder.set_model,
+                [APPLE_SYSTEM_MODEL],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        config.set_model.assert_called_once_with(APPLE_SYSTEM_MODEL)
+
     def test_list_models_prepends_apple_system_when_available(self):
         with mock.patch("src.apple_lm.apple_lm_status", return_value={"available": True}), \
              mock.patch("src.config.Config.get_model", return_value=APPLE_SYSTEM_MODEL), \

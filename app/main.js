@@ -7959,7 +7959,7 @@ ipcMain.handle('set-model', async (event, modelName) => {
     return { success: true, model: modelName };
   } catch (error) {
     sendDebugLog(`Error setting model: ${error.message}`);
-    return { success: false, error: error.message };
+    return parsePythonFailureJson(error);
   }
 });
 

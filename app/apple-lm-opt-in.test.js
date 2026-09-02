@@ -63,6 +63,15 @@ test('re-running setup preserves an explicit Apple Intelligence choice', () => {
   );
 });
 
+test('set-model preserves actionable backend failures', () => {
+  const setModel = handlerBody('set-model');
+
+  assert.match(
+    setModel,
+    /catch \(error\) \{[\s\S]*?return parsePythonFailureJson\(error\);[\s\S]*?\}/,
+  );
+});
+
 test('setup fails closed when the current model cannot be read', () => {
   const setup = handlerBody('setup-ollama-and-model');
   assert.match(

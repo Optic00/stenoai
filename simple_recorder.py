@@ -4751,8 +4751,21 @@ def set_model(model_name):
     config = get_config()
 
     # Validate model
-    from src.apple_lm import is_apple_system_model
-    if model_name not in config.SUPPORTED_MODELS and not is_apple_system_model(model_name):
+    from src.apple_lm import (
+        apple_lm_status,
+        apple_lm_unavailable_message,
+        is_apple_system_model,
+    )
+    apple_model = is_apple_system_model(model_name)
+    if apple_model:
+        status = apple_lm_status()
+        if status.get("available") is not True:
+            print(json.dumps({
+                "success": False,
+                "error": apple_lm_unavailable_message(status),
+            }))
+            sys.exit(1)
+    if model_name not in config.SUPPORTED_MODELS and not apple_model:
         print(f"WARNING: Model '{model_name}' is not in the recommended list.")
         print(f"Supported models: {', '.join(config.SUPPORTED_MODELS.keys())}")
         print(f"Setting anyway (make sure it's installed with 'ollama pull {model_name}')")
