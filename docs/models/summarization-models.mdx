@@ -19,11 +19,15 @@ After transcription, Steno passes the transcript to a language model to generate
 Local summarization runs via Ollama with `gemma4:e2b-it-qat` by default.
 On macOS 26 or later, users can explicitly select Apple's built-in `SystemLanguageModel` when Apple Intelligence is available.
 Steno does not silently change an existing model selection or fall back to another provider if Apple becomes unavailable.
+
+On Apple Silicon, the three Gemma 4 models are automatically pulled as MLX/NVFP4 builds instead of the base GGUF, providing faster inference at the larger download sizes shown above.
+`llama3.2:3b` remains available for existing users pinned to it, but it is deprecated and hidden from the default model picker.
+
 ## How to change models
 
 1. Open **Settings → AI**
 2. Select a model from the list
-3. If the model is not yet downloaded, Steno will download it via Ollama
+3. If an Ollama model is not yet downloaded, Steno will download it via Ollama. Apple's built-in model is managed by macOS.
 
 The new model is used for all future recordings. You can re-summarize an existing recording from its detail view using any model.
 

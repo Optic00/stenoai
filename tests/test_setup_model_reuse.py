@@ -164,5 +164,47 @@ class SetModelExitCodeTests(unittest.TestCase):
         )
 
 
+class SetModelIfCurrentTests(unittest.TestCase):
+    def test_preserves_a_newer_user_selection(self):
+        fake_config = mock.Mock()
+        fake_config.begin_transaction.return_value = True
+        fake_config.get_model.return_value = "apple:system"
+
+        with mock.patch("src.config.get_config", return_value=fake_config):
+            result = CliRunner().invoke(
+                simple_recorder.set_model_if_current,
+                ["gemma4:e2b-it-qat", "qwen3.5:9b"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            json.loads(result.output),
+            {"success": True, "updated": False, "model": "apple:system"},
+        )
+        fake_config.rollback_transaction.assert_called_once_with()
+        fake_config.set_model.assert_not_called()
+
+    def test_updates_matching_selection_as_setup_provenance(self):
+        fake_config = mock.Mock()
+        fake_config.begin_transaction.return_value = True
+        fake_config.get_model.return_value = "gemma4:e2b-it-qat"
+        fake_config.set_model.return_value = True
+        fake_config.commit_transaction.return_value = True
+
+        with mock.patch("src.config.get_config", return_value=fake_config):
+            result = CliRunner().invoke(
+                simple_recorder.set_model_if_current,
+                ["gemma4:e2b-it-qat", "qwen3.5:9b"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            json.loads(result.output),
+            {"success": True, "updated": True, "model": "qwen3.5:9b"},
+        )
+        fake_config.set_model.assert_called_once_with("qwen3.5:9b", source="auto")
+        fake_config.commit_transaction.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()

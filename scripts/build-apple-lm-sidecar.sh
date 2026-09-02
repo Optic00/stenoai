@@ -17,6 +17,10 @@ OUT_APP="$ROOT/bin/Steno Apple LM.app"
 OUT="$OUT_APP/Contents/MacOS/steno-apple-lm"
 MODULE_CACHE="$ROOT/build/apple-lm-module-cache"
 
+# Never leave a helper from an earlier build available for packaging after the
+# current source, SDK, compile, signing, or verification step fails.
+rm -rf "$OUT_APP"
+
 if [[ ! -f "$SRC" ]]; then
     echo "missing helper source: $SRC" >&2
     exit 1
@@ -69,7 +73,6 @@ codesign \
     "$TMP_APP"
 codesign --verify --deep --strict --verbose=2 "$TMP_APP"
 
-rm -rf "$OUT_APP"
 mv "$TMP_APP" "$OUT_APP"
 trap - EXIT
 rm -rf "$TMP_ROOT"

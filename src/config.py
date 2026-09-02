@@ -1792,6 +1792,8 @@ class Config:
         """
         from src.apple_lm import is_apple_system_model, apple_system_model_info
         if is_apple_system_model(model_name):
+            # Static metadata only. Availability belongs to list-models and
+            # explicit status checks, not ordinary config reads.
             return apple_system_model_info(is_default=self.get_model() == model_name)
         return self.SUPPORTED_MODELS.get(model_name)
     def list_supported_models(self) -> Dict[str, Dict[str, str]]:

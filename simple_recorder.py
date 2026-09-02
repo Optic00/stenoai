@@ -4705,6 +4705,11 @@ def list_models():
                         status=apple_status,
                     ),
                     "installed": bool(apple_status.get("available")),
+                    "available": bool(apple_status.get("available")),
+                    "managed": True,
+                    "selectable": bool(apple_status.get("available")),
+                    "downloadable": False,
+                    "deletable": False,
                     "gguf_installed": False,
                 }
                 models = {APPLE_SYSTEM_MODEL: apple_info, **models}
@@ -4763,6 +4768,43 @@ def set_model(model_name):
         # Exit non-zero so callers (e.g. the setup-ollama-and-model reuse path in
         # main.js) can't read a config-write failure as success — the model was
         # NOT persisted as active. sys.exit (not bare exit) for the PyInstaller bundle.
+        sys.exit(1)
+
+
+@cli.command(name='set-model-if-current')
+@click.argument('expected_model')
+@click.argument('model_name')
+def set_model_if_current(expected_model, model_name):
+    """Atomically update the setup model unless the user changed it meanwhile."""
+    from src.config import get_config
+
+    config = get_config()
+    if not config.begin_transaction():
+        print(json.dumps({"success": False, "error": "Could not lock config"}))
+        sys.exit(1)
+
+    try:
+        current_model = config.get_model()
+        if current_model != expected_model:
+            config.rollback_transaction()
+            print(json.dumps({
+                "success": True,
+                "updated": False,
+                "model": current_model,
+            }))
+            return
+
+        if not config.set_model(model_name, source="auto"):
+            config.rollback_transaction()
+            print(json.dumps({"success": False, "error": "Failed to stage model config"}))
+            sys.exit(1)
+        if not config.commit_transaction():
+            print(json.dumps({"success": False, "error": "Failed to save config"}))
+            sys.exit(1)
+        print(json.dumps({"success": True, "updated": True, "model": model_name}))
+    except Exception as error:
+        config.rollback_transaction()
+        print(json.dumps({"success": False, "error": str(error)}))
         sys.exit(1)
 
 

@@ -37,3 +37,35 @@ test('re-running setup preserves an explicit Apple Intelligence choice', () => {
   assert.match(setup, /current\.model === 'apple:system'/);
   assert.match(setup, /skipped:\s*true/);
 });
+
+test('setup fails closed when the current model cannot be read', () => {
+  const setup = handlerBody('setup-ollama-and-model');
+  const failureLog = setup.indexOf('Could not read current summary model:');
+  const retryError = setup.indexOf('Please retry setup.', failureLog);
+
+  assert.notStrictEqual(failureLog, -1);
+  assert.ok(retryError > failureLog);
+  assert.doesNotMatch(setup, /Could not read current summary model, proceeding/);
+});
+
+test('setup fails closed when the provider cannot be read', () => {
+  const setup = handlerBody('setup-ollama-and-model');
+
+  assert.match(setup, /Could not read AI provider:/);
+  assert.match(setup, /Could not read the AI provider\. Please retry setup\./);
+  assert.doesNotMatch(setup, /Could not read AI provider, proceeding/);
+});
+
+test('setup enforces bundled Ollama and atomically preserves newer choices', () => {
+  const setup = handlerBody('setup-ollama-and-model');
+  const bundledCheck = setup.indexOf('await findOllamaExecutable()');
+  const ollamaResolution = setup.indexOf("['resolve-setup-model']");
+
+  assert.notStrictEqual(bundledCheck, -1);
+  assert.ok(
+    bundledCheck < ollamaResolution,
+    'installed-model resolution must not bypass the bundled binary requirement',
+  );
+  assert.match(setup, /\['set-model-if-current',\s*setupModelAtStart,/);
+  assert.doesNotMatch(setup, /\['set-model',\s*resolved\.installed\]/);
+});

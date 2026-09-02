@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, writeFileSync } from 'fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { test, expect } from '../fixtures/electron';
@@ -50,6 +50,7 @@ test('fresh install offers Apple Intelligence without selecting it', async ({
   const mockScript = path.join(fixtureDir, 'mock-steno-apple-lm.sh');
   const unavailableMarker = path.join(fixtureDir, 'unavailable');
 
+  try {
   writeFileSync(
     mockScript,
     [
@@ -148,4 +149,7 @@ test('fresh install offers Apple Intelligence without selecting it', async ({
   );
 
   expect(fileSig(realUserDataDir())).toBe(realDirBefore);
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
 });

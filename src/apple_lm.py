@@ -59,6 +59,11 @@ def apple_lm_disabled() -> bool:
     return os.environ.get(_DISABLE_ENV) == "1"
 
 
+def _direct_test_helper_allowed() -> bool:
+    """True only for an unpackaged E2E process, never a shipped backend."""
+    return os.environ.get(_E2E_ENV) == "1" and not getattr(sys, "frozen", False)
+
+
 def reset_apple_lm_cache() -> None:
     """Drop the process-wide status cache. Tests only."""
     global _STATUS_CACHE, _STATUS_CACHE_BIN
@@ -72,8 +77,12 @@ def resolve_apple_lm_bin() -> Optional[str]:
     if apple_lm_disabled() or sys.platform != "darwin":
         return None
     candidates: list[str] = []
+    # A direct executable override exists only for deterministic E2E fixtures.
+    # Production prompts must go through the canonical nested helper app so
+    # LaunchServices applies its App Sandbox before any meeting content enters
+    # the process.
     override = os.environ.get(_BIN_ENV)
-    if override:
+    if override and _direct_test_helper_allowed():
         candidates.append(override)
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).parent
@@ -137,10 +146,7 @@ def apple_lm_status() -> Dict[str, Any]:
     # explicitly supplied mock sidecar still needs to exercise the integration
     # path. Production cannot bypass the OS gate: both the E2E marker and an
     # explicit test binary are required.
-    test_sidecar = (
-        os.environ.get(_E2E_ENV) == "1"
-        and bool(os.environ.get(_BIN_ENV))
-    )
+    test_sidecar = _direct_test_helper_allowed() and bool(os.environ.get(_BIN_ENV))
     if macos_major < 26 and not test_sidecar:
         return {"available": False, "reason": "unsupported_os"}
     binary = resolve_apple_lm_bin()
@@ -229,19 +235,26 @@ def apple_system_model_info(
     is_default: bool = False,
     status: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
-    status = status if status is not None else apple_lm_status()
-    default_bit = " (selected)" if is_default else ""
-    display = status.get("display_name") or "Apple Intelligence"
-    availability_bit = (
-        "OS-managed on-device model"
-        if status.get("available")
-        else apple_lm_unavailable_message(status)
-    )
+    # Keep ``is_default`` for compatibility with existing metadata callers.
+    # Selection is already represented structurally and rendered by the UI.
+    del is_default
+    display = (status or {}).get("display_name") or "Apple Intelligence"
+    if status is None:
+        # Metadata reads (including get-model during setup) must not launch the
+        # helper. Settings/list-models passes an explicit probed status when it
+        # needs availability-specific copy.
+        availability_bit = "OS-managed on-device model"
+    else:
+        availability_bit = (
+            "OS-managed on-device model"
+            if status.get("available")
+            else apple_lm_unavailable_message(status)
+        )
     return {
         "name": display if isinstance(display, str) and display.strip() else "Apple Intelligence",
         "size": "",
         "params": "OS-managed",
-        "description": f"On-device System Language Model - {availability_bit}{default_bit}",
+        "description": f"On-device System Language Model - {availability_bit}",
         "speed": "fast",
         "quality": "good",
     }
@@ -464,6 +477,8 @@ def stream_complete(prompt: str, timeout: float = 7200) -> Iterator[str]:
     if helper_app is not None:
         yield from _stream_apple_lm_app(helper_app, prompt, timeout)
         return
+    if not _direct_test_helper_allowed():
+        raise RuntimeError("Apple Intelligence helper is not sandboxed")
     proc = subprocess.Popen(
         [binary, "stream"],
         stdin=subprocess.PIPE,
@@ -586,6 +601,8 @@ def _run_apple_lm(
             stdin=stdin,
             timeout=timeout,
         )
+    if not _direct_test_helper_allowed():
+        raise RuntimeError("Apple Intelligence helper is not sandboxed")
     try:
         proc = subprocess.run(
             [binary, *args],

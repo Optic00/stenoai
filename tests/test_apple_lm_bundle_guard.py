@@ -1,4 +1,5 @@
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 
@@ -40,6 +41,7 @@ class AppleLMBundleGuardTests(unittest.TestCase):
                 )
             )
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX executable fixture")
     def test_existing_sidecar_must_be_executable(self):
         with tempfile.TemporaryDirectory() as tmp:
             helper, _binary = self._make_helper(tmp, executable=False)
@@ -47,6 +49,7 @@ class AppleLMBundleGuardTests(unittest.TestCase):
             with self.assertRaisesRegex(PermissionError, "executable"):
                 resolve_apple_lm_sidecar(helper, platform="darwin")
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX executable fixture")
     def test_macos_build_accepts_executable_sidecar(self):
         with tempfile.TemporaryDirectory() as tmp:
             helper, binary = self._make_helper(tmp, executable=True)

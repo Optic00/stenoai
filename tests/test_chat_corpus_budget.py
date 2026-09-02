@@ -41,11 +41,6 @@ class ChatCorpusBudgetTests(unittest.TestCase):
         self.assertGreater(budget, 0)
         self.assertLess(budget, 400_000)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class AppleWindowMeasuredCeilingTests(unittest.TestCase):
     """Pins the Apple on-device window against what the hardware actually does.
 
@@ -91,3 +86,6 @@ class AppleWindowMeasuredCeilingTests(unittest.TestCase):
         # The 4096 window produced 3292 chars per slice.
         self.assertGreater(s._snapshot_slice_budget_chars(), 3292 * 2)
 
+
+if __name__ == "__main__":
+    unittest.main()

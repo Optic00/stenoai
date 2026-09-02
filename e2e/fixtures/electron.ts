@@ -95,7 +95,9 @@ export const test = base.extend<Fixtures>({
           app = await electron.launch({
             args: [
               '.',
-              ...(process.env.ELECTRON_EXTRA_LAUNCH_ARGS ? process.env.ELECTRON_EXTRA_LAUNCH_ARGS.split(' ') : []),
+              ...(process.env.ELECTRON_EXTRA_LAUNCH_ARGS
+                ? process.env.ELECTRON_EXTRA_LAUNCH_ARGS.trim().split(/\s+/).filter(Boolean)
+                : []),
               ...(opts.fakeAudio
                 ? ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream']
                 : []),

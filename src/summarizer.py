@@ -420,7 +420,7 @@ class OllamaSummarizer:
         """Non-streaming Ollama call for one map chunk. Returns stripped text or raises."""
         import time
         prompt = self._create_map_prompt(chunk, chunk_num, total_chunks)
-        if self.ai_provider != "remote":
+        if self.ai_provider != "remote" and not self._using_apple_lm():
             self._ensure_ollama_ready()
         options = {**self._ollama_options(), "num_predict": MAP_OUTPUT_MAX_TOKENS}
         # think=False: thinking-capable models (gemma4:e2b-it-qat, gemma4:12b-it-qat,
@@ -573,7 +573,7 @@ class OllamaSummarizer:
             map_results = self._hierarchical_reduce(map_results, depth=1, progress_callback=progress_callback)
 
         reduce_prompt = self._create_reduce_prompt(map_results, language, notes)
-        if self.ai_provider != "remote":
+        if self.ai_provider != "remote" and not self._using_apple_lm():
             self._ensure_ollama_ready()
         # No try/except here: a reduce failure must propagate to the outer
         # handler in simple_recorder.reprocess (`except Exception as e:
@@ -649,7 +649,7 @@ class OllamaSummarizer:
         """Sequential snapshot updates, then one format pass. Apple on-device path."""
         slices = self._split_into_chunks(transcript, budget=self._snapshot_slice_budget_chars())
         n = len(slices)
-        snapshot = (notes or "").strip()
+        snapshot = self._hard_trim_snapshot((notes or "").strip())
         for i, slice_text in enumerate(slices):
             if progress_callback:
                 progress_callback(i + 1, n)
@@ -660,10 +660,10 @@ class OllamaSummarizer:
             progress_callback(n + 1, n)
         if template_prompt:
             prompt = self._create_template_report_prompt(
-                snapshot, template_prompt, language, notes=None
+                snapshot, template_prompt, language, notes=notes
             )
         else:
-            prompt = self._create_markdown_prompt(snapshot, language, notes=None)
+            prompt = self._create_markdown_prompt(snapshot, language, notes=notes)
         yielded = []
         for chunk in self._stream_direct(prompt):
             if chunk:
@@ -1311,7 +1311,7 @@ Return ONLY the response in this exact JSON format:
                             logger.info(f"Retry attempt {attempt + 1}/{max_retries}")
                             if self.ai_provider == "remote":
                                 self.client = ollama.Client(host=self.remote_url)
-                            else:
+                            elif not self._using_apple_lm():
                                 self._ensure_ollama_ready()
                                 self.client = ollama.Client()
 
@@ -1705,6 +1705,11 @@ TRANSCRIPT:
             True if connection is successful
         """
         try:
+            if self._using_apple_lm():
+                from src.apple_lm import apple_lm_status
+
+                return bool(apple_lm_status().get("available"))
+
             models = self.client.list()
             available_models = [model.model for model in models.models]
             
