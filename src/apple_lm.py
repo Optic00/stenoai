@@ -40,6 +40,7 @@ APPLE_LM_NUM_CTX = 8192
 _DISABLE_ENV = "STENOAI_DISABLE_APPLE_LM"
 _BIN_ENV = "STENOAI_APPLE_LM_BIN"
 _E2E_ENV = "STENOAI_E2E"
+_E2E_STATE_FILE_ENV = "STENOAI_APPLE_LM_STATE_FILE"
 
 _HELPER_APP_NAME = "Steno Apple LM.app"
 _HELPER_EXECUTABLE = "steno-apple-lm"
@@ -62,6 +63,16 @@ def apple_lm_disabled() -> bool:
 def _direct_test_helper_allowed() -> bool:
     """True only for an unpackaged E2E process, never a shipped backend."""
     return os.environ.get(_E2E_ENV) == "1" and not getattr(sys, "frozen", False)
+
+
+def _e2e_status_fixture() -> Optional[Dict[str, Any]]:
+    """Return deterministic status without executing a test helper."""
+    state_file = os.environ.get(_E2E_STATE_FILE_ENV)
+    if os.environ.get(_E2E_ENV) != "1" or not state_file:
+        return None
+    if Path(state_file).is_file():
+        return {"available": False, "reason": "appleIntelligenceNotEnabled"}
+    return {"available": True, "display_name": "Apple Intelligence"}
 
 
 def reset_apple_lm_cache() -> None:
@@ -138,6 +149,12 @@ def apple_lm_status() -> Dict[str, Any]:
         return {"available": False, "reason": "disabled"}
     if sys.platform != "darwin":
         return {"available": False, "reason": "unsupported_os"}
+    # Packaged T2 uses a status-only fixture. It cannot execute arbitrary code
+    # or receive meeting content, so the production helper boundary remains
+    # enforced even when the frozen backend is under test.
+    test_status = _e2e_status_fixture()
+    if test_status is not None:
+        return test_status
     try:
         macos_major = int(platform.mac_ver()[0].split(".", 1)[0])
     except (TypeError, ValueError):

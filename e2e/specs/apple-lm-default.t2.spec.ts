@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { test, expect } from '../fixtures/electron';
@@ -8,10 +8,10 @@ import { readUserConfig } from '../fixtures/user-config';
 /**
  * T2 - Apple System Language Model explicit opt-in.
  *
- * Model-free: uses a lightweight mock script pointed to via STENOAI_APPLE_LM_BIN
- * with STENOAI_DISABLE_APPLE_LM: '0'. Verifies that on Darwin, when Apple LM is
- * reported available, a fresh launch keeps the Ollama default, lists Apple in
- * supported_models, and only persists `apple:system` after an explicit choice.
+ * Model-free: uses the status-only E2E fixture with STENOAI_DISABLE_APPLE_LM: '0'.
+ * Verifies that on Darwin, when Apple LM is reported available, a fresh launch
+ * keeps the Ollama default, lists Apple in supported_models, and only persists
+ * `apple:system` after an explicit choice.
  */
 
 type ListResult = {
@@ -47,44 +47,12 @@ test('fresh install offers Apple Intelligence without selecting it', async ({
 
   const realDirBefore = fileSig(realUserDataDir());
   const fixtureDir = mkdtempSync(path.join(tmpdir(), 'stenoai-apple-lm-'));
-  const mockScript = path.join(fixtureDir, 'mock-steno-apple-lm.sh');
   const unavailableMarker = path.join(fixtureDir, 'unavailable');
 
   try {
-  writeFileSync(
-    mockScript,
-    [
-      '#!/usr/bin/env bash',
-      'set -euo pipefail',
-      'cmd="${1:-status}"',
-      'case "$cmd" in',
-      '  status)',
-      '    if [[ -f "${STENOAI_APPLE_LM_STATE_FILE:-}" ]]; then',
-      '      echo \'{"available":false,"reason":"appleIntelligenceNotEnabled"}\'',
-      '    else',
-      '      echo \'{"available":true,"display_name":"Apple Intelligence"}\'',
-      '    fi',
-      '    ;;',
-      '  complete)',
-      '    echo \'{"text":"Mocked response"}\'',
-      '    ;;',
-      '  stream)',
-      '    echo \'{"delta":"Mocked"}\'',
-      '    echo \'{"done":true}\'',
-      '    ;;',
-      '  *)',
-      '    echo \'{"error":"unknown_command"}\'',
-      '    exit 1',
-      '    ;;',
-      'esac',
-    ].join('\n'),
-  );
-  chmodSync(mockScript, 0o755);
-
   const { page } = await launchApp({
     env: {
       STENOAI_DISABLE_APPLE_LM: '0',
-      STENOAI_APPLE_LM_BIN: mockScript,
       STENOAI_APPLE_LM_STATE_FILE: unavailableMarker,
     },
   });

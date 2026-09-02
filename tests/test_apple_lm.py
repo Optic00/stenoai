@@ -173,24 +173,47 @@ class AppleLMResolutionTests(BaseAppleLMTest):
             )
         run_sidecar.assert_not_called()
 
-    def test_e2e_mock_sidecar_can_run_on_pre_tahoe_runner(self):
+    def test_e2e_status_fixture_can_run_on_pre_tahoe_runner(self):
+        state_file = Path(self._tmp_dir.name) / "unavailable"
         env = {
             "STENOAI_DISABLE_APPLE_LM": "0",
             "STENOAI_E2E": "1",
-            "STENOAI_APPLE_LM_BIN": "/tmp/mock-apple-lm",
+            "STENOAI_APPLE_LM_STATE_FILE": str(state_file),
         }
         with mock.patch("src.apple_lm.sys.platform", "darwin"), \
              mock.patch("src.apple_lm.platform.mac_ver", return_value=("15.7", ("", "", ""), "")), \
              mock.patch.dict(os.environ, env, clear=False), \
-             mock.patch("src.apple_lm.resolve_apple_lm_bin", return_value="/tmp/mock-apple-lm"), \
-             mock.patch(
-                 "src.apple_lm._run_apple_lm",
-                 return_value=json.dumps({"available": True}),
-             ) as run_sidecar:
+             mock.patch("src.apple_lm._run_apple_lm") as run_sidecar:
             from src.apple_lm import apple_lm_status
 
-            self.assertEqual(apple_lm_status(), {"available": True})
-        run_sidecar.assert_called_once_with(["status"], timeout=15)
+            self.assertEqual(
+                apple_lm_status(),
+                {"available": True, "display_name": "Apple Intelligence"},
+            )
+            state_file.write_text("", encoding="utf-8")
+            self.assertEqual(
+                apple_lm_status(),
+                {"available": False, "reason": "appleIntelligenceNotEnabled"},
+            )
+        run_sidecar.assert_not_called()
+
+    def test_production_ignores_e2e_status_fixture(self):
+        env = {
+            "STENOAI_DISABLE_APPLE_LM": "0",
+            "STENOAI_E2E": "0",
+            "STENOAI_APPLE_LM_STATE_FILE": str(
+                Path(self._tmp_dir.name) / "missing"
+            ),
+        }
+        with mock.patch("src.apple_lm.sys.platform", "darwin"), \
+             mock.patch("src.apple_lm.platform.mac_ver", return_value=("15.7", ("", "", ""), "")), \
+             mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch("src.apple_lm._run_apple_lm") as run_sidecar:
+            self.assertEqual(
+                apple_lm_status(),
+                {"available": False, "reason": "unsupported_os"},
+            )
+        run_sidecar.assert_not_called()
 
     def test_transient_status_failure_is_not_cached(self):
         env = {"STENOAI_DISABLE_APPLE_LM": "0"}
