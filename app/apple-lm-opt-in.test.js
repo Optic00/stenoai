@@ -31,7 +31,11 @@ test('first-run Ollama setup cannot silently select Apple Intelligence', () => {
     assertOllamaSetupModel('gemma4:e2b-it-qat'),
     'gemma4:e2b-it-qat',
   );
-  assert.match(setup, /setOllamaSetupModelIfCurrent\(/);
+  assert.strictEqual(
+    (setup.match(/setOllamaSetupModelIfCurrent\(/g) || []).length,
+    2,
+    'both setup persistence paths must use the guarded compare-and-set helper',
+  );
   assert.doesNotMatch(setup, /\['set-model-if-current'/);
 });
 
@@ -45,8 +49,14 @@ test('re-running setup preserves an explicit Apple Intelligence choice', () => {
     currentModelCheck < ollamaResolution,
     'the explicit Apple choice must be checked before Ollama model resolution',
   );
-  assert.match(setup, /current\.model === 'apple:system'/);
-  assert.match(setup, /skipped:\s*true/);
+  const appleShortCircuit = setup.match(
+    /if \(current\.model === 'apple:system'\) \{[\s\S]*?return \{ success: true, skipped: true, message: 'Apple Intelligence remains selected' \};[\s\S]*?\}/,
+  );
+  assert.ok(appleShortCircuit, 'Apple selection must return before Ollama setup continues');
+  assert.ok(
+    setup.indexOf(appleShortCircuit[0]) < ollamaResolution,
+    'the Apple short-circuit must precede Ollama model resolution',
+  );
 });
 
 test('setup fails closed when the current model cannot be read', () => {
@@ -93,6 +103,11 @@ test('setup owns Ollama before probing installed models', () => {
   assert.notStrictEqual(modelResolution, -1, 'setup must probe installed models');
   assert.ok(serviceStart < modelResolution, 'model probing must not start Ollama before Electron owns it');
   assert.ok(readinessGate < modelResolution, 'model probing must happen after the readiness gate');
+  assert.match(
+    setup,
+    /if \(!ready\) \{[\s\S]*?return \{ success: false, error: 'Ollama did not become ready\. Please retry setup\.' \};[\s\S]*?\}/,
+    'setup must fail before model resolution when Ollama never becomes ready',
+  );
 });
 
 test('setup model-save errors expose only fixed messages', () => {
@@ -107,7 +122,20 @@ test('setup model-save errors expose only fixed messages', () => {
     }),
     'Failed to save the selected model.',
   );
+  assert.strictEqual(
+    modelSetupSaveError({ success: false, error: 'permission denied: /Users/example/config.json' }),
+    'Failed to save the selected model.',
+  );
+  assert.strictEqual(
+    modelSetupSaveError({ success: false, error: 'Could not lock config' }),
+    'Could not lock config',
+  );
   const setup = handlerBody('setup-ollama-and-model');
   assert.match(setup, /error:\s*modelSetupSaveError\(e\)/);
+  assert.strictEqual(
+    (setup.match(/error:\s*modelSetupSaveError\(setRes\)/g) || []).length,
+    2,
+    'both non-success responses must normalize backend errors',
+  );
   assert.doesNotMatch(setup, /Failed to save the selected model:\s*\$\{e\.message\}/);
 });

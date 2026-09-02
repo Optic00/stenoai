@@ -7429,7 +7429,8 @@ ipcMain.handle('setup-ollama-and-model', async () => {
         }
         return { success: false, error: `Ollama failed to start (exit code: ${ollamaExitCode}). Check debug logs for details.` };
       }
-      sendDebugLog('Warning: Ollama may not be fully ready, attempting pull anyway...');
+      sendDebugLog('Ollama did not become ready during setup');
+      return { success: false, error: 'Ollama did not become ready. Please retry setup.' };
     }
 
     // Query installed models only after Electron has either reused an existing
@@ -7457,7 +7458,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
         const jsonLine = setRaw.trim().split('\n').reverse().find((l) => l.trim().startsWith('{'));
         const setRes = jsonLine ? JSON.parse(jsonLine) : null;
         if (!setRes || setRes.success !== true) {
-          return { success: false, error: (setRes && setRes.error) || 'Failed to save the selected model.' };
+          return { success: false, error: modelSetupSaveError(setRes) };
         }
         if (setRes.updated !== true) {
           return { success: true, skipped: true, message: 'A newer model selection was preserved' };
@@ -7627,7 +7628,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
               const jsonLine = setRaw.trim().split('\n').reverse().find((l) => l.trim().startsWith('{'));
               const setRes = jsonLine ? JSON.parse(jsonLine) : null;
               if (!setRes || setRes.success !== true) {
-                settle({ success: false, error: (setRes && setRes.error) || 'Failed to save the selected model.' });
+                settle({ success: false, error: modelSetupSaveError(setRes) });
                 return;
               }
               if (setRes.updated !== true) {

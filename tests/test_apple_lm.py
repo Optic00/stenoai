@@ -244,6 +244,32 @@ class AppleLMResolutionTests(BaseAppleLMTest):
 
         self.assertEqual(run_sidecar.call_count, 2)
 
+    def test_non_boolean_availability_is_rejected_and_not_cached(self):
+        env = {"STENOAI_DISABLE_APPLE_LM": "0"}
+        with mock.patch("src.apple_lm.sys.platform", "darwin"), mock.patch(
+            "src.apple_lm.platform.mac_ver",
+            return_value=("27.0", ("", "", ""), ""),
+        ), mock.patch.dict(os.environ, env, clear=False), mock.patch(
+            "src.apple_lm.resolve_apple_lm_bin",
+            return_value="/tmp/steno-apple-lm",
+        ), mock.patch(
+            "src.apple_lm._run_apple_lm",
+            side_effect=[
+                json.dumps({"available": "false"}),
+                json.dumps({"available": False, "reason": "modelNotReady"}),
+            ],
+        ) as run_sidecar:
+            self.assertEqual(
+                apple_lm_status(),
+                {"available": False, "reason": "sidecar_error"},
+            )
+            self.assertEqual(
+                apple_lm_status(),
+                {"available": False, "reason": "modelNotReady"},
+            )
+
+        self.assertEqual(run_sidecar.call_count, 2)
+
     def test_apple_system_model_info_describes_os_managed_model(self):
         with mock.patch("src.apple_lm.apple_lm_status") as status:
             info = apple_system_model_info(is_default=True)
@@ -474,6 +500,24 @@ class AppleLMConfigOptInTests(BaseAppleLMTest):
             config = Config(config_path=cfg_path)
         self.assertEqual(config.get_model(), Config.DEFAULT_MODEL)
 
+    def test_existing_config_without_model_source_is_preserved_as_user_choice(self):
+        cfg_path = Path(self._tmp_dir.name) / "config.json"
+        cfg_path.write_text(json.dumps({"model": "qwen3.5:9b"}))
+
+        config = Config(config_path=cfg_path)
+
+        self.assertEqual(config.get_model(), "qwen3.5:9b")
+        self.assertEqual(config.get("summary_model_source"), "user")
+        self.assertEqual(
+            json.loads(cfg_path.read_text())["summary_model_source"],
+            "user",
+        )
+
+    def test_fresh_config_marks_setup_model_as_automatic(self):
+        config = Config(config_path=Path(self._tmp_dir.name) / "config.json")
+
+        self.assertEqual(config.get("summary_model_source"), "auto")
+
     def test_explicit_apple_choice_survives_temporary_unavailability(self):
         cfg_path = Path(self._tmp_dir.name) / "config.json"
         cfg_path.write_text(json.dumps({"model": APPLE_SYSTEM_MODEL, "summary_model_source": "user"}))
@@ -526,6 +570,58 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
             stream = client.chat(stream=True, messages=[{"role": "user", "content": "hi"}])
             chunks = [c["message"]["content"] for c in stream]
             self.assertEqual(chunks, ["Hello", " world"])
+
+    def test_set_model_switches_from_apple_to_ollama_client(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.ai_provider = "local"
+        summarizer.model_name = APPLE_SYSTEM_MODEL
+        summarizer.client = AppleLMClient()
+        next_client = mock.Mock()
+        next_client.list.return_value.models = [mock.Mock(model="qwen3.5:9b")]
+
+        with mock.patch("src.summarizer.OLLAMA_AVAILABLE", True), mock.patch(
+            "src.summarizer.resolve_runtime_tag", return_value="qwen3.5:9b"
+        ), mock.patch.object(
+            summarizer, "_ensure_ollama_ready", return_value=True
+        ) as ensure, mock.patch(
+            "src.summarizer.ollama.Client", return_value=next_client
+        ):
+            self.assertTrue(summarizer.set_model("qwen3.5:9b"))
+
+        ensure.assert_called_once_with()
+        self.assertEqual(summarizer.model_name, "qwen3.5:9b")
+        self.assertIs(summarizer.client, next_client)
+
+    def test_set_model_switches_from_ollama_to_available_apple(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.ai_provider = "local"
+        summarizer.model_name = "qwen3.5:9b"
+        summarizer.client = mock.Mock()
+
+        with mock.patch(
+            "src.apple_lm.apple_lm_status", return_value={"available": True}
+        ):
+            self.assertTrue(summarizer.set_model(APPLE_SYSTEM_MODEL))
+
+        self.assertEqual(summarizer.model_name, APPLE_SYSTEM_MODEL)
+        self.assertIsInstance(summarizer.client, AppleLMClient)
+
+    def test_set_model_keeps_apple_when_ollama_switch_fails(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.ai_provider = "local"
+        summarizer.model_name = APPLE_SYSTEM_MODEL
+        apple_client = AppleLMClient()
+        summarizer.client = apple_client
+
+        with mock.patch("src.summarizer.OLLAMA_AVAILABLE", True), mock.patch(
+            "src.summarizer.resolve_runtime_tag", return_value="qwen3.5:9b"
+        ), mock.patch.object(
+            summarizer, "_ensure_ollama_ready", side_effect=RuntimeError("offline")
+        ):
+            self.assertFalse(summarizer.set_model("qwen3.5:9b"))
+
+        self.assertEqual(summarizer.model_name, APPLE_SYSTEM_MODEL)
+        self.assertIs(summarizer.client, apple_client)
 
     def test_apple_failure_does_not_retry_ignored_think_option(self):
         summarizer = OllamaSummarizer.__new__(OllamaSummarizer)

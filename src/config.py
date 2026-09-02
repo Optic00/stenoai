@@ -360,6 +360,7 @@ class Config:
         self._migrate_cloud_model_map()
         self._migrate_whisper_model()
         self._migrate_summary_model()
+        self._migrate_summary_model_source()
         self._migrate_transcription_engine()
         self._migrate_language_zh()
         self._migrate_privacy_notice_seen()
@@ -600,6 +601,22 @@ class Config:
         elif current in self._RETIRED_SUMMARY_MODELS:
             self._config["model"] = self.DEFAULT_MODEL
             self._save()
+
+    def _migrate_summary_model_source(self) -> None:
+        """Preserve model choices made before selection provenance existed.
+
+        Fresh installs may let setup adopt a locally available model. An
+        existing config without provenance is conservatively treated as a
+        user choice so a setup rerun cannot overwrite it.
+        """
+        if self._load_failed:
+            return
+        if self._config.get("summary_model_source") in ("user", "auto"):
+            return
+        self._config["summary_model_source"] = (
+            "user" if self._existed_at_load else "auto"
+        )
+        self._save()
 
     def _migrate_cloud_model_map(self) -> None:
         """One-shot migration from legacy single 'cloud_model' to per-provider
@@ -860,6 +877,7 @@ class Config:
             # model download readiness; config loading must never spawn a
             # sidecar or silently change an existing user's summary engine.
             "model": self.DEFAULT_MODEL,
+            "summary_model_source": "auto",
             "notifications_enabled": True,
             # Default ON — the calendar-based pre-meeting heads-up, independent
             # of notifications_enabled (which now only covers note-ready/

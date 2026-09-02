@@ -268,7 +268,7 @@ class OllamaSummarizer:
             )
             if is_apple_system_model(model_name):
                 status = apple_lm_status()
-                if not status.get("available"):
+                if status.get("available") is not True:
                     # The user explicitly selected Apple. A silent provider or
                     # model change would make provenance and privacy claims
                     # false, so surface the fixed availability reason instead.
@@ -1869,7 +1869,7 @@ TRANSCRIPT:
             if self._using_apple_lm():
                 from src.apple_lm import apple_lm_status
 
-                return bool(apple_lm_status().get("available"))
+                return apple_lm_status().get("available") is True
 
             models = self.client.list()
             available_models = [model.model for model in models.models]
@@ -1908,19 +1908,59 @@ TRANSCRIPT:
         Returns:
             True if model is available and set successfully
         """
+        from src.apple_lm import (
+            APPLE_SYSTEM_MODEL,
+            AppleLMClient,
+            apple_lm_status,
+            is_apple_system_model,
+        )
+
+        if self.ai_provider == "local" and is_apple_system_model(model_name):
+            if apple_lm_status().get("available") is not True:
+                logger.error("Apple Intelligence is not available")
+                return False
+            self.model_name = APPLE_SYSTEM_MODEL
+            self.client = AppleLMClient()
+            logger.info("Model changed to Apple System Language Model")
+            return True
+
+        previous_model = self.model_name
+        previous_client = self.client
+        switching_from_apple = self.ai_provider == "local" and self._using_apple_lm()
+        if switching_from_apple:
+            if not OLLAMA_AVAILABLE:
+                logger.error("Ollama client is not available")
+                return False
+            self.model_name = resolve_runtime_tag(model_name)
+            try:
+                self._ensure_ollama_ready()
+                self.client = ollama.Client()
+            except Exception as e:
+                self.model_name = previous_model
+                self.client = previous_client
+                logger.error(f"Error preparing Ollama model: {e}")
+                return False
+
         try:
             models = self.client.list()
             available_models = [model.model for model in models.models]
-            
-            if model_name in available_models:
-                self.model_name = model_name
+
+            candidate = self.model_name if switching_from_apple else model_name
+            if candidate in available_models:
+                self.model_name = candidate
                 logger.info(f"Model changed to: {model_name}")
                 return True
             else:
                 logger.error(f"Model {model_name} not available. Available models: {available_models}")
+                if switching_from_apple:
+                    self.model_name = previous_model
+                    self.client = previous_client
                 return False
-                
+
         except Exception as e:
+            if switching_from_apple:
+                self.model_name = previous_model
+                self.client = previous_client
             logger.error(f"Error setting model: {e}")
             return False
     

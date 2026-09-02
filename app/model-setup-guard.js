@@ -16,9 +16,12 @@ function assertOllamaSetupModel(model) {
 
 function modelSetupSaveError(error) {
   try {
-    const jsonLine = String(error?.stdout || '').trim().split('\n').reverse()
-      .find((line) => line.trim().startsWith('{'));
-    const result = jsonLine ? JSON.parse(jsonLine) : null;
+    let result = error;
+    if (!result || typeof result !== 'object' || typeof result.error !== 'string') {
+      const jsonLine = String(error?.stdout || '').trim().split('\n').reverse()
+        .find((line) => line.trim().startsWith('{'));
+      result = jsonLine ? JSON.parse(jsonLine) : null;
+    }
     if (result && SAFE_MODEL_SAVE_ERRORS.has(result.error)) {
       return result.error;
     }

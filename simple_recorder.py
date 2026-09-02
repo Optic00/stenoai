@@ -4512,7 +4512,7 @@ def setup_check(as_json):
     configured_model = get_config().get_model()
     if is_apple_system_model(configured_model):
         status = apple_lm_status()
-        if status.get("available"):
+        if status.get("available") is True:
             checks.append(("✅ llm-model", "Apple System Language Model (available)"))
         else:
             checks.append(("❌ llm-model", apple_lm_unavailable_message(status)))
@@ -4704,10 +4704,10 @@ def list_models():
                         is_default=apple_selected,
                         status=apple_status,
                     ),
-                    "installed": bool(apple_status.get("available")),
-                    "available": bool(apple_status.get("available")),
+                    "installed": apple_status.get("available") is True,
+                    "available": apple_status.get("available") is True,
                     "managed": True,
-                    "selectable": bool(apple_status.get("available")),
+                    "selectable": apple_status.get("available") is True,
                     "downloadable": False,
                     "deletable": False,
                     "gguf_installed": False,

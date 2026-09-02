@@ -177,8 +177,11 @@ def apple_lm_status() -> Dict[str, Any]:
     try:
         raw = _run_apple_lm(["status"], timeout=15)
         payload = json.loads(raw)
-        if not isinstance(payload, dict):
-            raise ValueError("status payload is not an object")
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("available"), bool)
+        ):
+            raise ValueError("status payload has no boolean availability")
     except Exception as exc:
         logger.info("apple-lm status failed: %s", type(exc).__name__)
         payload = {"available": False, "reason": "sidecar_error"}
@@ -190,7 +193,7 @@ def apple_lm_status() -> Dict[str, Any]:
 
 
 def apple_lm_available() -> bool:
-    return bool(apple_lm_status().get("available"))
+    return apple_lm_status().get("available") is True
 
 
 _UNAVAILABLE_MESSAGES = {
@@ -236,7 +239,7 @@ def apple_lm_should_list(
 ) -> bool:
     """Show actionable Tahoe availability states without advertising on older OSes."""
     payload = status if status is not None else apple_lm_status()
-    if selected or payload.get("available"):
+    if selected or payload.get("available") is True:
         return True
     return payload.get("reason") not in _HIDDEN_UNAVAILABLE_REASONS
 
@@ -266,7 +269,7 @@ def apple_system_model_info(
     else:
         availability_bit = (
             "OS-managed on-device model"
-            if status.get("available")
+            if status.get("available") is True
             else apple_lm_unavailable_message(status)
         )
     return {
