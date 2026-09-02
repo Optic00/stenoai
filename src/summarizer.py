@@ -118,9 +118,13 @@ _OVERLAP_RATIO = 0.05             # last 5% of previous chunk prepended to next
 # text snapshot; keep the newest slice verbatim. Map-reduce forgets reversals
 # and dies at hierarchical depth 2 on this window.
 _SNAPSHOT_MAX_CHARS = 2800
+_APPLE_RESPONSE_RESERVE_CHARS = 2800
 _SNAPSHOT_PROMPT_OVERHEAD_CHARS = 900
 _SNAPSHOT_HEAD_RATIO = 0.6
 _SNAPSHOT_NOTES_TRUNCATION_MARKER = "\n...[notes truncated]"
+_APPLE_QUERY_TRUNCATION_MARKER = (
+    "\n...[middle of transcript omitted to fit Apple Intelligence context]...\n"
+)
 
 
 def resolve_num_ctx(model_name: str) -> int:
@@ -605,9 +609,18 @@ class OllamaSummarizer:
 
     def _snapshot_slice_budget_chars(self) -> int:
         window = resolve_num_ctx(self.model_name) * _CHUNK_SAFETY_CHARS_PER_TOKEN
-        output_reserve = MAP_OUTPUT_MAX_TOKENS * _CHUNK_SAFETY_CHARS_PER_TOKEN
+        # Foundation Models has one shared context window for prompt and
+        # response. A snapshot may legitimately reach the full hard cap, so
+        # reserving the smaller map-output allowance can overflow at the model
+        # boundary even when the input prompt itself fits.
+        output_reserve = _SNAPSHOT_MAX_CHARS
         budget = window - _SNAPSHOT_MAX_CHARS - _SNAPSHOT_PROMPT_OVERHEAD_CHARS - output_reserve
         return max(800, budget)
+
+    def _apple_input_budget_chars(self) -> int:
+        """Maximum Apple prompt size with room for a full bounded response."""
+        window = resolve_num_ctx(self.model_name) * _CHUNK_SAFETY_CHARS_PER_TOKEN
+        return max(800, window - _APPLE_RESPONSE_RESERVE_CHARS)
 
     def _hard_trim_snapshot(self, snapshot: str) -> str:
         if len(snapshot) <= _SNAPSHOT_MAX_CHARS:
@@ -655,18 +668,20 @@ class OllamaSummarizer:
             return self._create_markdown_prompt(snapshot, language, notes=notes_value)
 
         clean_notes = (notes or "").strip()
+        input_budget = self._apple_input_budget_chars()
+        base_prompt = create(None)
+        if len(base_prompt) > input_budget:
+            raise ValueError(
+                "Template instructions are too long for Apple Intelligence. "
+                "Shorten the template and try again."
+            )
         if not clean_notes:
-            return create(None)
+            return base_prompt
 
         prompt = create(clean_notes)
-        input_budget = (
-            resolve_num_ctx(self.model_name) * _CHUNK_SAFETY_CHARS_PER_TOKEN
-            - MAP_OUTPUT_MAX_TOKENS * _CHUNK_SAFETY_CHARS_PER_TOKEN
-        )
         if len(prompt) <= input_budget:
             return prompt
 
-        base_prompt = create(None)
         one_char_prompt = create("x")
         notes_wrapper_chars = len(one_char_prompt) - len(base_prompt) - 1
         notes_budget = max(0, input_budget - len(base_prompt) - notes_wrapper_chars)
@@ -677,6 +692,24 @@ class OllamaSummarizer:
             + _SNAPSHOT_NOTES_TRUNCATION_MARKER
         )
         return create(bounded_notes)
+
+    def _validate_apple_snapshot_template(
+        self, template_prompt: Optional[str], language: str
+    ) -> None:
+        """Reject a template that cannot fit even after transcript compaction."""
+        if not template_prompt:
+            return
+        prompt = self._create_template_report_prompt(
+            "S" * _SNAPSHOT_MAX_CHARS,
+            template_prompt,
+            language,
+            notes=None,
+        )
+        if len(prompt) > self._apple_input_budget_chars():
+            raise ValueError(
+                "Template instructions are too long for Apple Intelligence. "
+                "Shorten the template and try again."
+            )
 
     def _snapshot_compact_streaming(
         self,
@@ -1697,7 +1730,27 @@ TRANSCRIPT:
             str: Text chunks as they arrive from the LLM
         """
         transcript = _strip_leading_timestamps(transcript)
-        if self._using_apple_lm() and self._needs_chunking(transcript, notes):
+        using_apple_lm = self._using_apple_lm()
+        apple_direct_prompt = None
+        if using_apple_lm:
+            apple_direct_prompt = (
+                self._create_template_report_prompt(
+                    transcript, template_prompt, language, notes
+                )
+                if template_prompt
+                else self._create_markdown_prompt(transcript, language, notes)
+            )
+
+        # Apple has a fixed 8K combined input/output window. Check the real
+        # prompt, including a custom template, notes, language instructions,
+        # and scaffolding. Transcript-only sizing lets a short transcript plus
+        # a large template bypass compaction and fail at the model boundary.
+        if (
+            using_apple_lm
+            and apple_direct_prompt is not None
+            and len(apple_direct_prompt) > self._apple_input_budget_chars()
+        ):
+            self._validate_apple_snapshot_template(template_prompt, language)
             inner = self._snapshot_compact_streaming(
                 transcript, language, notes, progress_callback, template_prompt
             )
@@ -1710,14 +1763,18 @@ TRANSCRIPT:
             # summary-schema specific and don't apply here). Stream through the
             # ACTIVE provider — not straight to Ollama, which has no client and
             # would crash in cloud/adapter mode.
-            prompt = self._create_template_report_prompt(transcript, template_prompt, language, notes)
+            prompt = apple_direct_prompt or self._create_template_report_prompt(
+                transcript, template_prompt, language, notes
+            )
             inner = self._stream_completion(prompt)
             empty_message = "Model returned an empty report"
         elif self._needs_chunking(transcript, notes):
             inner = self._map_reduce_streaming(transcript, language, notes, progress_callback)
             empty_message = "Model returned an empty summary"
         else:
-            prompt = self._create_markdown_prompt(transcript, language, notes)
+            prompt = apple_direct_prompt or self._create_markdown_prompt(
+                transcript, language, notes
+            )
             inner = self._stream_completion(prompt)
             empty_message = "Model returned an empty summary"
 
@@ -1968,6 +2025,35 @@ TRANSCRIPT:
 
 ANSWER:"""
 
+    def _build_bounded_apple_query_prompt(
+        self, transcript: str, question: str, language: str = "en"
+    ) -> str:
+        """Build a query prompt that leaves room for Apple's response.
+
+        Meeting chat must stay responsive and deterministic, so an oversized
+        transcript keeps its beginning and newest tail rather than starting a
+        second model-driven summarisation pipeline before answering.
+        """
+        input_budget = self._apple_input_budget_chars()
+        empty_prompt = self._build_query_prompt("", question, language)
+        transcript_budget = input_budget - len(empty_prompt)
+        if transcript_budget <= len(_APPLE_QUERY_TRUNCATION_MARKER):
+            raise ValueError(
+                "Question is too long for Apple Intelligence. Shorten it and try again."
+            )
+        if len(transcript) <= transcript_budget:
+            return self._build_query_prompt(transcript, question, language)
+
+        content_budget = transcript_budget - len(_APPLE_QUERY_TRUNCATION_MARKER)
+        head = int(content_budget * _SNAPSHOT_HEAD_RATIO)
+        tail = content_budget - head
+        bounded = (
+            transcript[:head]
+            + _APPLE_QUERY_TRUNCATION_MARKER
+            + transcript[-tail:]
+        )
+        return self._build_query_prompt(bounded, question, language)
+
     def query_transcript_streaming(self, transcript: str, question: str, language: str = "en"):
         """Generator that yields text chunks from the LLM for a transcript query."""
         if not transcript or transcript.strip() == "":
@@ -1977,7 +2063,11 @@ ANSWER:"""
             yield "Please provide a question."
             return
 
-        prompt = self._build_query_prompt(transcript, question, language)
+        prompt = (
+            self._build_bounded_apple_query_prompt(transcript, question, language)
+            if self._using_apple_lm()
+            else self._build_query_prompt(transcript, question, language)
+        )
 
         try:
             if self.ai_provider == "adapter":
@@ -2059,7 +2149,11 @@ ANSWER:"""
             if not question or question.strip() == "":
                 return "Please provide a question."
 
-            prompt = self._build_query_prompt(transcript, question, language)
+            prompt = (
+                self._build_bounded_apple_query_prompt(transcript, question, language)
+                if self._using_apple_lm()
+                else self._build_query_prompt(transcript, question, language)
+            )
 
             logger.info(f"Querying transcript with question ({len(question)} chars)")
 

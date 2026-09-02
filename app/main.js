@@ -7343,44 +7343,6 @@ ipcMain.handle('setup-ollama-and-model', async () => {
     }
     sendDebugLog(`Found bundled Ollama at: ${finalOllamaPath}`);
 
-    // Check whether an already-installed Ollama model can be reused, but only
-    // after the bundled binary requirement has been enforced. Persist through
-    // an atomic compare-and-set so a Settings choice made while setup runs can
-    // never be overwritten by this older setup operation.
-    let pullTarget = DEFAULT_AI_MODEL;
-    let resolved = null;
-    try {
-      const resolvedRaw = await runPythonScript('simple_recorder.py', ['resolve-setup-model'], true);
-      resolved = JSON.parse(resolvedRaw.trim());
-      if (resolved && resolved.pull_target) {
-        pullTarget = resolved.pull_target;
-      }
-    } catch (e) {
-      sendDebugLog(`Could not check for installed models: ${e.message}`);
-    }
-    if (resolved && resolved.installed) {
-      try {
-        sendDebugLog(`Found already-installed model "${resolved.installed}" - skipping download`);
-        const setRaw = await runPythonScript(
-          'simple_recorder.py',
-          ['set-model-if-current', setupModelAtStart, resolved.installed],
-          true,
-        );
-        const jsonLine = setRaw.trim().split('\n').reverse().find((l) => l.trim().startsWith('{'));
-        const setRes = jsonLine ? JSON.parse(jsonLine) : null;
-        if (!setRes || setRes.success !== true) {
-          return { success: false, error: (setRes && setRes.error) || 'Failed to save the selected model.' };
-        }
-        if (setRes.updated !== true) {
-          return { success: true, skipped: true, message: 'A newer model selection was preserved' };
-        }
-        trackEvent('setup_completed', { step: 'ollama_existing_model' });
-        return { success: true, message: `Using already-installed model ${resolved.installed}` };
-      } catch (e) {
-        return { success: false, error: `Failed to save the selected model: ${e.message}` };
-      }
-    }
-
     // Reuse already-running Ollama if its API is reachable on 11434.
     // Avoids "address already in use" when the user (or a previous launch)
     // already has Ollama up.
@@ -7459,6 +7421,44 @@ ipcMain.handle('setup-ollama-and-model', async () => {
         return { success: false, error: `Ollama failed to start (exit code: ${ollamaExitCode}). Check debug logs for details.` };
       }
       sendDebugLog('Warning: Ollama may not be fully ready, attempting pull anyway...');
+    }
+
+    // Query installed models only after Electron has either reused an existing
+    // service or started and recorded the bundled service. The Python command
+    // is deliberately probe-only: letting it start a detached Ollama process
+    // here would leave that process outside Electron's quit cleanup.
+    let pullTarget = DEFAULT_AI_MODEL;
+    let resolved = null;
+    try {
+      const resolvedRaw = await runPythonScript('simple_recorder.py', ['resolve-setup-model'], true);
+      resolved = JSON.parse(resolvedRaw.trim());
+      if (resolved && resolved.pull_target) {
+        pullTarget = resolved.pull_target;
+      }
+    } catch (e) {
+      sendDebugLog(`Could not check for installed models: ${e.message}`);
+    }
+    if (resolved && resolved.installed) {
+      try {
+        sendDebugLog(`Found already-installed model "${resolved.installed}" - skipping download`);
+        const setRaw = await runPythonScript(
+          'simple_recorder.py',
+          ['set-model-if-current', setupModelAtStart, resolved.installed],
+          true,
+        );
+        const jsonLine = setRaw.trim().split('\n').reverse().find((l) => l.trim().startsWith('{'));
+        const setRes = jsonLine ? JSON.parse(jsonLine) : null;
+        if (!setRes || setRes.success !== true) {
+          return { success: false, error: (setRes && setRes.error) || 'Failed to save the selected model.' };
+        }
+        if (setRes.updated !== true) {
+          return { success: true, skipped: true, message: 'A newer model selection was preserved' };
+        }
+        trackEvent('setup_completed', { step: 'ollama_existing_model' });
+        return { success: true, message: `Using already-installed model ${resolved.installed}` };
+      } catch (e) {
+        return { success: false, error: `Failed to save the selected model: ${e.message}` };
+      }
     }
 
     // If no model is installed yet, download the pullTarget model

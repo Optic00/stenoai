@@ -165,16 +165,20 @@ class SetModelExitCodeTests(unittest.TestCase):
 
 
 class SetModelIfCurrentTests(unittest.TestCase):
+    @staticmethod
+    def _invoke(fake_config):
+        with mock.patch("src.config.get_config", return_value=fake_config):
+            return CliRunner().invoke(
+                simple_recorder.set_model_if_current,
+                ["gemma4:e2b-it-qat", "qwen3.5:9b"],
+            )
+
     def test_preserves_a_newer_user_selection(self):
         fake_config = mock.Mock()
         fake_config.begin_transaction.return_value = True
         fake_config.get_model.return_value = "apple:system"
 
-        with mock.patch("src.config.get_config", return_value=fake_config):
-            result = CliRunner().invoke(
-                simple_recorder.set_model_if_current,
-                ["gemma4:e2b-it-qat", "qwen3.5:9b"],
-            )
+        result = self._invoke(fake_config)
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
@@ -191,11 +195,7 @@ class SetModelIfCurrentTests(unittest.TestCase):
         fake_config.set_model.return_value = True
         fake_config.commit_transaction.return_value = True
 
-        with mock.patch("src.config.get_config", return_value=fake_config):
-            result = CliRunner().invoke(
-                simple_recorder.set_model_if_current,
-                ["gemma4:e2b-it-qat", "qwen3.5:9b"],
-            )
+        result = self._invoke(fake_config)
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
@@ -204,6 +204,64 @@ class SetModelIfCurrentTests(unittest.TestCase):
         )
         fake_config.set_model.assert_called_once_with("qwen3.5:9b", source="auto")
         fake_config.commit_transaction.assert_called_once_with()
+
+    def test_lock_failure_exits_nonzero_without_rollback(self):
+        fake_config = mock.Mock()
+        fake_config.begin_transaction.return_value = False
+
+        result = self._invoke(fake_config)
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(
+            json.loads(result.output),
+            {"success": False, "error": "Could not lock config"},
+        )
+        fake_config.rollback_transaction.assert_not_called()
+
+    def test_staging_failure_rolls_back_and_exits_nonzero(self):
+        fake_config = mock.Mock()
+        fake_config.begin_transaction.return_value = True
+        fake_config.get_model.return_value = "gemma4:e2b-it-qat"
+        fake_config.set_model.return_value = False
+
+        result = self._invoke(fake_config)
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(
+            json.loads(result.output),
+            {"success": False, "error": "Failed to stage model config"},
+        )
+        fake_config.rollback_transaction.assert_called_once_with()
+
+    def test_commit_failure_exits_nonzero(self):
+        fake_config = mock.Mock()
+        fake_config.begin_transaction.return_value = True
+        fake_config.get_model.return_value = "gemma4:e2b-it-qat"
+        fake_config.set_model.return_value = True
+        fake_config.commit_transaction.return_value = False
+
+        result = self._invoke(fake_config)
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(
+            json.loads(result.output),
+            {"success": False, "error": "Failed to save config"},
+        )
+        fake_config.commit_transaction.assert_called_once_with()
+
+    def test_exception_rolls_back_and_exits_nonzero(self):
+        fake_config = mock.Mock()
+        fake_config.begin_transaction.return_value = True
+        fake_config.get_model.side_effect = RuntimeError("synthetic read failure")
+
+        result = self._invoke(fake_config)
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(
+            json.loads(result.output),
+            {"success": False, "error": "synthetic read failure"},
+        )
+        fake_config.rollback_transaction.assert_called_once_with()
 
 
 if __name__ == "__main__":

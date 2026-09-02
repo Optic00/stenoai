@@ -32,13 +32,12 @@ describe('ModelCard delete button', () => {
         onSelect={vi.fn()}
         onDeleteModel={undefined}
         selectDisabled
-        selectLabel="Unavailable"
       />,
     );
 
     expect(screen.queryByRole('button', { name: 'Delete model' })).toBeNull();
-    const unavailable = screen.getByRole('button', { name: 'Unavailable' });
-    expect((unavailable as HTMLButtonElement).disabled).toBe(true);
+    const select = screen.getByRole('button', { name: 'Select' });
+    expect((select as HTMLButtonElement).disabled).toBe(true);
   });
 });
 

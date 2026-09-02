@@ -161,7 +161,6 @@ interface ModelCardProps {
   downloadBytesPerSecond?: number;
   onSelect: () => void;
   selectDisabled?: boolean;
-  selectLabel?: string;
   // Lets a user on a slow connection (or a misclick on a large model) back
   // out of a download in progress instead of being stuck waiting for it.
   onCancelDownload?: () => void;
@@ -210,7 +209,6 @@ export function ModelCard({
   downloadBytesPerSecond,
   onSelect,
   selectDisabled = false,
-  selectLabel = 'Select',
   onCancelDownload,
   isInstalled = false,
   onDeleteModel,
@@ -387,7 +385,7 @@ export function ModelCard({
                 </>
               )
             ) : (
-              selectLabel
+              'Select'
             )}
           </Button>
         </div>

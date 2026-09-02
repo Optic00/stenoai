@@ -1020,7 +1020,6 @@ function ModelList() {
         downloadBytesPerSecond={pull.bytesPerSecond[pullTarget]}
         onSelect={onSelect}
         selectDisabled={m.selectable === false}
-        selectLabel={m.downloadable === false && !m.available ? 'Unavailable' : 'Select'}
         onCancelDownload={() => pull.cancel(pullTarget)}
         isInstalled={Boolean(m.installed)}
         onDeleteModel={m.deletable === false ? undefined : onDeleteModel}

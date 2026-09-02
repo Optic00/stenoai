@@ -41,6 +41,15 @@ class AppleLMBundleGuardTests(unittest.TestCase):
                 )
             )
 
+    def test_existing_bundle_must_contain_helper_executable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = Path(tmp) / "Steno Apple LM.app"
+            helper.joinpath("Contents").mkdir(parents=True)
+            helper.joinpath("Contents", "Info.plist").write_text("<plist/>")
+
+            with self.assertRaisesRegex(FileNotFoundError, "executable is missing"):
+                resolve_apple_lm_sidecar(helper, platform="darwin")
+
     @unittest.skipIf(sys.platform == "win32", "POSIX executable fixture")
     def test_existing_sidecar_must_be_executable(self):
         with tempfile.TemporaryDirectory() as tmp:

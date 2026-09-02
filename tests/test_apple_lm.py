@@ -638,15 +638,126 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
         self.assertIn("N" * 1_000, final_prompts[0])
         self.assertIn("...[notes truncated]", final_prompts[0])
         from src.summarizer import (
-            _CHUNK_SAFETY_CHARS_PER_TOKEN,
-            MAP_OUTPUT_MAX_TOKENS,
-            resolve_num_ctx,
+            _APPLE_RESPONSE_RESERVE_CHARS,
         )
-        input_budget = (
-            resolve_num_ctx(APPLE_SYSTEM_MODEL) * _CHUNK_SAFETY_CHARS_PER_TOKEN
-            - MAP_OUTPUT_MAX_TOKENS * _CHUNK_SAFETY_CHARS_PER_TOKEN
-        )
+        input_budget = summarizer._apple_input_budget_chars()
         self.assertLessEqual(len(final_prompts[0]), input_budget)
+        self.assertEqual(
+            APPLE_LM_NUM_CTX * 2 - input_budget,
+            _APPLE_RESPONSE_RESERVE_CHARS,
+        )
+
+    def test_snapshot_slice_budget_reserves_full_snapshot_response(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.model_name = APPLE_SYSTEM_MODEL
+        from src.summarizer import (
+            _CHUNK_SAFETY_CHARS_PER_TOKEN,
+            _SNAPSHOT_MAX_CHARS,
+            _SNAPSHOT_PROMPT_OVERHEAD_CHARS,
+        )
+
+        total = (
+            _SNAPSHOT_MAX_CHARS
+            + _SNAPSHOT_PROMPT_OVERHEAD_CHARS
+            + summarizer._snapshot_slice_budget_chars()
+            + _SNAPSHOT_MAX_CHARS
+        )
+        self.assertLessEqual(
+            total,
+            resolve_num_ctx(APPLE_SYSTEM_MODEL) * _CHUNK_SAFETY_CHARS_PER_TOKEN,
+        )
+
+    def test_large_apple_template_uses_snapshot_compaction(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.ai_provider = "local"
+        summarizer.model_name = APPLE_SYSTEM_MODEL
+        summarizer._snapshot_compact_streaming = mock.Mock(
+            return_value=iter(["bounded report"])
+        )
+
+        result = "".join(
+            summarizer.summarize_transcript_streaming(
+                "X" * summarizer._apple_input_budget_chars(),
+                template_prompt="T" * 1_000,
+            )
+        )
+
+        self.assertEqual(result, "bounded report")
+        summarizer._snapshot_compact_streaming.assert_called_once()
+
+    def test_oversized_template_fails_before_snapshot_model_calls(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.ai_provider = "local"
+        summarizer.model_name = APPLE_SYSTEM_MODEL
+        summarizer._snapshot_compact_streaming = mock.Mock()
+
+        with self.assertRaisesRegex(ValueError, "Template instructions are too long"):
+            "".join(
+                summarizer.summarize_transcript_streaming(
+                    "short transcript",
+                    template_prompt="T" * summarizer._apple_input_budget_chars(),
+                )
+            )
+
+        summarizer._snapshot_compact_streaming.assert_not_called()
+
+    def test_oversized_apple_template_fails_before_final_model_call(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.model_name = APPLE_SYSTEM_MODEL
+
+        with self.assertRaisesRegex(ValueError, "Template instructions are too long"):
+            summarizer._create_snapshot_final_prompt(
+                "snapshot",
+                "en",
+                None,
+                "T" * summarizer._apple_input_budget_chars(),
+            )
+
+    def test_apple_query_prompt_bounds_long_transcript_and_keeps_edges(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.model_name = APPLE_SYSTEM_MODEL
+        transcript = "HEAD-NEEDLE\n" + "M" * 30_000 + "\nTAIL-NEEDLE"
+
+        prompt = summarizer._build_bounded_apple_query_prompt(
+            transcript, "What changed?"
+        )
+
+        self.assertLessEqual(len(prompt), summarizer._apple_input_budget_chars())
+        self.assertIn("HEAD-NEEDLE", prompt)
+        self.assertIn("TAIL-NEEDLE", prompt)
+        self.assertIn("middle of transcript omitted", prompt)
+
+    def test_both_apple_query_paths_use_bounded_prompt(self):
+        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.ai_provider = "local"
+        summarizer.model_name = APPLE_SYSTEM_MODEL
+        transcript = "H" * 30_000 + "TAIL"
+        prompts = []
+
+        def fake_stream(prompt, timeout=300):
+            prompts.append(prompt)
+            return iter(["streamed"])
+
+        def fake_complete(prompt, timeout=120):
+            prompts.append(prompt)
+            return "complete"
+
+        with mock.patch("src.apple_lm.stream_complete", side_effect=fake_stream), \
+             mock.patch("src.apple_lm.complete", side_effect=fake_complete):
+            self.assertEqual(
+                "".join(summarizer.query_transcript_streaming(transcript, "Question?")),
+                "streamed",
+            )
+            self.assertEqual(
+                summarizer.query_transcript(transcript, "Question?"),
+                "complete",
+            )
+
+        self.assertEqual(len(prompts), 2)
+        self.assertTrue(
+            all(len(prompt) <= summarizer._apple_input_budget_chars() for prompt in prompts)
+        )
+        self.assertTrue(all("middle of transcript omitted" in prompt for prompt in prompts))
 
 
 class AppleLMCLITests(BaseAppleLMTest):
@@ -727,7 +838,7 @@ class AppleLMCLITests(BaseAppleLMTest):
 
     def test_resolve_setup_model_does_not_auto_select_apple_system(self):
         with mock.patch("src.apple_lm.apple_lm_available", return_value=True), \
-             mock.patch("src.ollama_manager.start_ollama_server"), \
+             mock.patch("src.ollama_manager.start_ollama_server") as start_ollama, \
              mock.patch("ollama.list", return_value=mock.Mock(models=[])):
             runner = CliRunner()
             result = runner.invoke(simple_recorder.resolve_setup_model)
@@ -735,6 +846,7 @@ class AppleLMCLITests(BaseAppleLMTest):
             data = json.loads(result.output)
             self.assertIsNone(data["installed"])
             self.assertIsNotNone(data["pull_target"])
+            start_ollama.assert_not_called()
 
     def test_setup_check_reports_apple_system_model(self):
         with mock.patch("sys.platform", "darwin"), \

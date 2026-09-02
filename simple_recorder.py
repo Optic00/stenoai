@@ -9513,17 +9513,16 @@ def resolve_setup_model():
     redundant download (#123).
 
     Prints {"installed": "<model-id>"} when the connected Ollama already has a
-    supported model, else {"installed": null}. Never pulls — the caller decides
-    whether to download. Uses the HTTP API (ollama package), not the binary.
+    supported model, else {"installed": null}. Never starts Ollama or pulls a
+    model: the Electron caller owns the service lifecycle and decides whether
+    to download. Uses the HTTP API (ollama package), not the binary.
     """
     from src.config import get_config, Config
 
-    from src.ollama_manager import start_ollama_server
     from src.config import is_apple_silicon
 
     result = {"installed": None, "pull_target": Config.DEFAULT_MODEL}
     try:
-        start_ollama_server()
         import ollama
         resp = ollama.list()
         installed = {

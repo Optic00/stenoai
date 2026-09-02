@@ -232,7 +232,7 @@ jobs:
           export STENOAI_DISABLE_APPLE_LM=0
           export STENOAI_E2E=1
           export STENOAI_APPLE_LM_BIN="$PWD/build/apple-lm-smoke/Steno Apple LM.app/Contents/MacOS/steno-apple-lm"
-          python - <<'PY'
+          python3 - <<'PY'
           from src.apple_lm import apple_lm_status
 
           status = apple_lm_status()

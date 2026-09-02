@@ -69,3 +69,16 @@ test('setup enforces bundled Ollama and atomically preserves newer choices', () 
   assert.match(setup, /\['set-model-if-current',\s*setupModelAtStart,/);
   assert.doesNotMatch(setup, /\['set-model',\s*resolved\.installed\]/);
 });
+
+test('setup owns Ollama before probing installed models', () => {
+  const setup = handlerBody('setup-ollama-and-model');
+  const serviceStart = setup.indexOf("ollamaProcess = spawn(finalOllamaPath, ['serve']");
+  const readinessGate = setup.indexOf('if (!ready)');
+  const modelResolution = setup.indexOf("['resolve-setup-model']");
+
+  assert.notStrictEqual(serviceStart, -1, 'setup must own a newly started Ollama service');
+  assert.notStrictEqual(readinessGate, -1, 'setup must wait for Ollama readiness');
+  assert.notStrictEqual(modelResolution, -1, 'setup must probe installed models');
+  assert.ok(serviceStart < modelResolution, 'model probing must not start Ollama before Electron owns it');
+  assert.ok(readinessGate < modelResolution, 'model probing must happen after the readiness gate');
+});
