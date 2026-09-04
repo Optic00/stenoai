@@ -114,3 +114,23 @@ test('no developer text survives any branch', () => {
     assert.ok(body.length > 0);
   }
 });
+
+test('a plain Error is not text-matched into a wrong cause', () => {
+  // The capture path also throws plain Errors carrying main's own messages. An
+  // EACCES opening the recording FILE used to match /permission/ and tell the
+  // user Steno lacked MICROPHONE access — a wrong cause, and on macOS a pointer
+  // to a settings pane that could not have helped.
+  const body = buildCaptureErrorBody({
+    name: 'Error',
+    message: "EACCES: permission denied, open '/Users/x/recordings/note.webm'",
+    platform: 'darwin',
+  });
+  assert.doesNotMatch(body, /microphone/i);
+  assert.doesNotMatch(body, /System Settings/);
+  assert.strictEqual(body, "Steno couldn't start the recording. Try again in a moment.");
+});
+
+test('message matching still works for a caller that supplies no name', () => {
+  const body = buildCaptureErrorBody({ message: 'Requested device not found' });
+  assert.match(body, /couldn't find a microphone/);
+});

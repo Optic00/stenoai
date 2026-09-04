@@ -45,9 +45,10 @@ function buildTranscriptReadyBody(title) {
  * three rules apply: name what actually failed, say whether the user has to do
  * anything, and let no developer text through.
  *
- * Dispatch is on the DOMException NAME, which is a specified, stable identifier;
- * the message text is engine wording and is only used as a fallback for callers
- * that could not supply a name.
+ * Dispatch is on the DOMException NAME, which is a specified, stable identifier.
+ * The message text is engine wording and is consulted ONLY when no name came
+ * with the error — see the `unnamed` guard below for what searching it anyway
+ * cost.
  *
  * @param {Object} [o]
  * @param {string} [o.name]     DOMException name (NotFoundError, NotAllowedError, …)
@@ -60,13 +61,23 @@ function buildCaptureErrorBody({ name, message, platform = process.platform } = 
   const n = typeof name === 'string' ? name : '';
   const msg = typeof message === 'string' ? message : '';
 
+  // Message matching applies ONLY when no name was supplied. A name means the
+  // thrower classified itself, and second-guessing it with a text search names
+  // wrong causes: the capture path also throws plain Errors carrying main's
+  // messages, so an EACCES opening the recording FILE ("permission denied,
+  // open '…/recordings/x.webm'") matched /permission/ and told the user Steno
+  // lacked microphone access — sending a macOS user to a settings pane that
+  // could not have helped. A plain Error therefore falls through to the
+  // generic sentence, which is vague but true.
+  const unnamed = n === '';
+
   // No usable input device. OverconstrainedError lands here too: it means the
   // pinned microphone's deviceId no longer matches anything, which the user
   // experiences as "my microphone is gone", not as a constraint problem.
-  if (n === 'NotFoundError' || n === 'OverconstrainedError' || /device not found|no device/i.test(msg)) {
+  if (n === 'NotFoundError' || n === 'OverconstrainedError' || (unnamed && /device not found|no device/i.test(msg))) {
     return "Steno couldn't find a microphone, so the recording didn't start. Connect one and try again.";
   }
-  if (n === 'NotAllowedError' || n === 'SecurityError' || /permission|not allowed/i.test(msg)) {
+  if (n === 'NotAllowedError' || n === 'SecurityError' || (unnamed && /permission|not allowed/i.test(msg))) {
     // CLAUDE.md's cross-platform rule applies to copy as much as to code: a
     // macOS-only instruction must not reach a Windows or Linux user. Linux has
     // no single settings path worth naming, so it gets the sentence alone.
@@ -80,7 +91,7 @@ function buildCaptureErrorBody({ name, message, platform = process.platform } = 
   }
   // The device exists but could not be opened — almost always another app
   // holding it exclusively.
-  if (n === 'NotReadableError' || n === 'AbortError' || /could not start|in use/i.test(msg)) {
+  if (n === 'NotReadableError' || n === 'AbortError' || (unnamed && /could not start|in use/i.test(msg))) {
     return "Steno couldn't open the microphone — another app may be using it. Close it and try again.";
   }
   return "Steno couldn't start the recording. Try again in a moment.";

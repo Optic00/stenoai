@@ -757,11 +757,15 @@ export function useSystemAudioCapture() {
         bridge.recording.reportSystemAudioState(false);
         // start-recording-ui already spawned the Parakeet live sidecar (a
         // Python process holding the loaded ASR model). Nothing else tears it
-        // down on this path — stop-recording-ui never runs for a recording
-        // that never started — so without this it stays resident until the app
-        // quits, and get-live-transcript-state keeps reporting an open session.
-        // Safe to call unconditionally: main no-ops when no sidecar is running,
-        // and whisper recordings never spawn one.
+        // down on this path — stop-recording-ui never runs for a recording that
+        // never started — so without this it stays resident until the app quits.
+        // It kills the PROCESS only: main's liveTranscriptState is reset by the
+        // next start, not by the stop, so get-live-transcript-state keeps
+        // reporting this session's name either way. Safe to call
+        // unconditionally: main no-ops when no sidecar is running, and whisper
+        // recordings never spawn one. No other recording can be affected —
+        // start-recording-ui refuses while systemAudioRecordingActive is set,
+        // and that flag is only cleared by the line above.
         bridge.liveTranscript.stop();
         // Surface the failure to the user (native notification) — otherwise a
         // denied mic permission looks like a silent no-op. Pass the DOMException
