@@ -10,6 +10,7 @@ import { MeetingsShell } from '@/components/MeetingsShell';
 import { useNavigate } from '@/lib/router';
 import { useRecording } from '@/hooks/useRecording';
 import { useLiveMeeting } from '@/hooks/useLiveMeeting';
+import { UI_LOCALE } from '@/lib/locale';
 
 export function Recording() {
   const navigate = useNavigate();
@@ -170,7 +171,7 @@ function Chip({
 }
 
 function formatDate(d: Date): string {
-  return d.toLocaleDateString(undefined, {
+  return d.toLocaleDateString(UI_LOCALE, {
     weekday: 'short',
     day: 'numeric',
     month: 'short',
