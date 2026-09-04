@@ -9513,11 +9513,13 @@ function showRecordingFailedNotification(body) {
   }
 }
 
-ipcMain.on('recording-capture-error', (_event, message, name) => {
-  // The raw text stays in the debug log, where it is what a diagnosis needs.
-  // What reaches the notification is prose — see buildCaptureErrorBody.
-  sendDebugLog(`[sysaudio] capture error: ${name ? `${name}: ` : ''}${message}`);
-  showRecordingFailedNotification(buildCaptureErrorBody({ name, message }));
+ipcMain.on('recording-capture-error', (_event, message, name, phase) => {
+  // The raw text stays in the debug log, where it is what a diagnosis needs —
+  // and ONLY there. What reaches the notification is prose built from the
+  // error's name and the caller's phase; see buildCaptureErrorBody for why the
+  // message itself is never consulted.
+  sendDebugLog(`[sysaudio] capture error (${phase || 'start'}): ${name ? `${name}: ` : ''}${message}`);
+  showRecordingFailedNotification(buildCaptureErrorBody({ name, phase }));
 });
 
 ipcMain.handle('process-system-audio-recording', async (event, audioFilePath, sessionName) => {

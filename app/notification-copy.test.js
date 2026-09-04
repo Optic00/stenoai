@@ -56,17 +56,13 @@ test('transcript-ready prompt quotes the note title', () => {
 // surface that cannot be expanded or clicked.
 
 test('a missing microphone reads as a missing microphone, not as a device error', () => {
-  const body = buildCaptureErrorBody({
-    name: 'NotFoundError',
-    message: 'Requested device not found',
-  });
+  const body = buildCaptureErrorBody({ name: 'NotFoundError' });
   assert.match(body, /couldn't find a microphone/);
   assert.doesNotMatch(body, /device not found/i);
 });
 
 test('a gone pinned microphone reads the same way', () => {
-  const body = buildCaptureErrorBody({ name: 'OverconstrainedError', message: 'deviceId' });
-  assert.match(body, /couldn't find a microphone/);
+  assert.match(buildCaptureErrorBody({ name: 'OverconstrainedError' }), /couldn't find a microphone/);
 });
 
 test('a permission failure names the platform path, and only its own platform', () => {
@@ -83,54 +79,70 @@ test('a permission failure names the platform path, and only its own platform', 
   assert.doesNotMatch(linux, /Settings/);
 });
 
-test('a busy microphone points at the other app rather than at a setting', () => {
-  const body = buildCaptureErrorBody({
-    name: 'NotReadableError',
-    message: 'Could not start audio source',
-  });
-  assert.match(body, /another app may be using it/);
-  assert.doesNotMatch(body, /audio source/i);
+test('a security-context failure is not sold as a microphone permission', () => {
+  // SecurityError means the document may not use the media API at all, so the
+  // "grant access in Settings" remedy would point at the wrong place.
+  const body = buildCaptureErrorBody({ name: 'SecurityError', platform: 'darwin' });
+  assert.doesNotMatch(body, /permission to use the microphone|System Settings/);
+  assert.strictEqual(body, "Steno couldn't start the recording. Try again in a moment.");
 });
 
-test('an unknown failure still says something, and says nothing developer-shaped', () => {
-  const body = buildCaptureErrorBody({
-    name: 'WeirdFutureError',
-    message: "NS_ERROR_FAILURE at /opt/Steno/resources/app.asar/renderer/dist/index.html:0",
-  });
-  assert.strictEqual(body, "Steno couldn't start the recording. Try again in a moment.");
+test('a busy microphone points at the other app rather than at a setting', () => {
+  assert.match(buildCaptureErrorBody({ name: 'NotReadableError' }), /another app may be using it/);
+});
+
+test('an unknown start failure still says something, and nothing developer-shaped', () => {
+  assert.strictEqual(
+    buildCaptureErrorBody({ name: 'WeirdFutureError' }),
+    "Steno couldn't start the recording. Try again in a moment.",
+  );
+});
+
+// The three situations reportCaptureError serves need three sentences. Telling a
+// user mid-recording that the recording "didn't start" is the same class of lie
+// as quoting the engine at them.
+
+test('a write failure DURING a recording does not claim the recording never started', () => {
+  const body = buildCaptureErrorBody({ phase: 'ongoing' });
+  assert.match(body, /may be incomplete/);
+  assert.doesNotMatch(body, /didn't start|find a microphone|permission/);
+});
+
+test('a failed stop is described as a failed stop', () => {
+  const body = buildCaptureErrorBody({ phase: 'stop' });
+  assert.match(body, /couldn't finish the recording/);
+  assert.doesNotMatch(body, /didn't start/);
+});
+
+test('the message is never an input, so no text can name a wrong cause', () => {
+  // An EACCES writing the recording FILE used to match /permission/ and told the
+  // user Steno lacked MICROPHONE access — wrong cause, and on macOS a pointer to
+  // a settings pane that could not have helped. No caller-supplied text reaches
+  // the copy at all now.
+  const disk = "EACCES: permission denied, open '/Users/x/recordings/note.webm'";
+  assert.strictEqual(
+    buildCaptureErrorBody({ message: disk, platform: 'darwin' }),
+    "Steno couldn't start the recording. Try again in a moment.",
+  );
+  assert.strictEqual(
+    buildCaptureErrorBody({ message: disk, phase: 'ongoing' }),
+    'Steno hit a problem while saving this recording, so the note may be incomplete.',
+  );
 });
 
 test('no developer text survives any branch', () => {
-  const raws = [
-    { name: 'NotFoundError', message: 'Requested device not found' },
-    { name: 'NotAllowedError', message: 'Permission denied by system' },
-    { name: 'NotReadableError', message: 'Could not start audio source' },
-    { name: '', message: 'ENOENT: no such file or directory, open /tmp/x' },
+  const cases = [
+    { name: 'NotFoundError' },
+    { name: 'NotAllowedError' },
+    { name: 'NotReadableError' },
+    { phase: 'ongoing' },
+    { phase: 'stop' },
+    { name: 'Error', message: 'ENOENT: no such file or directory, open /tmp/x' },
     {},
   ];
-  for (const raw of raws) {
-    const body = buildCaptureErrorBody({ ...raw, platform: 'linux' });
-    assert.doesNotMatch(body, /Error:|ENOENT|net::|\/tmp\/|asar/);
+  for (const c of cases) {
+    const body = buildCaptureErrorBody({ ...c, platform: 'linux' });
+    assert.doesNotMatch(body, /Error:|ENOENT|EACCES|net::|\/tmp\/|asar/);
     assert.ok(body.length > 0);
   }
-});
-
-test('a plain Error is not text-matched into a wrong cause', () => {
-  // The capture path also throws plain Errors carrying main's own messages. An
-  // EACCES opening the recording FILE used to match /permission/ and tell the
-  // user Steno lacked MICROPHONE access — a wrong cause, and on macOS a pointer
-  // to a settings pane that could not have helped.
-  const body = buildCaptureErrorBody({
-    name: 'Error',
-    message: "EACCES: permission denied, open '/Users/x/recordings/note.webm'",
-    platform: 'darwin',
-  });
-  assert.doesNotMatch(body, /microphone/i);
-  assert.doesNotMatch(body, /System Settings/);
-  assert.strictEqual(body, "Steno couldn't start the recording. Try again in a moment.");
-});
-
-test('message matching still works for a caller that supplies no name', () => {
-  const body = buildCaptureErrorBody({ message: 'Requested device not found' });
-  assert.match(body, /couldn't find a microphone/);
 });

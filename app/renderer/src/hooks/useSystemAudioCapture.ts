@@ -525,8 +525,13 @@ export function useSystemAudioCapture() {
                 appendFailedRef.current = true;
                 // eslint-disable-next-line no-console
                 console.error('[systemAudioCapture] chunk append failed:', res.error);
+                // 'ongoing': the recording is still running and only the write
+                // failed. Without the phase this reached the user as "the
+                // recording didn't start" — false twice over.
                 bridge.recording.reportCaptureError(
                   `Recording may be incomplete: ${res.error || 'failed to write audio'}`,
+                  undefined,
+                  'ongoing',
                 );
               }
             })
@@ -761,12 +766,21 @@ export function useSystemAudioCapture() {
         // never started — so without this it stays resident until the app quits.
         // It kills the PROCESS only: main's liveTranscriptState is reset by the
         // next start, not by the stop, so get-live-transcript-state keeps
-        // reporting this session's name either way. Safe to call
-        // unconditionally: main no-ops when no sidecar is running, and whisper
-        // recordings never spawn one. No other recording can be affected —
-        // start-recording-ui refuses while systemAudioRecordingActive is set,
-        // and that flag is only cleared by the line above.
-        bridge.liveTranscript.stop();
+        // reporting this session's name either way.
+        //
+        // Guarded on cancelled(), NOT sent unconditionally, because the sidecar
+        // is global state and this catch can belong to a start that is already
+        // over: stopCapture bumps the token and then reports the capture
+        // inactive, which lets main accept a NEW start and spawn ITS sidecar —
+        // so a media promise from the old attempt rejecting afterwards would
+        // land here and kill the running recording's sidecar. cancelled() is
+        // the same token check the acquisition path uses.
+        //
+        // The sibling calls in this block (reportSystemAudioState, the file
+        // close, disableLoopbackAudio, the notification) are ungated the same
+        // way and predate this change; they are left alone rather than widened
+        // into here, but they can reach a successor session for the same reason.
+        if (!cancelled()) bridge.liveTranscript.stop();
         // Surface the failure to the user (native notification) — otherwise a
         // denied mic permission looks like a silent no-op. Pass the DOMException
         // NAME as well as the message: main maps the name to prose, and a name
@@ -774,6 +788,7 @@ export function useSystemAudioCapture() {
         bridge.recording.reportCaptureError(
           err instanceof Error ? err.message : 'Recording could not start',
           err instanceof Error ? err.name : undefined,
+          'start',
         );
         try { await bridge.recording.disableLoopbackAudio(); } catch { /* */ }
       }
