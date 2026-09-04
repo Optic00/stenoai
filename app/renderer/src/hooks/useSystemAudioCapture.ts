@@ -525,8 +525,13 @@ export function useSystemAudioCapture() {
                 appendFailedRef.current = true;
                 // eslint-disable-next-line no-console
                 console.error('[systemAudioCapture] chunk append failed:', res.error);
+                // 'ongoing': the recording is still running and only the write
+                // failed. Without the phase this reached the user as "the
+                // recording didn't start" — false twice over.
                 bridge.recording.reportCaptureError(
                   `Recording may be incomplete: ${res.error || 'failed to write audio'}`,
+                  undefined,
+                  'ongoing',
                 );
               }
             })
@@ -745,22 +750,56 @@ export function useSystemAudioCapture() {
         //    when start-recording-ui ran, but this re-affirms it.
         bridge.recording.reportSystemAudioState(true);
       } catch (err) {
+        // A stop or unmount can invalidate this attempt while a media promise
+        // is still pending. At that point the refs and IPC globals may already
+        // belong to a successor, so the stale attempt may only stop the streams
+        // it acquired itself. In particular, teardownStreams() is NOT safe here:
+        // it follows shared refs and would tear down the successor too.
+        if (cancelled()) {
+          stopAcquired();
+          return;
+        }
         // eslint-disable-next-line no-console
         console.error('[systemAudioCapture] start failed', err);
         teardownStreams();
         activeRef.current = false;
         // Close any file opened before the failure so we don't leak the
         // main-side write stream (no-op if open never ran).
-        try { await bridge.recording.closeSystemAudioFile(); } catch { /* */ }
-        // Tell main to drop the stuck "recording" pill — its optimistic
-        // systemAudioRecordingActive flag was set on start-recording-ui.
-        bridge.recording.reportSystemAudioState(false);
+        try {
+          await bridge.recording.closeSystemAudioFile();
+        } catch {
+          /* */
+        }
+        if (cancelled()) {
+          stopAcquired();
+          return;
+        }
+        // Finish the current attempt's global cleanup before reporting it
+        // inactive. That final state report is what lets main accept a new
+        // recording, so nothing after it may still target global capture state.
+        try {
+          await bridge.recording.disableLoopbackAudio();
+        } catch {
+          /* */
+        }
+        if (cancelled()) {
+          stopAcquired();
+          return;
+        }
+        bridge.liveTranscript.stop();
         // Surface the failure to the user (native notification) — otherwise a
-        // denied mic permission looks like a silent no-op.
+        // denied mic permission looks like a silent no-op. Pass the DOMException
+        // NAME as well as the message: main maps the name to prose, and a name
+        // is a stable identifier where the message text is not.
         bridge.recording.reportCaptureError(
           err instanceof Error ? err.message : 'Recording could not start',
+          err instanceof Error ? err.name : undefined,
+          'start',
         );
-        try { await bridge.recording.disableLoopbackAudio(); } catch { /* */ }
+        // Tell main to drop the stuck "recording" pill — its optimistic
+        // systemAudioRecordingActive flag was set on start-recording-ui. Keep
+        // this LAST: after it, a successor may start immediately.
+        bridge.recording.reportSystemAudioState(false);
       }
     };
 
@@ -861,6 +900,11 @@ export function useSystemAudioCapture() {
   React.useEffect(() => {
     const bridge = ipc();
     return () => {
+      // Invalidate a media request that resolves or rejects after unmount. The
+      // cleanup below owns this hook instance's resources; its abandoned async
+      // start must not later touch global IPC state owned by a remount.
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- cleanup must invalidate the latest token
+      startTokenRef.current++;
       // Clear any live intervals first — the per-recording teardown helper
       // lives in the other useEffect's scope so it isn't reachable here,
       // and without an explicit clear the silence-auto-stop poll would

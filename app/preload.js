@@ -126,7 +126,7 @@ const stenoai = {
     // on.linuxLoopbackChunk instead of going through getDisplayMedia.
     startLinuxLoopback: () => invoke('start-linux-loopback'),
     stopLinuxLoopback: () => invoke('stop-linux-loopback'),
-    reportCaptureError: (message) => send('recording-capture-error', message),
+    reportCaptureError: (message, name, phase) => send('recording-capture-error', message, name, phase),
     processSystemAudio: (filePath, name) => invoke('process-system-audio-recording', filePath, name),
     processFile: (filePath, name) => invoke('process-recording', filePath, name),
     pickAudioFile: () => invoke('select-audio-file'),
