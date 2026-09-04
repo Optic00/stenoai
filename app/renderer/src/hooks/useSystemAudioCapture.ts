@@ -750,37 +750,43 @@ export function useSystemAudioCapture() {
         //    when start-recording-ui ran, but this re-affirms it.
         bridge.recording.reportSystemAudioState(true);
       } catch (err) {
+        // A stop or unmount can invalidate this attempt while a media promise
+        // is still pending. At that point the refs and IPC globals may already
+        // belong to a successor, so the stale attempt may only stop the streams
+        // it acquired itself. In particular, teardownStreams() is NOT safe here:
+        // it follows shared refs and would tear down the successor too.
+        if (cancelled()) {
+          stopAcquired();
+          return;
+        }
         // eslint-disable-next-line no-console
         console.error('[systemAudioCapture] start failed', err);
         teardownStreams();
         activeRef.current = false;
         // Close any file opened before the failure so we don't leak the
         // main-side write stream (no-op if open never ran).
-        try { await bridge.recording.closeSystemAudioFile(); } catch { /* */ }
-        // Tell main to drop the stuck "recording" pill — its optimistic
-        // systemAudioRecordingActive flag was set on start-recording-ui.
-        bridge.recording.reportSystemAudioState(false);
-        // start-recording-ui already spawned the Parakeet live sidecar (a
-        // Python process holding the loaded ASR model). Nothing else tears it
-        // down on this path — stop-recording-ui never runs for a recording that
-        // never started — so without this it stays resident until the app quits.
-        // It kills the PROCESS only: main's liveTranscriptState is reset by the
-        // next start, not by the stop, so get-live-transcript-state keeps
-        // reporting this session's name either way.
-        //
-        // Guarded on cancelled(), NOT sent unconditionally, because the sidecar
-        // is global state and this catch can belong to a start that is already
-        // over: stopCapture bumps the token and then reports the capture
-        // inactive, which lets main accept a NEW start and spawn ITS sidecar —
-        // so a media promise from the old attempt rejecting afterwards would
-        // land here and kill the running recording's sidecar. cancelled() is
-        // the same token check the acquisition path uses.
-        //
-        // The sibling calls in this block (reportSystemAudioState, the file
-        // close, disableLoopbackAudio, the notification) are ungated the same
-        // way and predate this change; they are left alone rather than widened
-        // into here, but they can reach a successor session for the same reason.
-        if (!cancelled()) bridge.liveTranscript.stop();
+        try {
+          await bridge.recording.closeSystemAudioFile();
+        } catch {
+          /* */
+        }
+        if (cancelled()) {
+          stopAcquired();
+          return;
+        }
+        // Finish the current attempt's global cleanup before reporting it
+        // inactive. That final state report is what lets main accept a new
+        // recording, so nothing after it may still target global capture state.
+        try {
+          await bridge.recording.disableLoopbackAudio();
+        } catch {
+          /* */
+        }
+        if (cancelled()) {
+          stopAcquired();
+          return;
+        }
+        bridge.liveTranscript.stop();
         // Surface the failure to the user (native notification) — otherwise a
         // denied mic permission looks like a silent no-op. Pass the DOMException
         // NAME as well as the message: main maps the name to prose, and a name
@@ -790,7 +796,10 @@ export function useSystemAudioCapture() {
           err instanceof Error ? err.name : undefined,
           'start',
         );
-        try { await bridge.recording.disableLoopbackAudio(); } catch { /* */ }
+        // Tell main to drop the stuck "recording" pill — its optimistic
+        // systemAudioRecordingActive flag was set on start-recording-ui. Keep
+        // this LAST: after it, a successor may start immediately.
+        bridge.recording.reportSystemAudioState(false);
       }
     };
 
@@ -891,6 +900,11 @@ export function useSystemAudioCapture() {
   React.useEffect(() => {
     const bridge = ipc();
     return () => {
+      // Invalidate a media request that resolves or rejects after unmount. The
+      // cleanup below owns this hook instance's resources; its abandoned async
+      // start must not later touch global IPC state owned by a remount.
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- cleanup must invalidate the latest token
+      startTokenRef.current++;
       // Clear any live intervals first — the per-recording teardown helper
       // lives in the other useEffect's scope so it isn't reachable here,
       // and without an explicit clear the silence-auto-stop poll would

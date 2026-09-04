@@ -26,6 +26,12 @@ const STALE_ENV = {
   STENOAI_E2E_STALE_SESSION_NAME: 'Note',
 };
 
+const ipcCalls = (app: import('@playwright/test').ElectronApplication) =>
+  app.evaluate(() => (global as unknown as { __mockIpcCalls: string[] }).__mockIpcCalls);
+
+const countCalls = (calls: string[], channel: string) =>
+  calls.filter((call) => call === channel).length;
+
 test('a session name left behind by a failed start shows no recording row', async ({
   launchApp,
 }) => {
@@ -61,7 +67,130 @@ test('a genuinely running session still shows its recording row', async ({ launc
 
   await page.evaluate(() => window.stenoai.recording.start('Test note'));
 
-  await expect(
-    page.locator('[data-testid="previous-row"][data-recording="true"]'),
-  ).toHaveCount(1, { timeout: 10_000 });
+  await expect(page.locator('[data-testid="previous-row"][data-recording="true"]')).toHaveCount(1, {
+    timeout: 10_000,
+  });
+});
+
+test('a cancelled start rejecting late cannot clean up its successor', async ({ launchApp }) => {
+  const { app, page } = await launchApp({
+    mockIpc: true,
+    fakeAudio: true,
+    env: { STENOAI_E2E_MOCK_PARAKEET_INSTALLED: '1' },
+  });
+
+  // Hold the first microphone request open. Its rejection is released only
+  // after stopCapture has invalidated that attempt and a successor is live.
+  await page.evaluate(() => {
+    const race = {
+      calls: 0,
+      rejectFirst: null as ((reason?: unknown) => void) | null,
+      successorStream: null as MediaStream | null,
+    };
+    (window as typeof window & { __captureStartRace: typeof race }).__captureStartRace = race;
+    const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {
+      configurable: true,
+      value: (constraints?: MediaStreamConstraints) => {
+        const audio = constraints?.audio;
+        const isCaptureRequest =
+          typeof audio === 'object' &&
+          audio !== null &&
+          audio.echoCancellation === true &&
+          audio.noiseSuppression === false;
+        if (!isCaptureRequest) return originalGetUserMedia(constraints);
+        race.calls += 1;
+        if (race.calls === 1) {
+          return new Promise<MediaStream>((_resolve, reject) => {
+            race.rejectFirst = reject;
+          });
+        }
+        return originalGetUserMedia(constraints).then((stream) => {
+          race.successorStream = stream;
+          return stream;
+        });
+      },
+    });
+  });
+
+  await page.evaluate(() => window.stenoai.recording.start('Cancelled start'));
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        Boolean(
+          (
+            window as typeof window & {
+              __captureStartRace: {
+                rejectFirst: ((reason?: unknown) => void) | null;
+              };
+            }
+          ).__captureStartRace.rejectFirst
+        )
+      )
+    )
+    .toBe(true);
+  const callsBeforeSuccessor = await page.evaluate(
+    () =>
+      (window as typeof window & { __captureStartRace: { calls: number } }).__captureStartRace.calls
+  );
+
+  await page.evaluate(() => window.stenoai.recording.stop());
+  await expect
+    .poll(async () => countCalls(await ipcCalls(app), 'disable-loopback-audio'))
+    .toBeGreaterThan(0);
+
+  await page.evaluate(() => window.stenoai.recording.start('Successor'));
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as typeof window & { __captureStartRace: { calls: number } }).__captureStartRace
+            .calls
+      )
+    )
+    .toBeGreaterThan(callsBeforeSuccessor);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __captureStartRace: { successorStream: MediaStream | null };
+            }
+          ).__captureStartRace.successorStream?.getAudioTracks()[0]?.readyState
+      )
+    )
+    .toBe('live');
+
+  const before = await ipcCalls(app);
+  const closeBefore = countCalls(before, 'close-system-audio-file');
+  const disableBefore = countCalls(before, 'disable-loopback-audio');
+
+  await page.evaluate(() => {
+    const race = (
+      window as typeof window & {
+        __captureStartRace: {
+          rejectFirst: ((reason?: unknown) => void) | null;
+        };
+      }
+    ).__captureStartRace;
+    race.rejectFirst?.(new DOMException('first attempt rejected late', 'NotFoundError'));
+  });
+  await page.waitForTimeout(300);
+
+  const after = await ipcCalls(app);
+  expect(countCalls(after, 'close-system-audio-file')).toBe(closeBefore);
+  expect(countCalls(after, 'disable-loopback-audio')).toBe(disableBefore);
+  expect(
+    await page.evaluate(
+      () =>
+        (
+          window as typeof window & { __captureStartRace: { successorStream: MediaStream | null } }
+        ).__captureStartRace.successorStream?.getAudioTracks()[0]?.readyState
+    )
+  ).toBe('live');
+
+  const queue = await page.evaluate(() => window.stenoai.recording.getQueue());
+  expect(queue.hasRecording).toBe(true);
+  expect(queue.sessionName).toBe('Successor');
 });
