@@ -33,6 +33,7 @@ import {
 import { useRecording } from '@/hooks/useRecording';
 import { navigate, useRoute } from '@/lib/router';
 import type { Meeting } from '@/lib/ipc';
+import { UI_LOCALE } from '@/lib/locale';
 
 interface MeetingsShellProps {
   activeSummaryFile: string | null;
@@ -507,7 +508,7 @@ export function formatDateLabel(info: Meeting['session_info']): string | undefin
     d.getDate() === yesterday.getDate();
   if (wasYesterday) return 'Yesterday';
   if (now.getTime() - d.getTime() < 7 * 24 * 60 * 60 * 1000) {
-    return d.toLocaleDateString(undefined, { weekday: 'short' });
+    return d.toLocaleDateString(UI_LOCALE, { weekday: 'short' });
   }
-  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return d.toLocaleDateString(UI_LOCALE, { month: 'short', day: 'numeric' });
 }
