@@ -636,6 +636,198 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # Real PipeWire capture, on a runner. Everything else about Linux system
+  # audio is tested against a stub: linux-loopback.t1 drives synthetic PCM
+  # through the renderer bridge with mock IPC, and recording-lifecycle.t2
+  # SKIPS on Linux ("system-audio path unsupported on this host") because a
+  # bare runner has no PipeWire. So the part that actually talks to the OS —
+  # isLinuxLoopbackSupported, getDefaultSinkName's pw-dump parsing, and
+  # pw-record itself — had no automated coverage anywhere, only one
+  # contributor's desktop. #502's own final commit records that the
+  # frame-alignment fix was never confirmed against real audio.
+  #
+  # PipeWire runs headless here under dbus-run-session with a null sink, and a
+  # known two-tone signal is played into it. That makes "captured only silence"
+  # a failure rather than the normal state, which is what the developer-machine
+  # script could never guarantee. This check is intentionally advisory while
+  # its stability on hosted runners is established; promoting it to a required
+  # branch-protection context is a separate maintainer decision.
+  linux-loopback-pipewire:
+    name: Linux loopback (real PipeWire)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # pipewire-pulse + pulseaudio-utils give us pactl/paplay to create the
+      # sink and play into it; wireplumber is the session manager that actually
+      # assigns nodes (without it, pw-dump reports no default sink).
+      - name: Install PipeWire
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pipewire pipewire-pulse wireplumber pulseaudio-utils dbus-x11
+
+      - name: Capture real audio through the loopback module
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          sudo mkdir -p "$XDG_RUNTIME_DIR"
+          sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+
+          node scripts/make-test-tone.js /tmp/tone.wav 20
+
+          # One dbus session for the whole thing: pipewire, the playback and the
+          # capture must share it or they see different graphs.
+          dbus-run-session -- bash -euo pipefail -c '
+            # Start in dependency order and WAIT between each. Launching all
+            # three at once races: wireplumber connects before pipewire has its
+            # socket, dies with "disconnected from pipewire", and without a
+            # session manager there is no default-sink metadata — which then
+            # surfaces confusingly as `pactl set-default-sink` returning
+            # "Failure: Not supported".
+            pipewire &
+            for i in $(seq 1 30); do
+              if pw-cli info 0 > /dev/null 2>&1; then echo "pipewire up after ${i}s"; break; fi
+              if [ "$i" = 30 ]; then echo "::error::pipewire did not start"; exit 1; fi
+              sleep 1
+            done
+
+            wireplumber &
+            pipewire-pulse &
+            for i in $(seq 1 30); do
+              if pactl info > /dev/null 2>&1; then echo "pulse layer up after ${i}s"; break; fi
+              if [ "$i" = 30 ]; then echo "::error::pipewire-pulse did not start"; exit 1; fi
+              sleep 1
+            done
+
+            # A null sink stands in for a real output device. Its monitor is
+            # what the app captures, so anything played to it is what we should
+            # get back.
+            pactl load-module module-null-sink sink_name=steno_test \
+              sink_properties=device.description=StenoTest
+            pactl set-default-sink steno_test
+
+            # getDefaultSinkName() reads the PipeWire "default" metadata
+            # object, not the pulse view of it, so require the exact sink value
+            # that the module under test will parse. An existing default for a
+            # different sink is not readiness. wireplumber normally updates it;
+            # set it directly if it has not converged, then allow the session
+            # manager a short second convergence window before failing.
+            DEFAULT_SINK_READY=false
+            for i in $(seq 1 15); do
+              DEFAULT_METADATA="$(pw-metadata -n default 2>/dev/null || true)"
+              if grep -Eq "default\.audio\.sink.*\"name\"[[:space:]]*:[[:space:]]*\"steno_test\"" \
+                <<< "$DEFAULT_METADATA"; then
+                DEFAULT_SINK_READY=true
+                break
+              fi
+              sleep 1
+            done
+
+            if [ "$DEFAULT_SINK_READY" != true ]; then
+              echo "wireplumber did not select steno_test — setting it directly"
+              for i in $(seq 1 5); do
+                if ! pw-metadata -n default 0 default.audio.sink "{\"name\":\"steno_test\"}"; then
+                  echo "pw-metadata set failed on attempt $i — retrying"
+                  sleep 1
+                  continue
+                fi
+                sleep 1
+                DEFAULT_METADATA="$(pw-metadata -n default 2>/dev/null || true)"
+                if grep -Eq "default\.audio\.sink.*\"name\"[[:space:]]*:[[:space:]]*\"steno_test\"" \
+                  <<< "$DEFAULT_METADATA"; then
+                  DEFAULT_SINK_READY=true
+                  break
+                fi
+              done
+            fi
+
+            if [ "$DEFAULT_SINK_READY" != true ]; then
+              echo "::error::PipeWire default sink did not converge to steno_test"
+              exit 1
+            fi
+            echo "--- pipewire default metadata ---"
+            pw-metadata -n default || true
+            echo "--- sinks ---"
+            pactl list short sinks
+
+            # Loop so the tone outlasts the capture window regardless of timing.
+            ( while true; do paplay --device=steno_test /tmp/tone.wav || true; done ) &
+            PLAY_PID=$!
+            trap "kill $PLAY_PID 2>/dev/null || true" EXIT
+            sleep 2
+
+            # The real module: resolves the default sink by name via pw-dump,
+            # spawns pw-record against its monitor, and fails on a silent or
+            # empty capture.
+            node scripts/linux-loopback-poc-demo.js /tmp/captured.pcm
+          '
+
+      - name: Confirm the capture carries both channels
+        run: |
+          set -euo pipefail
+          # The demo script proves "not silence". This proves the STEREO frame
+          # layout survived: the tone is 440Hz left / 880Hz right, so a channel
+          # that is silent, or two channels that are identical, means the frame
+          # alignment or the channel mapping is wrong — the exact failure #502's
+          # createFrameAligner exists to prevent, and which no test has ever
+          # observed against real audio.
+          node -e "
+            const fs = require('fs');
+            const { measurePeakRms } = require('./scripts/measure-pcm');
+            const buf = fs.readFileSync('/tmp/captured.pcm');
+            if (buf.length < 48000 * 4) throw new Error('capture too short: ' + buf.length + ' bytes');
+            if (buf.length % 4 !== 0) throw new Error('capture is not a whole number of stereo frames: ' + buf.length);
+            const frames = buf.length / 4;
+            const left = Buffer.alloc(frames * 2);
+            const right = Buffer.alloc(frames * 2);
+            for (let i = 0; i < frames; i++) {
+              left.writeInt16LE(buf.readInt16LE(i * 4), i * 2);
+              right.writeInt16LE(buf.readInt16LE(i * 4 + 2), i * 2);
+            }
+            const L = measurePeakRms(left);
+            const R = measurePeakRms(right);
+            console.log('left  peak=' + L.peak + ' rms=' + L.rms.toFixed(1));
+            console.log('right peak=' + R.peak + ' rms=' + R.rms.toFixed(1));
+            if (L.peak === 0) throw new Error('left channel is silent');
+            if (R.peak === 0) throw new Error('right channel is silent');
+            if (left.equals(right)) throw new Error('channels are identical — stereo layout collapsed');
+
+            // Which channel is which. Two sines at equal amplitude have equal
+            // peak and near-equal RMS, so the checks above pass just as happily
+            // on a SWAPPED pair. Counting zero crossings identifies the
+            // frequency: the 880Hz channel must cross about twice as often as
+            // the 440Hz one. Cheap, and robust on a clean tone.
+            const crossings = (b) => {
+              let n = 0;
+              for (let i = 1; i < b.length / 2; i++) {
+                const prev = b.readInt16LE((i - 1) * 2);
+                const cur = b.readInt16LE(i * 2);
+                if ((prev < 0 && cur >= 0) || (prev >= 0 && cur < 0)) n++;
+              }
+              return n;
+            };
+            const cl = crossings(left);
+            const cr = crossings(right);
+            const ratio = cr / cl;
+            console.log('zero crossings: left=' + cl + ' right=' + cr + ' ratio=' + ratio.toFixed(2));
+            if (!(ratio > 1.6 && ratio < 2.4)) {
+              throw new Error(
+                'expected right (880Hz) to cross ~2x as often as left (440Hz), got ratio ' +
+                ratio.toFixed(2) + ' — channels are swapped or misaligned'
+              );
+            }
+            console.log('PASS: real PipeWire capture, both channels present, distinct, and correctly ordered.');
+          "
+
   build-backend-linux:
     name: Build backend bundle (Linux)
     runs-on: ubuntu-latest
