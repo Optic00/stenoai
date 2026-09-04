@@ -311,7 +311,11 @@ function install({ ipcMain }) {
     active: false,
     paused: false,
     processing: false,
-    sessionName: null,
+    // STENOAI_E2E_STALE_SESSION_NAME seeds the state main.js is left in after a
+    // capture start that failed in the renderer: no recording, but the session
+    // NAME retained. See the get-queue-status handler for why that state is not
+    // otherwise reachable through this mock.
+    sessionName: process.env.STENOAI_E2E_STALE_SESSION_NAME || null,
     // The append/resume target (summary file) of the active recording, mirrored
     // into get-queue-status.recordingSummaryFile so the detail view can match
     // "recording this note" by identity (not display name).
@@ -562,7 +566,20 @@ function install({ ipcMain }) {
         elapsedSeconds: rec.active
           ? Math.floor(((rec.paused ? rec.pausedAt : Date.now()) - rec.startedAt) / 1000)
           : 0,
-        sessionName: rec.active || rec.processing ? rec.sessionName : null,
+        // The real main.js does NOT clear currentRecordingSessionName when the
+        // renderer reports its capture inactive — it deliberately keeps the
+        // name so a brief capture flap can't drop the "which meeting is live"
+        // label, on the assumption that "a stale name while hasRecording is
+        // false is inert" (main.js, system-audio-recording-state handler).
+        // This mock nulls it instead, which is a *more* correct contract than
+        // the app implements — and is why no T1 spec could ever reproduce the
+        // phantom "Recording" row a failed capture start left behind.
+        // STENOAI_E2E_STALE_SESSION_NAME reproduces main's actual behaviour so
+        // that regression stays covered; opt-in, so no existing spec shifts.
+        sessionName:
+          rec.active || rec.processing || process.env.STENOAI_E2E_STALE_SESSION_NAME
+            ? rec.sessionName
+            : null,
         recordingSummaryFile: rec.active ? rec.appendTo : null,
       };
     },
