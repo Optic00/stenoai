@@ -79,6 +79,12 @@ tests; `STENOAI_DIARIZE_MODEL_DIR` is the lower-level sidecar override.
 Apple Intelligence is offered as an explicit model choice; availability never changes an existing or fresh configuration automatically.
 On-device summarization uses `bin/Steno Apple LM.app`, a minimal sandboxed Swift helper app (`apple-lm-sidecar/`) wrapping `FoundationModels.SystemLanguageModel.default`.
 The OS manages the concrete model behind that API.
+Apple summaries and reports are short-input only: at most 2,000 UTF-8 bytes of
+timestamp-normalized transcript, notes and template combined, and 5,000 UTF-8 bytes in the complete prompt,
+including notes, template and language instructions. The existing character
+budget also reserves output space. These are product limits, not tokenizer
+guarantees. Oversized requests fail before generation without truncation,
+snapshot compaction, or provider fallback. Query/chat context selection is separate.
 Python launches the helper through LaunchServices and talks to it through private named pipes via `src.apple_lm` (`status` / `complete` / `stream`).
 Prompts are not written to disk, and errors are fixed strings.
 Build it before `pyinstaller` when the macOS 26+ SDK is present:

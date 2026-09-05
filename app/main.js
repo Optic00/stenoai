@@ -2986,6 +2986,7 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
       });
 
       let stderrBuf = '';
+      let reprocessStreamError = '';
       // Mirrors the main pipeline: true only if summarization actually ran
       // (STREAM_COMPLETE). "Generate notes" reprocess always summarises; a
       // retranscribe with auto_summarize off wouldn't, so track it rather than
@@ -3031,6 +3032,7 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
             }
           } else if (line.startsWith('STREAM_ERROR:')) {
             const errMsg = line.slice('STREAM_ERROR:'.length);
+            reprocessStreamError = errMsg.trim();
             sendDebugLog(`❌ Reprocess stream error: ${errMsg}`);
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('summary-complete', { success: false, sessionName, summaryFile });
@@ -3102,10 +3104,10 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
               success: false,
               sessionName,
               summaryFile,
-              message: `Reprocessing failed (exit ${code})`,
+              message: reprocessStreamError || `Reprocessing failed (exit ${code})`,
             });
           }
-          reject(new Error(`reprocess exited with code ${code}: ${stderrBuf.slice(-500)}`));
+          reject(new Error(reprocessStreamError || `reprocess exited with code ${code}: ${stderrBuf.slice(-500)}`));
         }
       });
     });
@@ -3200,6 +3202,7 @@ ipcMain.handle('generate-report-meeting', async (event, summaryFile, templateId)
       let stderrBuf = '';
 
       const watchdog = makeInactivityWatchdog(proc, TRANSCRIBE_INACTIVITY_MS, 'generate-report');
+      let reportStreamError = '';
 
       proc.on('error', (err) => {
         watchdog.clear();
@@ -3236,6 +3239,7 @@ ipcMain.handle('generate-report-meeting', async (event, summaryFile, templateId)
             }
           } else if (line.startsWith('STREAM_ERROR:')) {
             const errMsg = line.slice('STREAM_ERROR:'.length);
+            reportStreamError = errMsg.trim();
             sendDebugLog(`❌ Report generation stream error: ${errMsg}`);
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('summary-complete', { success: false, sessionName, summaryFile, report: true });
@@ -3284,10 +3288,10 @@ ipcMain.handle('generate-report-meeting', async (event, summaryFile, templateId)
               sessionName,
               summaryFile,
               report: true,
-              message: `Report generation failed (exit ${code})`,
+              message: reportStreamError || `Report generation failed (exit ${code})`,
             });
           }
-          reject(new Error(`generate-report exited with code ${code}: ${stderrBuf.slice(-500)}`));
+          reject(new Error(reportStreamError || `generate-report exited with code ${code}: ${stderrBuf.slice(-500)}`));
         }
       });
     });

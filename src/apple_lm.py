@@ -271,7 +271,11 @@ def apple_system_model_info(
         "name": display if isinstance(display, str) and display.strip() else "Apple Intelligence",
         "size": "",
         "params": "OS-managed",
-        "description": f"On-device System Language Model - {availability_bit}",
+        "description": (
+            f"On-device System Language Model - {availability_bit}. "
+            "Short inputs only (transcript, notes and template combined: "
+            "up to 2,000 UTF-8 bytes)."
+        ),
         "speed": "fast",
         "quality": "good",
     }

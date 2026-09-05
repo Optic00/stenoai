@@ -66,30 +66,16 @@ class AppleSupportedWindowTests(unittest.TestCase):
             4096 * 2,
         )
 
-    def test_apple_snapshot_update_and_response_fit_the_4k_window(self):
-        from src.summarizer import OllamaSummarizer, _SNAPSHOT_MAX_CHARS
-
-        s = OllamaSummarizer.__new__(OllamaSummarizer)
-        s.model_name = "apple:system"
-        self.assertGreater(s._snapshot_slice_budget_chars(), 0)
-        prompt = s._create_snapshot_update_prompt(
-            "S" * _SNAPSHOT_MAX_CHARS,
-            "T" * s._snapshot_slice_budget_chars(),
-            999,
-            999,
-        )
-        self.assertLessEqual(len(prompt) + _SNAPSHOT_MAX_CHARS, 4096 * 2)
-
-    def test_meeting_that_fitted_the_beta_budget_now_uses_compaction(self):
+    def test_meeting_that_fitted_the_beta_budget_is_rejected_without_model_calls(self):
         from src.summarizer import OllamaSummarizer
 
         s = OllamaSummarizer.__new__(OllamaSummarizer)
         s.model_name = "apple:system"
         s.ai_provider = "local"
-        s._snapshot_compact_streaming = mock.Mock(return_value=iter(["summary"]))
-        result = "".join(s.summarize_transcript_streaming("meeting text " * 500))
-        self.assertEqual(result, "summary")
-        s._snapshot_compact_streaming.assert_called_once()
+        s._stream_completion = mock.Mock()
+        with self.assertRaisesRegex(ValueError, "only short transcripts"):
+            list(s.summarize_transcript_streaming("meeting text " * 500))
+        s._stream_completion.assert_not_called()
 
     def test_query_trims_the_assembled_corpus_to_the_supported_input_budget(self):
         from src.summarizer import OllamaSummarizer, _APPLE_RESPONSE_RESERVE_CHARS

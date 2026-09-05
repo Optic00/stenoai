@@ -9,7 +9,7 @@ import logging
 import re
 import subprocess
 import time
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any
 from .models import MeetingTranscript, ActionItem, Decision
 from .config import Config, resolve_runtime_tag, BEDROCK_REGION_RE
 from . import ollama_manager
@@ -112,14 +112,25 @@ CHARS_PER_TOKEN = 4               # English baseline; used for the reduce-fits s
 _CHUNK_SAFETY_CHARS_PER_TOKEN = 2 # used for chunk budget: worst-case German/BPE (2.0 c/t floor)
 _OVERLAP_RATIO = 0.05             # last 5% of previous chunk prepended to next
 
-# Apple on-device path uses the conservative supported window in
-# APPLE_LM_NUM_CTX. Carry a bounded text snapshot and keep the newest slice
-# verbatim; map-reduce loses reversals across successive meeting updates.
-_SNAPSHOT_MAX_CHARS = 2800
+# Apple summaries are deliberately limited to a single short-input call.
+# These UTF-8 byte limits are a conservative product scope, not token counts
+# or a guarantee of model accuracy. Never compact or truncate summary inputs.
+_APPLE_SUMMARY_MAX_CONTENT_BYTES = 2000
+_APPLE_SUMMARY_MAX_PROMPT_BYTES = 5000
 _APPLE_RESPONSE_RESERVE_CHARS = 2800
-_SNAPSHOT_PROMPT_OVERHEAD_CHARS = 900
-_SNAPSHOT_HEAD_RATIO = 0.6
-_SNAPSHOT_NOTES_TRUNCATION_MARKER = "\n...[notes truncated]"
+_APPLE_QUERY_HEAD_RATIO = 0.6
+_APPLE_SUMMARY_TOO_LONG = (
+    "Apple Intelligence currently supports only short transcripts "
+    "(transcript, notes and template combined: up to 2,000 UTF-8 bytes). The input exceeds "
+    "its input limit. Shorten the input or choose another model in Settings "
+    "and retry. No model was switched automatically."
+)
+
+
+class AppleSummaryInputTooLong(ValueError):
+    """A summary exceeds the supported Apple short-input scope."""
+
+
 _APPLE_QUERY_TRUNCATION_MARKER = (
     "\n...[middle of transcript omitted to fit Apple Intelligence context]...\n"
 )
@@ -620,188 +631,24 @@ class OllamaSummarizer:
         if not ''.join(streamed_chunks).strip():
             raise ValueError("Reduce step returned empty result")
 
-    def _snapshot_slice_budget_chars(self) -> int:
-        window = resolve_num_ctx(self.model_name) * _CHUNK_SAFETY_CHARS_PER_TOKEN
-        # Foundation Models has one shared context window for prompt and
-        # response. A snapshot may legitimately reach the full hard cap, so
-        # reserving the smaller map-output allowance can overflow at the model
-        # boundary even when the input prompt itself fits.
-        output_reserve = _SNAPSHOT_MAX_CHARS
-        budget = window - _SNAPSHOT_MAX_CHARS - _SNAPSHOT_PROMPT_OVERHEAD_CHARS - output_reserve
-        return max(800, budget)
-
     def _apple_input_budget_chars(self) -> int:
-        """Maximum Apple prompt size with room for a full bounded response."""
+        """Maximum Apple prompt size with room for a bounded response."""
         window = resolve_num_ctx(self.model_name) * _CHUNK_SAFETY_CHARS_PER_TOKEN
         return max(800, window - _APPLE_RESPONSE_RESERVE_CHARS)
 
-    def _hard_trim_snapshot(self, snapshot: str) -> str:
-        if len(snapshot) <= _SNAPSHOT_MAX_CHARS:
-            return snapshot
-        head = int(_SNAPSHOT_MAX_CHARS * _SNAPSHOT_HEAD_RATIO)
-        tail = _SNAPSHOT_MAX_CHARS - head - 5
-        return snapshot[:head] + "\n...\n" + snapshot[-tail:]
-
-    def _create_snapshot_update_prompt(
-        self, snapshot: str, slice_text: str, chunk_num: int, total_chunks: int
-    ) -> str:
-        current = snapshot.strip() or "(empty)"
-        return (
-            "Maintain a running meeting snapshot. Extract only what is explicitly stated.\n"
-            f"Hard cap: {_SNAPSHOT_MAX_CHARS} characters. Prefer dropping chatter over "
-            "decisions, actions, or reversals. If this slice contradicts the snapshot, "
-            "the slice wins and note the reversal.\n\n"
-            "Emit ONLY the updated snapshot with these headers:\n"
-            "ATTENDEES\nDECISIONS\nACTIONS\nOPEN\nTIMELINE\n\n"
-            f"CURRENT SNAPSHOT:\n{current}\n\n"
-            f"NEW TRANSCRIPT (part {chunk_num} of {total_chunks}):\n{slice_text}"
-        )
-
-    def _complete_snapshot(self, prompt: str) -> str:
-        from src.apple_lm import complete
-
-        text = (complete(prompt) or "").strip()
-        if not text:
-            raise ValueError("Snapshot update returned an empty result")
-        return self._hard_trim_snapshot(text)
-
-    def _create_snapshot_final_prompt(
-        self,
-        snapshot: str,
-        language: str,
-        notes: Optional[str],
-        template_prompt: Optional[str],
-    ) -> str:
-        """Build the Apple format prompt without exceeding its input budget."""
-        def create(notes_value: Optional[str]) -> str:
-            if template_prompt:
-                return self._create_template_report_prompt(
-                    snapshot, template_prompt, language, notes=notes_value
-                )
-            return self._create_markdown_prompt(snapshot, language, notes=notes_value)
-
-        return self._fit_apple_final_prompt(
-            create,
-            notes,
-            "Template instructions are too long for Apple Intelligence. "
-            "Shorten the template and try again.",
-        )
-
-    def _fit_apple_final_prompt(
-        self,
-        create: Callable[[Optional[str]], str],
-        notes: Optional[str],
-        oversized_error: str,
-    ) -> str:
-        """Fit optional notes around an already-bounded snapshot prompt."""
-        clean_notes = (notes or "").strip()
-        input_budget = self._apple_input_budget_chars()
-        base_prompt = create(None)
-        if len(base_prompt) > input_budget:
-            raise ValueError(oversized_error)
-        if not clean_notes:
-            return base_prompt
-
-        prompt = create(clean_notes)
-        if len(prompt) <= input_budget:
-            return prompt
-
-        one_char_prompt = create("x")
-        notes_wrapper_chars = len(one_char_prompt) - len(base_prompt) - 1
-        notes_budget = max(0, input_budget - len(base_prompt) - notes_wrapper_chars)
-        if notes_budget <= len(_SNAPSHOT_NOTES_TRUNCATION_MARKER):
-            return base_prompt
-        bounded_notes = (
-            clean_notes[:notes_budget - len(_SNAPSHOT_NOTES_TRUNCATION_MARKER)]
-            + _SNAPSHOT_NOTES_TRUNCATION_MARKER
-        )
-        return create(bounded_notes)
-
-    def _validate_apple_snapshot_template(
-        self, template_prompt: Optional[str], language: str
-    ) -> None:
-        """Reject a template that cannot fit even after transcript compaction."""
-        if not template_prompt:
-            return
-        prompt = self._create_template_report_prompt(
-            "S" * _SNAPSHOT_MAX_CHARS,
-            template_prompt,
-            language,
-            notes=None,
-        )
-        if len(prompt) > self._apple_input_budget_chars():
-            raise ValueError(
-                "Template instructions are too long for Apple Intelligence. "
-                "Shorten the template and try again."
-            )
-
-    def _build_apple_snapshot(
-        self,
-        transcript: str,
-        notes: Optional[str] = None,
-        progress_callback=None,
-    ) -> str:
-        """Fold a long transcript into one bounded Apple meeting snapshot."""
-        slices = self._split_into_chunks(
-            transcript,
-            budget=self._snapshot_slice_budget_chars(),
-        )
-        n = len(slices)
-        snapshot = self._hard_trim_snapshot((notes or "").strip())
-        for i, slice_text in enumerate(slices):
-            if progress_callback:
-                progress_callback(i + 1, n)
-            snapshot = self._complete_snapshot(
-                self._create_snapshot_update_prompt(snapshot, slice_text, i + 1, n)
-            )
-        if progress_callback:
-            progress_callback(n + 1, n)
-        return snapshot
-
-    def _create_snapshot_permissive_prompt(
-        self,
-        snapshot: str,
-        language: str,
-        notes: Optional[str],
-    ) -> str:
-        """Build the legacy JSON summary prompt inside Apple's input budget."""
-        def create(notes_value: Optional[str]) -> str:
-            return self._create_permissive_prompt(
-                snapshot,
-                language,
-                notes=notes_value,
-            )
-
-        return self._fit_apple_final_prompt(
-            create,
-            notes,
-            "Apple Intelligence JSON summary prompt is too large",
-        )
-
-    def _snapshot_compact_streaming(
-        self,
-        transcript: str,
-        language: str = "en",
-        notes: str = None,
-        progress_callback=None,
+    def _validate_apple_summary_input(
+        self, transcript: str, prompt: str, notes: Optional[str] = None,
         template_prompt: Optional[str] = None,
-    ):
-        """Sequential snapshot updates, then one format pass. Apple on-device path."""
-        snapshot = self._build_apple_snapshot(
-            transcript,
-            notes,
-            progress_callback,
-        )
-        prompt = self._create_snapshot_final_prompt(
-            snapshot, language, notes, template_prompt
-        )
-        yielded = []
-        for chunk in self._stream_direct(prompt):
-            if chunk:
-                yielded.append(chunk)
-                yield chunk
-        if not "".join(yielded).strip():
-            raise ValueError("Snapshot format step returned empty result")
+    ) -> None:
+        """Fail before generation; preserve the full input and selected model."""
+        if (
+            sum(len(text.encode("utf-8")) for text in (
+                transcript, (notes or "").strip(), (template_prompt or "").strip(),
+            )) > _APPLE_SUMMARY_MAX_CONTENT_BYTES
+            or len(prompt.encode("utf-8")) > _APPLE_SUMMARY_MAX_PROMPT_BYTES
+            or len(prompt) > self._apple_input_budget_chars()
+        ):
+            raise AppleSummaryInputTooLong(_APPLE_SUMMARY_TOO_LONG)
 
     def _repair_json(self, json_text: str) -> Optional[str]:
         """
@@ -1418,16 +1265,8 @@ Return ONLY the response in this exact JSON format:
                 )
             
             prompt = self._create_permissive_prompt(transcript, language, notes=notes)
-            if (
-                self._using_apple_lm()
-                and len(prompt) > self._apple_input_budget_chars()
-            ):
-                snapshot = self._build_apple_snapshot(transcript, notes)
-                prompt = self._create_snapshot_permissive_prompt(
-                    snapshot,
-                    language,
-                    notes,
-                )
+            if self._using_apple_lm():
+                self._validate_apple_summary_input(transcript, prompt, notes)
             logger.info(f"Sending transcript to {self.ai_provider} model: {self.model_name}")
             logger.info(f"Transcript length: {len(transcript)} characters")
 
@@ -1443,8 +1282,9 @@ Return ONLY the response in this exact JSON format:
             elif self.ai_provider == "cloud":
                 response_text = self._cloud_chat(prompt, timeout_seconds)
             else:
-                # Retry logic for Ollama API calls (local or remote)
-                max_retries = 3
+                # Apple short-input summaries use one direct generation only.
+                # Ollama keeps its existing compatibility/retry behavior.
+                max_retries = 1 if self._using_apple_lm() else 3
                 ollama_response = None
                 for attempt in range(max_retries):
                     try:
@@ -1591,6 +1431,9 @@ Return ONLY the response in this exact JSON format:
                 logger.error(f"Error creating MeetingTranscript object: {e}")
                 return None
                 
+        except AppleSummaryInputTooLong:
+            # Preserve the actionable limit error for CLI/UI callers.
+            raise
         except Exception as e:
             logger.error(f"Ollama API call failed: {e}")
             logger.error(f"Model used: {self.model_name}")
@@ -1636,6 +1479,25 @@ Return ONLY the response in this exact JSON format:
         notes_context = ""
         if notes and notes.strip():
             notes_context = f"USER NOTES (written during the meeting):\n{notes.strip()}\n\n"
+
+        if getattr(self, "model_name", None) == "apple:system" and getattr(self, "ai_provider", None) == "local":
+            # A compact instruction-only schema avoids the small model copying
+            # example placeholders into the user's note. Other providers keep
+            # the established prompt and its contracts unchanged.
+            return (
+                f"{diarisation_note}{notes_context}Write factual meeting notes as markdown. "
+                "Output only the notes, starting with ## Summary. Use these exact "
+                "English section headers: ## Summary, ## Key Topics, ## Key Points, "
+                "## Action Items. Write a brief overview in Summary, actual topic "
+                "headings in Key Topics, and factual bullets in the last two sections. "
+                "Preserve explicitly stated project names, locations, current dates, "
+                "decisions, and every task with its owner and status. When a date or "
+                "decision changes, report the latest value. Pending tasks stay pending; "
+                "do not describe them as completed. Put these facts in Key Points and "
+                "Action Items even if the overview is brief. Do not invent missing facts, "
+                "owners or deadlines. Never output example placeholders."
+                f"{language_instruction}\n\nTRANSCRIPT:\n{transcript}"
+            )
 
         return f"""{diarisation_note}{notes_context}Summarise this meeting transcript as markdown. Output ONLY the markdown below with no preamble, commentary, or explanation. Start directly with ## Summary.
 
@@ -1812,19 +1674,11 @@ TRANSCRIPT:
                 else self._create_markdown_prompt(transcript, language, notes)
             )
 
-        # Apple shares its context window between input and output. Check the real
-        # prompt, including a custom template, notes, language instructions,
-        # and scaffolding. Transcript-only sizing lets a short transcript plus
-        # a large template bypass compaction and fail at the model boundary.
-        if (
-            using_apple_lm
-            and apple_direct_prompt is not None
-            and len(apple_direct_prompt) > self._apple_input_budget_chars()
-        ):
-            self._validate_apple_snapshot_template(template_prompt, language)
-            inner = self._snapshot_compact_streaming(
-                transcript, language, notes, progress_callback, template_prompt
-            )
+        if using_apple_lm:
+            # Include notes, templates, language instructions and scaffolding in
+            # the check. Never enter snapshot/map-reduce or trim user content.
+            self._validate_apple_summary_input(transcript, apple_direct_prompt, notes, template_prompt)
+            inner = self._stream_completion(apple_direct_prompt)
             empty_message = (
                 "Model returned an empty report" if template_prompt
                 else "Model returned an empty summary"
@@ -2162,7 +2016,7 @@ ANSWER:"""
             return self._build_query_prompt(transcript, question, language)
 
         content_budget = transcript_budget - len(_APPLE_QUERY_TRUNCATION_MARKER)
-        head = int(content_budget * _SNAPSHOT_HEAD_RATIO)
+        head = int(content_budget * _APPLE_QUERY_HEAD_RATIO)
         tail = content_budget - head
         bounded = (
             transcript[:head]

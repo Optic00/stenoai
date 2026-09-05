@@ -768,7 +768,7 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
         self.assertIsNone(res)
         self.assertEqual(client.chat.call_count, 2)
 
-    def test_batch_retry_keeps_apple_client(self):
+    def test_batch_failure_does_not_retry_or_switch_apple_client(self):
         cfg = mock.Mock()
         cfg.get_ai_provider.return_value = "local"
         cfg.get_remote_ollama_url.return_value = None
@@ -790,55 +790,19 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
             ) as chat:
                 result = summarizer.summarize_transcript("Transcript", 1)
 
-        self.assertIsNotNone(result)
-        self.assertEqual(result.overview, "Summary")
-        self.assertEqual(chat.call_count, 2)
+        self.assertIsNone(result)
+        self.assertEqual(chat.call_count, 1)
+        self.assertIs(summarizer.client, apple_client)
         ollama_client.assert_not_called()
 
-    def test_long_legacy_batch_summary_uses_bounded_snapshot_prompt(self):
-        cfg = mock.Mock()
-        cfg.get_ai_provider.return_value = "local"
-        cfg.get_remote_ollama_url.return_value = None
-        cfg.get_model.return_value = APPLE_SYSTEM_MODEL
-        payload = json.dumps({"overview": "Summary", "participants": []})
-
-        with mock.patch(
-            "src.apple_lm.apple_lm_status",
-            return_value={"available": True},
-        ):
-            summarizer = OllamaSummarizer(config=cfg)
-        summarizer._build_apple_snapshot = mock.Mock(
-            return_value="BOUNDED SNAPSHOT"
-        )
-        summarizer.client.chat = mock.Mock(
-            return_value={"message": {"content": payload}}
-        )
-
-        transcript = "HEAD\n" + "M" * 30_000 + "\nTAIL"
-        result = summarizer.summarize_transcript(transcript, 30)
-
-        self.assertIsNotNone(result)
-        summarizer._build_apple_snapshot.assert_called_once_with(
-            transcript,
-            None,
-        )
-        prompt = summarizer.client.chat.call_args.kwargs["messages"][0]["content"]
-        self.assertIn("BOUNDED SNAPSHOT", prompt)
-        self.assertNotIn("M" * 10_000, prompt)
-        self.assertLessEqual(len(prompt), summarizer._apple_input_budget_chars())
-
-    def test_legacy_snapshot_prompt_bounds_large_notes(self):
+    def test_long_legacy_batch_summary_rejects_before_generation(self):
         summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
+        summarizer.ai_provider = "local"
         summarizer.model_name = APPLE_SYSTEM_MODEL
-
-        prompt = summarizer._create_snapshot_permissive_prompt(
-            "bounded snapshot",
-            "en",
-            "N" * 40_000,
-        )
-
-        self.assertLessEqual(len(prompt), summarizer._apple_input_budget_chars())
-        self.assertIn("...[notes truncated]", prompt)
+        summarizer.client = mock.Mock()
+        with self.assertRaisesRegex(ValueError, "only short transcripts"):
+            summarizer.summarize_transcript("X" * 2001, 30)
+        summarizer.client.chat.assert_not_called()
 
     def test_connection_checks_apple_availability_without_ollama_list(self):
         cfg = mock.Mock()
@@ -867,145 +831,106 @@ class AppleLMSummarizerIntegrationTests(BaseAppleLMTest):
                 mock_complete.assert_called_once()
                 self.assertEqual(mock_complete.call_args.kwargs.get("timeout"), 90)
 
-    def test_long_transcript_uses_snapshot_compact(self):
-        cfg = mock.Mock()
-        cfg.get_ai_provider.return_value = "local"
-        cfg.get_remote_ollama_url.return_value = None
-        cfg.get_model.return_value = APPLE_SYSTEM_MODEL
-        cfg.get_language_name.return_value = "English"
-        with mock.patch("src.apple_lm.apple_lm_status", return_value={"available": True}):
-            summarizer = OllamaSummarizer(config=cfg)
-        prompts = []
+    def _short_input_summarizer(self):
+        s = OllamaSummarizer.__new__(OllamaSummarizer)
+        s.ai_provider = "local"
+        s.model_name = APPLE_SYSTEM_MODEL
+        s.config = mock.Mock()
+        s.client = mock.Mock()
+        return s
 
-        def fake_complete(prompt, timeout=7200):
-            prompts.append(prompt)
-            return f"SNAPSHOT-{len(prompts)}\nDECISIONS\n- keep going"
+    def test_apple_transcript_byte_boundary_preserves_entire_direct_input(self):
+        for transcript in ("A" * 1999, "A" * 2000, "ä" * 1000, "🙂" * 500):
+            with self.subTest(byte_count=len(transcript.encode("utf-8"))):
+                s = self._short_input_summarizer()
+                with mock.patch.object(s, "_stream_completion", return_value=iter(["summary"])) as stream, \
+                     mock.patch.object(s, "_map_reduce_streaming") as reduce:
+                    self.assertEqual("".join(s.summarize_transcript_streaming(transcript)), "summary")
+                self.assertIn(transcript, stream.call_args.args[0])
+                stream.assert_called_once()
+                reduce.assert_not_called()
 
-        def fake_stream(prompt, timeout=7200):
-            yield "## Summary\nSnapshot formatted."
+    def test_apple_rejects_oversize_transcript_notes_and_template_without_generation(self):
+        cases = [
+            ("A" * 2001, None, None),
+            ("ä" * 1001, None, None),
+            ("🙂" * 501, None, None),
+            ("short", "notes " * 1000, None),
+            ("short", None, "template " * 1000),
+        ]
+        for transcript, notes, template in cases:
+            with self.subTest(notes=bool(notes), template=bool(template)):
+                s = self._short_input_summarizer()
+                with mock.patch("src.apple_lm.complete") as complete, \
+                     mock.patch("src.apple_lm.stream_complete") as stream, \
+                     mock.patch("src.summarizer.ollama.Client") as ollama_client, \
+                     mock.patch.object(s, "_map_reduce_streaming") as reduce:
+                    with self.assertRaisesRegex(ValueError, "No model was switched automatically"):
+                        list(s.summarize_transcript_streaming(transcript, notes=notes, template_prompt=template))
+                complete.assert_not_called()
+                stream.assert_not_called()
+                ollama_client.assert_not_called()
+                reduce.assert_not_called()
+                s.config.set_model.assert_not_called()
+                self.assertEqual(s.model_name, APPLE_SYSTEM_MODEL)
 
-        transcript = "".join(
-            f"Speaker A: unique-line-{i} was discussed.\n" for i in range(500)
-        )
-        with mock.patch("src.apple_lm.complete", side_effect=fake_complete), \
-             mock.patch("src.apple_lm.stream_complete", side_effect=fake_stream), \
-             mock.patch.object(summarizer, "_map_reduce_streaming") as map_reduce:
-            text = "".join(summarizer.summarize_transcript_streaming(transcript))
-        map_reduce.assert_not_called()
-        self.assertIn("Snapshot formatted.", text)
-        self.assertGreaterEqual(len(prompts), 2)
-        self.assertTrue(all("CURRENT SNAPSHOT" in p for p in prompts))
-        self.assertIn("SNAPSHOT-1", prompts[1])
-        joined = "\n".join(prompts)
-        self.assertIn("unique-line-0", joined)
-        self.assertIn("unique-line-499", joined)
+    def test_combined_byte_boundary_counts_notes_and_templates(self):
+        s = self._short_input_summarizer()
+        for template in (None, "Write a factual report."):
+            template_size = len((template or "").encode("utf-8"))
+            notes = "N" * (2000 - len("short") - template_size)
+            for size in (1999, 2000, 2001):
+                value = notes[:len(notes) - 1] if size == 1999 else notes + ("x" if size == 2001 else "")
+                with self.subTest(size=size, template=bool(template)):
+                    with mock.patch.object(s, "_stream_completion", return_value=iter(["report"])) as stream:
+                        if size > 2000:
+                            with self.assertRaisesRegex(ValueError, "only short transcripts"):
+                                list(s.summarize_transcript_streaming("short", notes=value, template_prompt=template))
+                            stream.assert_not_called()
+                        else:
+                            list(s.summarize_transcript_streaming("short", notes=value, template_prompt=template))
+                            self.assertIn(value, stream.call_args.args[0])
 
-    def test_hard_trim_snapshot_keeps_head_and_tail(self):
-        cfg = mock.Mock()
-        cfg.get_ai_provider.return_value = "local"
-        cfg.get_remote_ollama_url.return_value = None
-        cfg.get_model.return_value = APPLE_SYSTEM_MODEL
-        with mock.patch("src.apple_lm.apple_lm_status", return_value={"available": True}):
-            summarizer = OllamaSummarizer(config=cfg)
-        from src.summarizer import _SNAPSHOT_MAX_CHARS
-        blob = "H" * 2000 + "MID" + "T" * 2000
-        trimmed = summarizer._hard_trim_snapshot(blob)
-        self.assertLessEqual(len(trimmed), _SNAPSHOT_MAX_CHARS)
-        self.assertTrue(trimmed.startswith("H"))
-        self.assertTrue(trimmed.endswith("T"))
-        self.assertIn("...", trimmed)
+    def test_full_prompt_byte_boundary_is_checked_independently(self):
+        s = self._short_input_summarizer()
+        for size in (4999, 5000, 5001):
+            with self.subTest(size=size):
+                # A future formatting/language scaffold must not bypass the
+                # complete-prompt guard even with tiny user inputs.
+                with mock.patch.object(s, "_create_markdown_prompt", return_value="x" * size), \
+                     mock.patch.object(s, "_stream_completion", return_value=iter(["summary"])) as stream:
+                    if size > 5000:
+                        with self.assertRaisesRegex(ValueError, "only short transcripts"):
+                            list(s.summarize_transcript_streaming("short"))
+                        stream.assert_not_called()
+                    else:
+                        list(s.summarize_transcript_streaming("short"))
+                        stream.assert_called_once()
 
-    def test_snapshot_compaction_bounds_initial_and_final_notes(self):
-        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
-        summarizer.model_name = APPLE_SYSTEM_MODEL
-        prompts = []
-        final_prompts = []
+    def test_timestamp_removal_and_apple_fact_instruction(self):
+        s = self._short_input_summarizer()
+        with mock.patch.object(s, "_stream_completion", return_value=iter(["summary"])) as stream:
+            list(s.summarize_transcript_streaming("[01:00] " + "A" * 2000))
+        self.assertNotIn("[01:00]", stream.call_args.args[0])
+        self.assertIn("Pending tasks stay pending", stream.call_args.args[0])
 
-        summarizer._split_into_chunks = mock.Mock(return_value=["short transcript"])
-        summarizer._complete_snapshot = mock.Mock(
-            side_effect=lambda prompt: prompts.append(prompt) or "bounded snapshot"
-        )
-        summarizer._stream_direct = mock.Mock(
-            side_effect=lambda prompt: final_prompts.append(prompt) or iter(["summary"])
-        )
+    def test_legacy_batch_rejects_large_notes_without_calling_model(self):
+        s = self._short_input_summarizer()
+        with self.assertRaisesRegex(ValueError, "only short transcripts"):
+            s.summarize_transcript("short", 1, notes="N" * 5000)
+        s.client.chat.assert_not_called()
 
-        notes = "N" * 40_000
-        self.assertEqual(
-            "".join(summarizer._snapshot_compact_streaming("text", notes=notes)),
-            "summary",
-        )
-        self.assertLess(len(prompts[0]), len(notes))
-        self.assertEqual(len(final_prompts), 1)
-        self.assertNotIn(notes, final_prompts[0])
-        self.assertIn("N" * 1_000, final_prompts[0])
-        self.assertIn("...[notes truncated]", final_prompts[0])
-        input_budget = summarizer._apple_input_budget_chars()
-        self.assertLessEqual(len(final_prompts[0]), input_budget)
-
-    def test_max_snapshot_update_prompt_reserves_full_snapshot_response(self):
-        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
-        summarizer.model_name = APPLE_SYSTEM_MODEL
-        from src.summarizer import (
-            _CHUNK_SAFETY_CHARS_PER_TOKEN,
-            _SNAPSHOT_MAX_CHARS,
-        )
-
-        prompt = summarizer._create_snapshot_update_prompt(
-            "S" * _SNAPSHOT_MAX_CHARS,
-            "T" * summarizer._snapshot_slice_budget_chars(),
-            999,
-            999,
-        )
-        self.assertLessEqual(
-            len(prompt) + _SNAPSHOT_MAX_CHARS,
-            resolve_num_ctx(APPLE_SYSTEM_MODEL) * _CHUNK_SAFETY_CHARS_PER_TOKEN,
-        )
-
-    def test_large_apple_template_uses_snapshot_compaction(self):
-        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
-        summarizer.ai_provider = "local"
-        summarizer.model_name = APPLE_SYSTEM_MODEL
-        summarizer._snapshot_compact_streaming = mock.Mock(
-            return_value=iter(["bounded report"])
-        )
-
-        result = "".join(
-            summarizer.summarize_transcript_streaming(
-                "X" * summarizer._apple_input_budget_chars(),
-                template_prompt="T" * 1_000,
-            )
-        )
-
-        self.assertEqual(result, "bounded report")
-        summarizer._snapshot_compact_streaming.assert_called_once()
-
-    def test_oversized_template_fails_before_snapshot_model_calls(self):
-        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
-        summarizer.ai_provider = "local"
-        summarizer.model_name = APPLE_SYSTEM_MODEL
-        summarizer._snapshot_compact_streaming = mock.Mock()
-
-        with self.assertRaisesRegex(ValueError, "Template instructions are too long"):
-            "".join(
-                summarizer.summarize_transcript_streaming(
-                    "short transcript",
-                    template_prompt="T" * summarizer._apple_input_budget_chars(),
-                )
-            )
-
-        summarizer._snapshot_compact_streaming.assert_not_called()
-
-    def test_oversized_apple_template_fails_before_final_model_call(self):
-        summarizer = OllamaSummarizer.__new__(OllamaSummarizer)
-        summarizer.model_name = APPLE_SYSTEM_MODEL
-
-        with self.assertRaisesRegex(ValueError, "Template instructions are too long"):
-            summarizer._create_snapshot_final_prompt(
-                "snapshot",
-                "en",
-                None,
-                "T" * summarizer._apple_input_budget_chars(),
-            )
+    def test_non_apple_summary_limit_is_unchanged(self):
+        for provider in ("local", "remote", "cloud", "adapter"):
+            with self.subTest(provider=provider):
+                s = self._short_input_summarizer()
+                s.ai_provider = provider
+                s.model_name = "gemma4:e2b-it-qat"
+                transcript = "X" * 6000
+                with mock.patch.object(s, "_needs_chunking", return_value=False), \
+                     mock.patch.object(s, "_stream_completion", return_value=iter(["summary"])) as stream:
+                    self.assertEqual("".join(s.summarize_transcript_streaming(transcript)), "summary")
+                self.assertIn(transcript, stream.call_args.args[0])
 
     def test_apple_query_prompt_bounds_long_transcript_and_keeps_edges(self):
         summarizer = OllamaSummarizer.__new__(OllamaSummarizer)

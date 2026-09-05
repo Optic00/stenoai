@@ -20,6 +20,21 @@ Local summarization runs via Ollama with `gemma4:e2b-it-qat` by default.
 On macOS 26 or later, users can explicitly select Apple's built-in `SystemLanguageModel` when Apple Intelligence is available.
 Steno does not silently change an existing model selection or fall back to another provider if Apple becomes unavailable.
 
+Apple summaries and reports currently support short transcripts only: up to
+2,000 UTF-8 bytes for the transcript, notes and template instructions combined,
+after removing transcript timestamps. The complete request, including notes,
+template instructions and formatting instructions, must also fit within 5,000
+UTF-8 bytes. Non-ASCII text can use several bytes per character. These limits are
+not a meeting-duration limit or a guarantee of summary accuracy.
+
+If the input exceeds either limit, Steno stops before generation. It does not
+shorten the transcript or notes, combine partial summaries, or switch models.
+Your source text is preserved. Choose another model in **Settings → AI** and retry
+for longer transcripts, or shorten optional notes/template instructions when
+those exceed the request limit. An automatic extra template report is best-effort:
+if it exceeds the limit, the Standard note remains available; generating the
+report explicitly shows the error.
+
 For local Ollama on Apple Silicon, the three Gemma 4 models are automatically pulled as MLX/NVFP4 builds instead of the base GGUF, providing faster inference at the larger download sizes shown above.
 `llama3.2:3b` remains available for existing users pinned to it, but it is deprecated and hidden from the default model picker.
 
