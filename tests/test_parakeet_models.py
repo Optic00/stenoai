@@ -193,6 +193,7 @@ class DownloadProgressTests(unittest.TestCase):
             self.assertEqual([e["stage"] for e in events], expected)
             self.assertEqual(loaded.call_count, 0 if failure else 1)
 
+    @patch.dict(os.environ)
     def test_snapshot_progress_and_older_hub_fallback(self):
         import types
         import sys

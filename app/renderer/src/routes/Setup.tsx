@@ -362,7 +362,7 @@ export function Setup() {
         if (parakeetInstalled || anyWhisperInstalled) {
           setStatus('transcription', 'done', 'Transcription model ready');
         } else {
-          setStatus('transcription', 'running', 'Downloading Parakeet TDT v3...');
+          setStatus('transcription', 'running', `Downloading Parakeet TDT v3 (${isMac ? '~2.5 GB' : '~670 MB'})...`);
           setParakeetStage({ stage: 'preparing' });
           await parakeetStep.mutateAsync();
           setParakeetStage(null);

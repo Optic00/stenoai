@@ -281,7 +281,7 @@ export function MeetingsShell({
           setFolderError(null);
         }
       }}>
-        <DialogContent>
+        <DialogContent closeDisabled={createFolder.isPending}>
           <DialogHeader>
             <DialogTitle>New folder</DialogTitle>
             <DialogDescription>

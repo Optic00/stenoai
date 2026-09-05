@@ -5,7 +5,35 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const { makeLineReader } = require('./backend-stream');
+const ts = require('typescript');
 const source = fs.readFileSync(require('node:path').join(__dirname, 'main.js'), 'utf8');
+
+// Parse statement boundaries rather than depending on indentation or brace layout.
+function registration(sourceText, channel) {
+  const file = ts.createSourceFile('main.js', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const matches = file.statements.filter(statement => {
+    if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) return false;
+    const call = statement.expression;
+    return ts.isPropertyAccessExpression(call.expression)
+      && ts.isIdentifier(call.expression.expression)
+      && call.expression.expression.text === 'ipcMain'
+      && call.expression.name.text === 'handle'
+      && call.arguments[0] && ts.isStringLiteral(call.arguments[0])
+      && call.arguments[0].text === channel;
+  });
+  assert.equal(matches.length, 1, `Expected exactly one IPC registration for ${channel}`);
+  return matches[0].getText(file);
+}
+
+test('registration extraction tolerates indentation and nested callbacks', () => {
+  const input = `  ipcMain.handle('sample', () => {
+    nested(() => {
+});
+  });
+  unrelated();`;
+  assert.equal(registration(input, 'sample'), input.trim().replace('\n  unrelated();', ''));
+  assert.throws(() => registration(input, 'missing'), /Expected exactly one IPC registration/);
+});
 
 for (const channel of ['setup-parakeet', 'pull-parakeet-model']) {
   function start() {
@@ -14,9 +42,7 @@ for (const channel of ['setup-parakeet', 'pull-parakeet-model']) {
     proc.stdout = new EventEmitter();
     proc.stderr = new EventEmitter();
     const events = [];
-    const begin = source.indexOf(`ipcMain.handle('${channel}'`);
-    const end = source.indexOf('\n});', begin) + 5;
-    vm.runInNewContext(source.slice(begin, end), {
+    vm.runInNewContext(registration(source, channel), {
       ipcMain: { handle: (_, fn) => { handler = fn; } },
       spawn: () => proc, getBackendPath: () => '/synthetic/backend', getBackendCwd: () => '/synthetic',
       makeLineReader, sendDebugLog: () => {}, setTimeout, clearTimeout,

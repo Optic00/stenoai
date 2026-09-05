@@ -17,12 +17,14 @@ test('folder creation blocks repeated clicks and Enter, recovers after failure a
   });
   await expect(dialog.getByRole('button', { name: 'Creating folder…' })).toBeDisabled();
   await expect(input).toBeDisabled();
+  await expect(dialog.getByRole('button', { name: 'Close', exact: true })).toBeDisabled();
   await page.keyboard.press('Escape');
   await expect(dialog).toBeVisible();
   expect(await app.evaluate(() => (globalThis as any).__folderCreateTest.calls)).toBe(1);
   await app.evaluate(() => (globalThis as any).__folderCreateTest.finish({ success: false, error: 'Synthetic failure' }));
   await expect(dialog.getByRole('alert')).toContainText('Could not create folder');
   await expect(input).toHaveValue('Synthetic folder');
+  await expect(dialog.getByRole('button', { name: 'Close', exact: true })).toBeEnabled();
   await dialog.getByRole('button', { name: 'Create folder', exact: true }).click();
   await expect.poll(() => app.evaluate(() => (globalThis as any).__folderCreateTest.calls)).toBe(2);
   await app.evaluate(() => (globalThis as any).__folderCreateTest.finish({ success: true, folder: { id: 'one', name: 'Synthetic folder' } }));

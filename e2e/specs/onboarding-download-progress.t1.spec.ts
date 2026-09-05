@@ -150,3 +150,14 @@ test('Settings displays Parakeet file progress next to the pending model selecti
   });
   await expect(page.getByRole('status')).toContainText('Download complete. Preparing model…');
 });
+
+for (const [platform, size] of [['darwin', '~2.5 GB'], ['win32', '~670 MB']] as const) {
+  test(`Parakeet setup shows the download estimate on ${platform}`, async ({ launchApp }) => {
+    const { page } = await launchApp({ mockIpc: true, env: {
+      STENOAI_E2E_SETUP_PROGRESS: '1', STENOAI_E2E_RENDERER_PLATFORM: platform,
+    } });
+    await page.evaluate(() => { window.location.hash = '#/setup'; });
+    await page.getByRole('button', { name: 'Begin setup' }).click();
+    await expect(page.locator('[data-setup-step="transcription"]')).toContainText(`Downloading Parakeet TDT v3 (${size})...`);
+  });
+}
