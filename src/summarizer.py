@@ -112,11 +112,9 @@ CHARS_PER_TOKEN = 4               # English baseline; used for the reduce-fits s
 _CHUNK_SAFETY_CHARS_PER_TOKEN = 2 # used for chunk budget: worst-case German/BPE (2.0 c/t floor)
 _OVERLAP_RATIO = 0.05             # last 5% of previous chunk prepended to next
 
-# Apple on-device path (8k window — see APPLE_LM_NUM_CTX, measured, not
-# assumed). Advanced accepted an image Attachment (2026-08-25 probe) but
-# returned 2 chars and missed the needle — do not rasterize. Carry a bounded
-# text snapshot; keep the newest slice verbatim. Map-reduce forgets reversals
-# and dies at hierarchical depth 2 on this window.
+# Apple on-device path uses the conservative supported window in
+# APPLE_LM_NUM_CTX. Carry a bounded text snapshot and keep the newest slice
+# verbatim; map-reduce loses reversals across successive meeting updates.
 _SNAPSHOT_MAX_CHARS = 2800
 _APPLE_RESPONSE_RESERVE_CHARS = 2800
 _SNAPSHOT_PROMPT_OVERHEAD_CHARS = 900
@@ -1814,7 +1812,7 @@ TRANSCRIPT:
                 else self._create_markdown_prompt(transcript, language, notes)
             )
 
-        # Apple has a fixed 8K combined input/output window. Check the real
+        # Apple shares its context window between input and output. Check the real
         # prompt, including a custom template, notes, language instructions,
         # and scaffolding. Transcript-only sizing lets a short transcript plus
         # a large template bypass compaction and fail at the model boundary.

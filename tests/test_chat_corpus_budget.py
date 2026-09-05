@@ -7,6 +7,7 @@ overflowing (WS3). Pure function — no notes or model needed.
 """
 
 import unittest
+from unittest import mock
 
 from simple_recorder import _chat_corpus_char_budget
 from src.summarizer import resolve_num_ctx
@@ -41,50 +42,64 @@ class ChatCorpusBudgetTests(unittest.TestCase):
         self.assertGreater(budget, 0)
         self.assertLess(budget, 400_000)
 
-class AppleWindowMeasuredCeilingTests(unittest.TestCase):
-    """Pins the Apple on-device window against what the hardware actually does.
+class AppleSupportedWindowTests(unittest.TestCase):
+    """A newer model's measured capacity must not break supported macOS 26."""
 
-    APPLE_LM_NUM_CTX only sizes OUR prompt budgets, so nothing fails loudly if
-    it drifts — it shipped at 4096, which silently halved every Apple budget and
-    no test noticed, because every other test derives from the constant instead
-    of pinning it.
-
-    The numbers below come from feeding needle-in-filler prompts straight at the
-    sidecar on AFM 3 Core Advanced / macOS 27: clean answers with the needle
-    recovered through ~37.9k chars, hard refusal from ~40.0k. These assertions
-    encode both halves of that: the window must not shrink back, and the largest
-    derived budget must stay well under the measured cliff.
-    """
-
-    MEASURED_CLIFF_CHARS = 40_000
-    MEASURED_LAST_GOOD_CHARS = 37_900
-
-    def test_window_is_the_measured_8k_not_the_old_4k(self):
+    def test_window_uses_the_documented_4k_fallback(self):
         from src.apple_lm import APPLE_LM_NUM_CTX
 
-        self.assertEqual(APPLE_LM_NUM_CTX, 8192)
-        self.assertEqual(resolve_num_ctx("apple:system"), 8192)
+        self.assertEqual(APPLE_LM_NUM_CTX, 4096)
+        self.assertEqual(resolve_num_ctx("apple:system"), 4096)
 
-    def test_apple_corpus_budget_is_bigger_than_the_old_4k_figure(self):
+    def test_apple_corpus_budget_reserves_space_for_prompt_and_response(self):
         budget = _chat_corpus_char_budget("local", "apple:system")
-        # The 4096 window produced 7884 chars; anything at or below that means
-        # the regression is back.
-        self.assertGreater(budget, 7884 * 1.5)
+        self.assertEqual(budget, int(4096 * 3.5 * 0.55))
 
-    def test_apple_budget_stays_under_the_measured_cliff(self):
-        budget = _chat_corpus_char_budget("local", "apple:system")
-        # Half the last-known-good size is the margin: the prompt also carries
-        # scaffolding, the question, and the model's own answer.
-        self.assertLess(budget, self.MEASURED_LAST_GOOD_CHARS / 2)
-        self.assertLess(budget, self.MEASURED_CLIFF_CHARS)
+    def test_apple_input_budget_reserves_a_response_in_the_4k_window(self):
+        from src.summarizer import OllamaSummarizer, _APPLE_RESPONSE_RESERVE_CHARS
 
-    def test_apple_snapshot_slice_budget_grew_with_the_window(self):
+        s = OllamaSummarizer.__new__(OllamaSummarizer)
+        s.model_name = "apple:system"
+        self.assertGreater(s._apple_input_budget_chars(), 0)
+        self.assertLessEqual(
+            s._apple_input_budget_chars() + _APPLE_RESPONSE_RESERVE_CHARS,
+            4096 * 2,
+        )
+
+    def test_apple_snapshot_update_and_response_fit_the_4k_window(self):
+        from src.summarizer import OllamaSummarizer, _SNAPSHOT_MAX_CHARS
+
+        s = OllamaSummarizer.__new__(OllamaSummarizer)
+        s.model_name = "apple:system"
+        self.assertGreater(s._snapshot_slice_budget_chars(), 0)
+        prompt = s._create_snapshot_update_prompt(
+            "S" * _SNAPSHOT_MAX_CHARS,
+            "T" * s._snapshot_slice_budget_chars(),
+            999,
+            999,
+        )
+        self.assertLessEqual(len(prompt) + _SNAPSHOT_MAX_CHARS, 4096 * 2)
+
+    def test_meeting_that_fitted_the_beta_budget_now_uses_compaction(self):
         from src.summarizer import OllamaSummarizer
 
         s = OllamaSummarizer.__new__(OllamaSummarizer)
         s.model_name = "apple:system"
-        # The 4096 window produced 3292 chars per slice.
-        self.assertGreater(s._snapshot_slice_budget_chars(), 3292 * 2)
+        s.ai_provider = "local"
+        s._snapshot_compact_streaming = mock.Mock(return_value=iter(["summary"]))
+        result = "".join(s.summarize_transcript_streaming("meeting text " * 500))
+        self.assertEqual(result, "summary")
+        s._snapshot_compact_streaming.assert_called_once()
+
+    def test_query_trims_the_assembled_corpus_to_the_supported_input_budget(self):
+        from src.summarizer import OllamaSummarizer, _APPLE_RESPONSE_RESERVE_CHARS
+
+        s = OllamaSummarizer.__new__(OllamaSummarizer)
+        s.model_name = "apple:system"
+        corpus = "H" + "X" * 7882 + "T"
+        prompt = s._build_bounded_apple_query_prompt(corpus, "What changed?")
+        self.assertNotIn(corpus, prompt)
+        self.assertLessEqual(len(prompt) + _APPLE_RESPONSE_RESERVE_CHARS, 4096 * 2)
 
 
 if __name__ == "__main__":
