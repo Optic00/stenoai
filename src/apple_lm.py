@@ -34,6 +34,7 @@ APPLE_SYSTEM_MODEL = "apple:system"
 APPLE_LM_NUM_CTX = 4096
 
 _DISABLE_ENV = "STENOAI_DISABLE_APPLE_LM"
+_EXPERIMENTAL_ENV = "STENOAI_ENABLE_EXPERIMENTAL_APPLE_LM"
 _BIN_ENV = "STENOAI_APPLE_LM_BIN"
 _E2E_ENV = "STENOAI_E2E"
 _E2E_STATE_FILE_ENV = "STENOAI_APPLE_LM_STATE_FILE"
@@ -55,6 +56,11 @@ def is_apple_system_model(model_id: Optional[str]) -> bool:
 
 def apple_lm_disabled() -> bool:
     return os.environ.get(_DISABLE_ENV) == "1"
+
+
+def apple_lm_experimental_enabled() -> bool:
+    """Explicit process opt-in; never inferred from hardware or saved selection."""
+    return os.environ.get(_EXPERIMENTAL_ENV) == "1"
 
 
 def _direct_test_helper_allowed() -> bool:
@@ -82,7 +88,7 @@ def reset_apple_lm_cache() -> None:
 
 def resolve_apple_lm_bin() -> Optional[str]:
     """Locate the Apple LM helper executable. Darwin only."""
-    if apple_lm_disabled() or sys.platform != "darwin":
+    if apple_lm_disabled() or sys.platform != "darwin" or not apple_lm_experimental_enabled():
         return None
     candidates: list[str] = []
     # A direct executable override exists only for deterministic E2E fixtures.
@@ -146,6 +152,8 @@ def apple_lm_status() -> Dict[str, Any]:
         return {"available": False, "reason": "disabled"}
     if sys.platform != "darwin":
         return {"available": False, "reason": "unsupported_os"}
+    if not apple_lm_experimental_enabled():
+        return {"available": False, "reason": "experimental_disabled"}
     # Packaged T2 uses a status-only fixture. It cannot execute arbitrary code
     # or receive meeting content, so the production helper boundary remains
     # enforced even when the frozen backend is under test.
@@ -192,6 +200,10 @@ def apple_lm_available() -> bool:
 
 
 _UNAVAILABLE_MESSAGES = {
+    "experimental_disabled": (
+        "Apple Intelligence is experimental and disabled by default. "
+        "Choose another model in Settings to continue. Your selection was not changed."
+    ),
     "disabled": "Apple Intelligence is disabled for this run.",
     "unsupported_os": "Apple Intelligence requires macOS 26 or later.",
     "sidecar_missing": "This Steno build does not include the Apple Intelligence helper.",
@@ -202,7 +214,7 @@ _UNAVAILABLE_MESSAGES = {
     "unavailable": "Apple Intelligence is not available on this system.",
 }
 
-_HIDDEN_UNAVAILABLE_REASONS = {"disabled", "unsupported_os"}
+_HIDDEN_UNAVAILABLE_REASONS = {"disabled", "unsupported_os", "experimental_disabled"}
 
 _GENERATION_ERROR_MESSAGES = {
     "guardrail": "Apple Intelligence could not process this content.",
@@ -268,16 +280,17 @@ def apple_system_model_info(
             else apple_lm_unavailable_message(status)
         )
     return {
-        "name": display if isinstance(display, str) and display.strip() else "Apple Intelligence",
+        "name": f"{display if isinstance(display, str) and display.strip() else 'Apple Intelligence'} (Experimental)",
         "size": "",
         "params": "OS-managed",
         "description": (
             f"On-device System Language Model - {availability_bit}. "
+            "Experimental: may omit facts or invent details. Review every result. "
             "Short inputs only (transcript, notes and template combined: "
             "up to 2,000 UTF-8 bytes)."
         ),
         "speed": "fast",
-        "quality": "good",
+        "quality": "experimental",
     }
 
 
@@ -518,6 +531,8 @@ def _run_apple_lm_app(
 
 
 def complete(prompt: str, timeout: float = 7200) -> str:
+    if not apple_lm_experimental_enabled():
+        raise RuntimeError(apple_lm_unavailable_message({"reason": "experimental_disabled"}))
     raw = _run_apple_lm(["complete"], stdin=prompt, timeout=timeout)
     try:
         payload = json.loads(raw)
@@ -534,6 +549,8 @@ def complete(prompt: str, timeout: float = 7200) -> str:
 
 
 def stream_complete(prompt: str, timeout: float = 7200) -> Iterator[str]:
+    if not apple_lm_experimental_enabled():
+        raise RuntimeError(apple_lm_unavailable_message({"reason": "experimental_disabled"}))
     binary = resolve_apple_lm_bin()
     if not binary:
         raise RuntimeError("Apple Intelligence helper is not available")

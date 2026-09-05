@@ -53,6 +53,7 @@ test('fresh install offers Apple Intelligence without selecting it', async ({
     const { page } = await launchApp({
       env: {
         STENOAI_DISABLE_APPLE_LM: '0',
+        STENOAI_ENABLE_EXPERIMENTAL_APPLE_LM: '1',
         STENOAI_APPLE_LM_STATE_FILE: unavailableMarker,
       },
     });

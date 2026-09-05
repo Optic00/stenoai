@@ -9,7 +9,7 @@ After transcription, Steno passes the transcript to a language model to generate
 
 | Model | Size | Notes |
 |-------|------|-------|
-| `apple:system` (Apple Intelligence) | Built-in | Optional on macOS 26+. The OS manages the on-device SystemLanguageModel. |
+| `apple:system` (Apple Intelligence) | Built-in | Experimental, disabled by default. Requires macOS 26+ and an explicit test opt-in. |
 | `gemma4:e2b-it-qat` | ~4.3GB (~6.5GB on Apple Silicon) | Default local model. Fast, 128K context. |
 | `gemma4:e4b-it-qat` | ~6.1GB (~8.8GB on Apple Silicon) | Higher quality, modest footprint. |
 | `qwen3.5:9b` | ~6.6GB | Strong at structured output and action items. |
@@ -17,8 +17,17 @@ After transcription, Steno passes the transcript to a language model to generate
 | `gpt-oss:20b` | ~14GB | Highest quality, reasoning. |
 
 Local summarization runs via Ollama with `gemma4:e2b-it-qat` by default.
-On macOS 26 or later, users can explicitly select Apple's built-in `SystemLanguageModel` when Apple Intelligence is available.
+Apple's built-in `SystemLanguageModel` integration is experimental and disabled
+by default. It is not offered in the normal model picker. Testers on macOS 26+
+can opt in by launching Steno with `STENOAI_ENABLE_EXPERIMENTAL_APPLE_LM=1` in
+its process environment, then explicitly selecting **Apple Intelligence
+(Experimental)** when macOS reports it available. `STENOAI_DISABLE_APPLE_LM=1`
+overrides this opt-in. The experiment applies to Apple summaries, reports and chat.
+Results can omit facts or invent details, even with short inputs; review every
+result against the source. This is not a production-quality recommendation.
 Steno does not silently change an existing model selection or fall back to another provider if Apple becomes unavailable.
+An Apple selection from an earlier test remains saved when the experiment is
+disabled, but cannot generate. Select another model in **Settings → AI** to continue.
 
 Apple summaries and reports currently support short transcripts only: up to
 2,000 UTF-8 bytes for the transcript, notes and template instructions combined,

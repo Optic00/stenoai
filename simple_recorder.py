@@ -843,9 +843,6 @@ Summary output language: {config.get_language_name(output_language)}
             }
 
         # Step 2: Streaming summary
-        if self.summarizer is None:
-            self.summarizer = OllamaSummarizer()
-
         from src.config import get_config
         config = get_config()
         configured_language = config.get_language()
@@ -858,6 +855,8 @@ Summary output language: {config.get_language_name(output_language)}
         print("🧠 Generating summary...", flush=True)
         streamed_chunks = []
         try:
+            if self.summarizer is None:
+                self.summarizer = OllamaSummarizer()
             for chunk in self.summarizer.summarize_transcript_streaming(
                 text_for_summary, duration_minutes, output_language, notes_text,
                 progress_callback=_emit_progress,
@@ -1447,9 +1446,6 @@ def process_streaming(audio_file, name, notes, live_transcript, append_to):
             return
 
         # Step 2: Stream summary
-        if recorder.summarizer is None:
-            recorder.summarizer = OllamaSummarizer()
-
         from src.config import get_config
         config = get_config()
         configured_language = config.get_language()
@@ -1467,6 +1463,8 @@ def process_streaming(audio_file, name, notes, live_transcript, append_to):
         summary_heartbeat = _start_summary_heartbeat()
         _stream_error = None
         try:
+            if recorder.summarizer is None:
+                recorder.summarizer = OllamaSummarizer()
             for chunk in recorder.summarizer.summarize_transcript_streaming(
                 text_for_summary, duration_minutes, output_language, notes_text,
                 progress_callback=_emit_progress,
@@ -3281,11 +3279,6 @@ def reprocess(summary_file, regenerate_title, retranscribe):
             existing_session_info, transcript, get_config().get_language()
         )
 
-        # Use streaming summarization (same as new recordings)
-        if recorder.summarizer is None:
-            from src.summarizer import OllamaSummarizer
-            recorder.summarizer = OllamaSummarizer()
-
         print("Generating summary...", flush=True)
         streamed_chunks = []
         # Same watchdog-liveness cover as process_streaming: model load +
@@ -3293,6 +3286,11 @@ def reprocess(summary_file, regenerate_title, retranscribe):
         summary_heartbeat = _start_summary_heartbeat()
         _stream_error = None
         try:
+            # Initialization can reject a disabled/unavailable provider before
+            # streaming starts. Surface it through the same user-safe protocol.
+            if recorder.summarizer is None:
+                from src.summarizer import OllamaSummarizer
+                recorder.summarizer = OllamaSummarizer()
             for chunk in recorder.summarizer.summarize_transcript_streaming(
                 transcript, duration_minutes, output_language, notes_text,
                 progress_callback=_emit_progress,
@@ -3722,15 +3720,14 @@ def generate_report(summary_file, template_id):
             persisted_info, transcript, config.get_language()
         )
 
-    if recorder.summarizer is None:
-        from src.summarizer import OllamaSummarizer
-        recorder.summarizer = OllamaSummarizer()
-
     print("Generating report...", flush=True)
     streamed_chunks = []
     summary_heartbeat = _start_summary_heartbeat()
     _stream_error = None
     try:
+        if recorder.summarizer is None:
+            from src.summarizer import OllamaSummarizer
+            recorder.summarizer = OllamaSummarizer()
         for chunk in recorder.summarizer.summarize_transcript_streaming(
             transcript, duration_minutes, output_language, notes_text,
             progress_callback=_emit_progress,

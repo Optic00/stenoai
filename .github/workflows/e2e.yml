@@ -231,6 +231,8 @@ jobs:
           ditto "bin/Steno Apple LM.app" "build/apple-lm-smoke/Steno Apple LM.app"
           codesign --force --deep --sign - --options runtime "build/apple-lm-smoke/Steno Apple LM.app"
           export STENOAI_DISABLE_APPLE_LM=0
+          export STENOAI_ENABLE_EXPERIMENTAL_APPLE_LM=1
+          export STENOAI_USER_DATA_DIR="$(mktemp -d)"
           export STENOAI_E2E=1
           export STENOAI_APPLE_LM_BIN="$PWD/build/apple-lm-smoke/Steno Apple LM.app/Contents/MacOS/steno-apple-lm"
           python3 - <<'PY'
@@ -238,7 +240,10 @@ jobs:
 
           status = apple_lm_status()
           assert isinstance(status.get("available"), bool), status
-          assert status.get("reason") != "sidecar_error", status
+          assert status.get("reason") not in {
+              "sidecar_error", "sidecar_missing", "experimental_disabled",
+              "disabled", "unsupported_os",
+          }, status
           print(status)
           PY
 

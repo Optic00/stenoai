@@ -38,6 +38,9 @@ from src.summarizer import OllamaSummarizer, resolve_num_ctx
 class BaseAppleLMTest(unittest.TestCase):
     def setUp(self):
         reset_apple_lm_cache()
+        self._experiment = mock.patch.dict(os.environ, {"STENOAI_ENABLE_EXPERIMENTAL_APPLE_LM": "1"})
+        self._experiment.start()
+        self.addCleanup(self._experiment.stop)
         self._old_config_instance = config_module._config_instance
         config_module._config_instance = None
         self._tmp_dir = tempfile.TemporaryDirectory()
@@ -55,6 +58,47 @@ class BaseAppleLMTest(unittest.TestCase):
 
 
 class AppleLMResolutionTests(BaseAppleLMTest):
+    def test_experimental_gate_is_default_off_and_cannot_be_bypassed_by_fixture(self):
+        for value in (None, "0", "true", "yes"):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {
+                "STENOAI_DISABLE_APPLE_LM": "0",
+                "STENOAI_E2E": "1",
+                "STENOAI_APPLE_LM_STATE_FILE": str(Path(self._tmp_dir.name) / "missing"),
+            }), mock.patch("src.apple_lm.sys.platform", "darwin"), \
+                 mock.patch("src.apple_lm._run_apple_lm") as run:
+                if value is None:
+                    os.environ.pop("STENOAI_ENABLE_EXPERIMENTAL_APPLE_LM", None)
+                else:
+                    os.environ["STENOAI_ENABLE_EXPERIMENTAL_APPLE_LM"] = value
+                self.assertEqual(apple_lm_status(), {"available": False, "reason": "experimental_disabled"})
+                self.assertIsNone(resolve_apple_lm_bin())
+                self.assertFalse(apple_lm_should_list())
+                self.assertTrue(apple_lm_should_list(selected=True))
+                with self.assertRaisesRegex(RuntimeError, "experimental and disabled"):
+                    complete("synthetic")
+                with self.assertRaisesRegex(RuntimeError, "experimental and disabled"):
+                    list(stream_complete("synthetic"))
+                run.assert_not_called()
+
+    def test_disabling_experiment_overrides_cached_available_status(self):
+        with mock.patch.dict(os.environ, {
+            "STENOAI_DISABLE_APPLE_LM": "0",
+            "STENOAI_ENABLE_EXPERIMENTAL_APPLE_LM": "0",
+        }), mock.patch("src.apple_lm.sys.platform", "darwin"), \
+             mock.patch("src.apple_lm._STATUS_CACHE", {"available": True}), \
+             mock.patch("src.apple_lm._STATUS_CACHE_BIN", "/synthetic/helper"), \
+             mock.patch("src.apple_lm.resolve_apple_lm_bin") as resolve:
+            self.assertEqual(apple_lm_status()["reason"], "experimental_disabled")
+        resolve.assert_not_called()
+
+    def test_kill_switch_wins_over_experimental_opt_in(self):
+        with mock.patch.dict(os.environ, {
+            "STENOAI_DISABLE_APPLE_LM": "1",
+            "STENOAI_ENABLE_EXPERIMENTAL_APPLE_LM": "1",
+        }):
+            self.assertEqual(apple_lm_status()["reason"], "disabled")
+            self.assertIsNone(resolve_apple_lm_bin())
+
     def test_is_apple_system_model(self):
         self.assertTrue(is_apple_system_model("apple:system"))
         self.assertFalse(is_apple_system_model("gemma4:e2b-it-qat"))
@@ -548,7 +592,9 @@ class AppleLMConfigOptInTests(BaseAppleLMTest):
             config = Config(config_path=Path(self._tmp_dir.name) / "config.json")
             info = config.get_model_info(APPLE_SYSTEM_MODEL)
         self.assertIsNotNone(info)
-        self.assertEqual(info["name"], "Apple Intelligence")
+        self.assertEqual(info["name"], "Apple Intelligence (Experimental)")
+        self.assertEqual(info["quality"], "experimental")
+        self.assertIn("may omit facts or invent details", info["description"])
         self.assertEqual(info["params"], "OS-managed")
         status.assert_not_called()
 
