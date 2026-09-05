@@ -66,13 +66,18 @@ const { registerSpeakerIpc } = require('./speaker-ipc');
 const { registerObsidianSync } = require('./obsidian-sync');
 const { registerObsidianIpc } = require('./obsidian-ipc');
 const { isSafeToAutoInstall } = require('./update-idle-gate');
-const { describeUpdateError, updateErrorPhase } = require('./update-error-copy');
+const { describeUpdateError, updateErrorPhase, isMissingUpdateFeedError } = require('./update-error-copy');
 const { isOSUpdateEligible, MIN_MACOS_FOR_AUTOUPDATE } = require('./update-os-gate');
 const processingLog = require('./processing-log');
 const { isMeetingApp, allowsDeviceLevelFallback, isMacos14Plus } = require('./meeting-detect');
+const { isLinuxLoopbackSupported, startLoopbackCapture, createFrameAligner, createSerialQueue } = require('./linux-loopback');
 const { sweepOrphanedLiveSnapshots } = require('./live-snapshot-sweep');
 const { userNotesFilePath } = require('./notes-file');
-const { buildNoteReadyNotificationOptions, buildTranscriptReadyBody } = require('./notification-copy');
+const {
+  buildNoteReadyNotificationOptions,
+  buildTranscriptReadyBody,
+  buildCaptureErrorBody,
+} = require('./notification-copy');
 const { makeLineReader } = require('./backend-stream');
 // Pure deep-link (stenoai://) parsing/sanitizing lives in ./shortcut-url
 // (unit-tested). The stateful side — window creation, IPC dispatch,
@@ -271,7 +276,11 @@ function isAutoDetectSupported() {
 // Whether system-audio (loopback) capture is available on this OS at all.
 // macOS: CoreAudio Process Tap (14.4+). Windows: electron-audio-loopback uses
 // Chromium's WASAPI loopback on Windows 10+ (both Win10 and Win11 report major
-// version 10). Linux: not wired. Drives the Settings/MainToolbar toggle.
+// version 10). Linux: a PipeWire monitor-port capture (see ./linux-loopback.js)
+// bypassing Chromium's getDisplayMedia path entirely — that path would route
+// through xdg-desktop-portal's ScreenCast picker on Wayland just to get a
+// throwaway video track, a real UX regression versus mac/Windows showing no
+// dialog at all. Drives the Settings/MainToolbar toggle.
 function isSystemAudioSupported() {
   if (process.platform === 'darwin') return isCoreAudioTapSupported();
   if (process.platform === 'win32') {
@@ -282,6 +291,7 @@ function isSystemAudioSupported() {
       return true; // assume a modern Windows if the version probe fails
     }
   }
+  if (process.platform === 'linux') return isLinuxLoopbackSupported();
   return false;
 }
 
@@ -6730,12 +6740,14 @@ function setupAutoUpdater() {
     // download is still running forever, and About would show a stuck
     // progress bar with no way to tell it failed.
     pendingDownloadPercent = null;
-    // Until a release carrying this platform's update feed (latest.yml on
-    // Windows) is published, the updater 404s on the feed file. That's an
-    // expected transitional state, not a real failure — log it quietly so it
-    // doesn't read as a scary stack trace for alpha testers, and don't
-    // surface it to the renderer as an error.
-    if (/latest(-mac)?\.yml/i.test(msg) && /(404|cannot find)/i.test(msg)) {
+    // Until a release carrying this platform's update feed is published
+    // (latest.yml on Windows, latest-linux*.yml on Linux — which ships none
+    // at all today), the updater 404s on the feed file. That's an expected
+    // state, not a real failure — log it quietly so it doesn't read as a
+    // scary stack trace for alpha testers, and don't surface it to the
+    // renderer as an error. See isMissingUpdateFeedError for why the match
+    // is not spelled out inline any more.
+    if (isMissingUpdateFeedError(msg)) {
       sendDebugLog('Auto-updater: no update feed published for this release yet — skipping.');
       return;
     }
@@ -8336,16 +8348,20 @@ ipcMain.handle('show-silence-auto-stop-notification', async (_event, payload) =>
 });
 
 // Fired by useSystemAudioCapture.ts when an enabled loopback acquisition
-// genuinely fails (for example, System Audio Recording permission is denied).
-// It is not fired when the user turns system audio off or the OS is unsupported.
-// Clicking it opens Settings via the same tray-open-settings event the tray
-// menu uses.
+// genuinely fails (for example, System Audio Recording permission is denied),
+// or when a live Linux capture dies mid-recording. It is not fired when the
+// user turns system audio off or the OS is unsupported. Clicking it opens
+// Settings via the same tray-open-settings event the tray menu uses.
 ipcMain.handle('show-system-audio-mic-only-notification', async () => {
   try {
     if (!(await notificationsEnabled())) return { success: true, shown: false };
     const notif = new Notification({
       title: 'Recording mic-only',
-      body: 'System audio could not be captured. Check Steno’s Screen & System Audio Recording access in System Settings.',
+      // The permissions hint is macOS-only; elsewhere there is no such setting
+      // to send the user to.
+      body: process.platform === 'darwin'
+        ? 'System audio could not be captured. Check Steno’s Screen & System Audio Recording access in System Settings.'
+        : 'System audio could not be captured. Continuing with the microphone only.',
       iconType: 'alert',
     });
     notif.on('click', () => {
@@ -9473,6 +9489,66 @@ ipcMain.handle('close-system-audio-file', async () => {
   }
 });
 
+// Linux system-audio loopback — spawns pw-record and streams raw PCM to the
+// renderer instead of going through Chromium's capture path (see
+// ./linux-loopback.js for why). Module-level, like activeSysAudioWriteStream.
+let activeLinuxLoopback = null;
+
+// Serialises start/stop — see createSerialQueue in ./linux-loopback.js for why.
+const queueLinuxLoopback = createSerialQueue();
+
+ipcMain.handle('start-linux-loopback', () => queueLinuxLoopback(async () => {
+  try {
+    // Reclaim an unstopped prior capture, same as open-system-audio-file above
+    // — and not a rare race: a renderer reload remounts useSystemAudioCapture
+    // with a fresh activeRef, which restarts capture off main's still-
+    // 'recording' status. Leaving the old process running would feed the
+    // renderer's new subscription both streams interleaved, and stop-linux-
+    // loopback only knows the newer one.
+    if (activeLinuxLoopback) {
+      const prior = activeLinuxLoopback;
+      activeLinuxLoopback = null;
+      sendDebugLog('[linux-loopback] abandoning unstopped prior capture');
+      prior.stdout.removeAllListeners('data');
+      await prior.stop();
+    }
+    const capture = await startLoopbackCapture({
+      onError: (err) => sendDebugLog(`[linux-loopback] capture error: ${err.message}`),
+    });
+    const align = createFrameAligner(2 * capture.channels); // s16 = 2 bytes/sample
+    capture.stdout.on('data', (chunk) => {
+      const whole = align(chunk);
+      if (whole) mainWindow?.webContents.send('linux-loopback-chunk', whole);
+    });
+    capture.proc.on('exit', (code, signal) => {
+      // stop() clears the ref before killing, so reaching here still-referenced
+      // means pw-record died on its own. Tell the renderer — otherwise the
+      // recording continues with a dead system channel and no warning.
+      if (activeLinuxLoopback?.proc === capture.proc) {
+        sendDebugLog(`[linux-loopback] pw-record exited unexpectedly (code=${code}, signal=${signal})`);
+        activeLinuxLoopback = null;
+        mainWindow?.webContents.send('linux-loopback-ended', { code, signal });
+      }
+    });
+    activeLinuxLoopback = capture;
+    sendDebugLog(`[linux-loopback] capturing from ${capture.target}`);
+    return { success: true, sampleRate: capture.sampleRate, channels: capture.channels };
+  } catch (error) {
+    sendDebugLog(`[linux-loopback] start failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}));
+
+ipcMain.handle('stop-linux-loopback', () => queueLinuxLoopback(async () => {
+  const capture = activeLinuxLoopback;
+  activeLinuxLoopback = null;
+  if (!capture) return { success: true };
+  capture.stdout.removeAllListeners('data');
+  await capture.stop();
+  sendDebugLog('[linux-loopback] stopped');
+  return { success: true };
+}));
+
 // A failed renderer-side capture (mic permission denied, no audio device)
 // would otherwise be silent — the optimistic "recording" pill is dropped via
 // system-audio-recording-state, but the user gets no reason. Surface a native
@@ -9492,11 +9568,13 @@ function showRecordingFailedNotification(body) {
   }
 }
 
-ipcMain.on('recording-capture-error', (_event, message) => {
-  sendDebugLog(`[sysaudio] capture error: ${message}`);
-  showRecordingFailedNotification(
-    message ? `Recording couldn't start: ${message}` : "Recording couldn't start.",
-  );
+ipcMain.on('recording-capture-error', (_event, message, name, phase) => {
+  // The raw text stays in the debug log, where it is what a diagnosis needs —
+  // and ONLY there. What reaches the notification is prose built from the
+  // error's name and the caller's phase; see buildCaptureErrorBody for why the
+  // message itself is never consulted.
+  sendDebugLog(`[sysaudio] capture error (${phase || 'start'}): ${name ? `${name}: ` : ''}${message}`);
+  showRecordingFailedNotification(buildCaptureErrorBody({ name, phase }));
 });
 
 ipcMain.handle('process-system-audio-recording', async (event, audioFilePath, sessionName) => {

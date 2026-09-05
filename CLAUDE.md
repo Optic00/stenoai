@@ -91,7 +91,7 @@ scripts/build-apple-lm-sidecar.sh   # outputs bin/Steno Apple LM.app
 A custom electron-builder signing hook gives only the nested helper its App Sandbox entitlement and packages it under `Steno.app/Contents/Helpers/`.
 A development host without the SDK omits it and the app keeps Ollama `gemma4:e2b-it-qat`.
 Release builds set `STENOAI_REQUIRE_APPLE_LM_SIDECAR=1`, so a missing helper fails the build.
-The release workflow builds the helper separately with Xcode 27 and packages it beside the backend built on macOS 14, preserving the application's Sonoma compatibility floor.
+The release workflow builds the helper separately with Xcode 27 and packages it beside the backend built on macOS 15 with `MACOSX_DEPLOYMENT_TARGET=14.4`, preserving the application's Sonoma compatibility floor.
 Tests isolate with `STENOAI_DISABLE_APPLE_LM=1`; an unfrozen E2E process can inject a fake binary via `STENOAI_APPLE_LM_BIN` only when `STENOAI_E2E=1`.
 Windows/Linux never resolve the helper.
 

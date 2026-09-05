@@ -311,7 +311,11 @@ function install({ ipcMain }) {
     active: false,
     paused: false,
     processing: false,
-    sessionName: null,
+    // STENOAI_E2E_STALE_SESSION_NAME seeds the state main.js is left in after a
+    // capture start that failed in the renderer: no recording, but the session
+    // NAME retained. See the get-queue-status handler for why that state is not
+    // otherwise reachable through this mock.
+    sessionName: process.env.STENOAI_E2E_STALE_SESSION_NAME || null,
     // The append/resume target (summary file) of the active recording, mirrored
     // into get-queue-status.recordingSummaryFile so the detail view can match
     // "recording this note" by identity (not display name).
@@ -478,6 +482,10 @@ function install({ ipcMain }) {
   // real ipcMain.handle callback. Mirror the real handlers' return shapes from
   // app/main.js (get-ai-provider ~5950, org-* ~7990).
   const MOCKS = {
+    // The permissive default ({success:true}) would leave sampleRate/channels
+    // undefined, making the renderer's bytesPerFrame NaN. Mirror the real
+    // handler's shape (main.js start-linux-loopback) instead.
+    'start-linux-loopback': async () => ({ success: true, sampleRate: 48000, channels: 2 }),
     'start-recording-ui': async (_event, name, _trigger, appendTo) => {
       rec.active = true;
       rec.paused = false;
@@ -558,7 +566,20 @@ function install({ ipcMain }) {
         elapsedSeconds: rec.active
           ? Math.floor(((rec.paused ? rec.pausedAt : Date.now()) - rec.startedAt) / 1000)
           : 0,
-        sessionName: rec.active || rec.processing ? rec.sessionName : null,
+        // The real main.js does NOT clear currentRecordingSessionName when the
+        // renderer reports its capture inactive — it deliberately keeps the
+        // name so a brief capture flap can't drop the "which meeting is live"
+        // label, on the assumption that "a stale name while hasRecording is
+        // false is inert" (main.js, system-audio-recording-state handler).
+        // This mock nulls it instead, which is a *more* correct contract than
+        // the app implements — and is why no T1 spec could ever reproduce the
+        // phantom "Recording" row a failed capture start left behind.
+        // STENOAI_E2E_STALE_SESSION_NAME reproduces main's actual behaviour so
+        // that regression stays covered; opt-in, so no existing spec shifts.
+        sessionName:
+          rec.active || rec.processing || process.env.STENOAI_E2E_STALE_SESSION_NAME
+            ? rec.sessionName
+            : null,
         recordingSummaryFile: rec.active ? rec.appendTo : null,
       };
     },
@@ -1491,6 +1512,11 @@ function install({ ipcMain }) {
     },
   };
 
+  // Invoked-channel log, readable from a spec via app.evaluate(). The
+  // contextBridge object is frozen, so a spec cannot spy on the renderer side;
+  // this is the observable seam for "which IPC did the renderer actually call".
+  global.__mockIpcCalls = [];
+
   const originalHandle = ipcMain.handle.bind(ipcMain);
   ipcMain.handle = (channel, realFn) => {
     let fn;
@@ -1507,8 +1533,12 @@ function install({ ipcMain }) {
       // never installed under mock IPC.
       fn = async () => ({ success: true });
     }
-    return originalHandle(channel, fn);
+    return originalHandle(channel, (...args) => {
+      global.__mockIpcCalls.push(channel);
+      return fn(...args);
+    });
   };
+
 }
 
 module.exports = { install };
