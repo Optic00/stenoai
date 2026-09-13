@@ -97,7 +97,8 @@ function TranscriptionSection() {
 
   const engine = engineQuery.data ?? 'parakeet';
   // Parakeet has the narrower language set; Whisper and the OpenAI-compatible
-  // cloud ASR (whisper-1 family) both offer the full 99-language list.
+  // cloud ASR expose Whisper language hints. Custom endpoints/models may
+  // support a subset; compatibility alone does not advertise capabilities.
   const options = engine === 'parakeet' ? LANGUAGES_PARAKEET : LANGUAGES_WHISPER;
   // useSetActiveTranscription coerces language to 'auto' when switching
   // to an engine that doesn't support the current pick. So by the time
@@ -411,24 +412,32 @@ function OpenAiAsrConfig() {
   const [apiKey, setApiKey] = React.useState('');
   const [saveError, setSaveError] = React.useState<string | null>(null);
   const keySaveTail = React.useRef<Promise<unknown>>(Promise.resolve());
+  const fieldEdits = React.useRef({ api_url: 0, model: 0 });
+  const dirtyFields = React.useRef({ api_url: false, model: false });
+  const keyEdit = React.useRef(0);
 
   React.useEffect(() => {
     if (config.data) {
-      setApiUrl(config.data.api_url);
-      setModel(config.data.model);
+      if (!dirtyFields.current.api_url) setApiUrl(config.data.api_url);
+      if (!dirtyFields.current.model) setModel(config.data.model);
     }
   }, [config.data?.api_url, config.data?.model]);
 
   const keySet = config.data?.api_key_set ?? false;
 
   const saveEndpointField = (field: 'api_url' | 'model', value: string) => {
+    const edit = fieldEdits.current[field];
     void setConfig.mutateAsync({ [field]: value })
       .then((saved) => {
+        if (fieldEdits.current[field] !== edit) return;
+        dirtyFields.current[field] = false;
         setSaveError(null);
         if (field === 'api_url') setApiUrl(saved.api_url ?? DEFAULT_OPENAI_ASR_URL);
         else setModel(saved.model ?? DEFAULT_OPENAI_ASR_MODEL);
       })
       .catch(() => {
+        if (fieldEdits.current[field] !== edit) return;
+        dirtyFields.current[field] = false;
         // The backend rejected or failed to save the edit. Restore the
         // displayed committed value instead of leaving a value that is not
         // actually active, especially important for an audio-upload endpoint.
@@ -439,6 +448,7 @@ function OpenAiAsrConfig() {
   };
 
   const saveKey = (key: string) => {
+    const edit = keyEdit.current;
     // Blur fires before a clicked Clear button. Serialize credential writes so
     // the later clear always commits after any replacement queued by blur.
     const operation = keySaveTail.current
@@ -453,7 +463,7 @@ function OpenAiAsrConfig() {
       .finally(() => {
         // Do not retain a plaintext credential in renderer state after either
         // outcome. The visible error is sufficient for retry.
-        setApiKey('');
+        if (keyEdit.current === edit) setApiKey('');
       });
   };
 
@@ -474,7 +484,11 @@ function OpenAiAsrConfig() {
         <Input
           id="openai-asr-api-url"
           value={apiUrl}
-          onChange={(e) => setApiUrl(e.target.value)}
+          onChange={(e) => {
+            fieldEdits.current.api_url += 1;
+            dirtyFields.current.api_url = true;
+            setApiUrl(e.target.value);
+          }}
           placeholder={t('settings.ai.cloudAsr.apiUrlPlaceholder')}
           onBlur={() => {
             // A cleared (or whitespace-only) field resets to the default URL
@@ -483,6 +497,7 @@ function OpenAiAsrConfig() {
             const next = apiUrl.trim() || DEFAULT_OPENAI_ASR_URL;
             if (next !== apiUrl) setApiUrl(next);
             if (next !== config.data?.api_url) saveEndpointField('api_url', next);
+            else dirtyFields.current.api_url = false;
           }}
           className={COMPACT_INPUT}
         />
@@ -498,7 +513,11 @@ function OpenAiAsrConfig() {
         <Input
           id="openai-asr-model"
           value={model}
-          onChange={(e) => setModel(e.target.value)}
+          onChange={(e) => {
+            fieldEdits.current.model += 1;
+            dirtyFields.current.model = true;
+            setModel(e.target.value);
+          }}
           placeholder={t('settings.ai.cloudAsr.modelPlaceholder')}
           onBlur={() => {
             // Same as the URL: a cleared field resets to the default model
@@ -506,6 +525,7 @@ function OpenAiAsrConfig() {
             const next = model.trim() || DEFAULT_OPENAI_ASR_MODEL;
             if (next !== model) setModel(next);
             if (next !== config.data?.model) saveEndpointField('model', next);
+            else dirtyFields.current.model = false;
           }}
           className={COMPACT_INPUT}
         />
@@ -523,7 +543,10 @@ function OpenAiAsrConfig() {
             id="openai-asr-api-key"
             type="password"
             value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
+            onChange={(e) => {
+              keyEdit.current += 1;
+              setApiKey(e.target.value);
+            }}
             placeholder={keySet ? '••••••••' : t('settings.ai.cloudAsr.apiKeyPlaceholder')}
             onBlur={() => {
               if (apiKey) {
@@ -538,6 +561,7 @@ function OpenAiAsrConfig() {
               size="sm"
               className={COMPACT_BTN}
               onClick={() => {
+                keyEdit.current += 1;
                 setApiKey('');
                 saveKey('');
               }}

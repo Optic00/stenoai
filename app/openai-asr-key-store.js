@@ -123,6 +123,22 @@ function readLegacyCredentialSnapshot({ fs, configPath }) {
   return readOpenAiAsrConfigSnapshot({ fs, configPath })?.legacy || null;
 }
 
+// Exclusive creation prevents following a pre-existing symlink. Only clean up
+// a path after this call acquired its file descriptor successfully.
+function writePrivateTemp(fs, target, bytes) {
+  const fd = fs.openSync(target, 'wx', 0o600);
+  try {
+    try {
+      fs.writeFileSync(fd, bytes);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (error) {
+    try { fs.unlinkSync(target); } catch (_) {}
+    throw error;
+  }
+}
+
 function clearedMarkerPath(keyPath) {
   return `${keyPath}.cleared`;
 }
@@ -138,17 +154,19 @@ function isEncryptedKeyCleared({ fs, keyPath }) {
  */
 function markEncryptedKeyClearedAtomically({ fs, path, processId, now, keyPath }) {
   const markerPath = clearedMarkerPath(keyPath);
-  const tempPath = `${markerPath}.${processId}.${now}.tmp`;
+  const tempPath = `${markerPath}.${processId}.${now}.${crypto.randomUUID()}.tmp`;
   const keyDir = path.dirname(keyPath);
+  let tempCreated = false;
 
   if (!fs.existsSync(keyDir)) fs.mkdirSync(keyDir, { recursive: true });
   if (!fs.existsSync(markerPath)) {
     try {
-      fs.writeFileSync(tempPath, 'cleared\n', { mode: 0o600 });
+      writePrivateTemp(fs, tempPath, 'cleared\n');
+      tempCreated = true;
       fs.renameSync(tempPath, markerPath);
     } catch (error) {
       try {
-        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        if (tempCreated && fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
       } catch (_) {}
       throw new Error('OpenAI ASR API key clear state was not saved', { cause: error });
     }
@@ -209,10 +227,11 @@ function loadEncryptedKeyForOrigin({ fs, keyPath, origin, safeStorage }) {
  * be mistaken for "there was no previous credential".
  */
 function saveEncryptedKeyAtomically({ fs, path, processId, now, keyPath, key, origin, safeStorage }) {
-  const tempPath = `${keyPath}.${processId}.${now}.tmp`;
+  const tempPath = `${keyPath}.${processId}.${now}.${crypto.randomUUID()}.tmp`;
   const rollbackPath = `${tempPath}.rollback`;
   const markerPath = clearedMarkerPath(keyPath);
   const keyDir = path.dirname(keyPath);
+  let tempCreated = false;
   let hadPrevious = false;
   let previous = null;
   let rollbackPrepared = false;
@@ -233,11 +252,12 @@ function saveEncryptedKeyAtomically({ fs, path, processId, now, keyPath, key, or
 
     const envelope = JSON.stringify({ version: 1, origin, key });
     const encrypted = safeStorage.encryptString(envelope);
-    fs.writeFileSync(tempPath, encrypted, { mode: 0o600 });
+    writePrivateTemp(fs, tempPath, encrypted);
+    tempCreated = true;
     if (hadPrevious) {
       // Prepare the encrypted recovery blob before replacing keyPath. A disk
       // error can therefore abort while the old path is still authoritative.
-      fs.writeFileSync(rollbackPath, previous, { mode: 0o600 });
+      writePrivateTemp(fs, rollbackPath, previous);
       rollbackPrepared = true;
     }
     fs.renameSync(tempPath, keyPath);
@@ -270,7 +290,7 @@ function saveEncryptedKeyAtomically({ fs, path, processId, now, keyPath, key, or
     const rollbackFailures = [];
 
     try {
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      if (tempCreated && fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
     } catch (cleanupError) {
       rollbackFailures.push(cleanupError);
     }

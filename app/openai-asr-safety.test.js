@@ -21,6 +21,14 @@ const {
 
 const source = fs.readFileSync(path.join(__dirname, 'main.js'), 'utf8');
 
+function sourceBetween(startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  assert.ok(start >= 0, `Missing start marker: ${startMarker}`);
+  const end = source.indexOf(endMarker, start + startMarker.length);
+  assert.ok(end > start, `Missing end marker: ${endMarker}`);
+  return source.slice(start, end);
+}
+
 test('OpenAI ASR plaintext-key migration runs at application startup', () => {
   const ready = source.indexOf('app.whenReady().then(async () => {');
   const migration = source.indexOf('void migrateLegacyOpenAiAsrApiKey();', ready);
@@ -32,9 +40,9 @@ test('OpenAI ASR plaintext-key migration runs at application startup', () => {
 });
 
 test('transcription launches use one config snapshot for endpoint and legacy key', () => {
-  const launch = source.slice(
-    source.indexOf('function getTranscriptionEnv()'),
-    source.indexOf('// Read the Python-side ai_provider config'),
+  const launch = sourceBetween(
+    'function getTranscriptionEnv()',
+    '// Read the Python-side ai_provider config',
   );
   assert.match(launch, /STENOAI_OAI_API_KEY/);
   assert.match(launch, /STENOAI_OAI_API_ORIGIN/);
@@ -241,9 +249,9 @@ test('missing config defaults, but inaccessible config fails closed without an e
 });
 
 test('main keeps an unreadable config distinct from an absent legacy key', () => {
-  const credentialFlow = source.slice(
-    source.indexOf('function readLegacyOpenAiAsrCredential()'),
-    source.indexOf('// Build the env additions a Python AI-driven subprocess needs.'),
+  const credentialFlow = sourceBetween(
+    'function readLegacyOpenAiAsrCredential()',
+    '// Build the env additions a Python AI-driven subprocess needs.',
   );
   assert.match(credentialFlow, /OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE/);
   assert.match(
@@ -300,9 +308,9 @@ test('legacy snapshots digest raw keys but expose only valid normalized credenti
 });
 
 test('main sends only the legacy snapshot digest to the cleanup CLI', () => {
-  const migration = source.slice(
-    source.indexOf('async function migrateLegacyOpenAiAsrApiKey('),
-    source.indexOf('// Build the env additions a Python AI-driven subprocess needs.'),
+  const migration = sourceBetween(
+    'async function migrateLegacyOpenAiAsrApiKey(',
+    '// Build the env additions a Python AI-driven subprocess needs.',
   );
   assert.match(migration, /STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST: legacy\.snapshotDigest/);
   assert.doesNotMatch(migration, /\['remove-legacy-openai-asr-api-key',\s*legacy\.key\]/);
@@ -445,10 +453,11 @@ test('rollback filesystem failure retains an encrypted recovery copy of the old 
   withKeyDirectory((keyPath) => {
     const previous = encrypted('old-key');
     fs.writeFileSync(keyPath, previous);
-    const rollbackPath = `${keyPath}.123.456.tmp.rollback`;
+    let rollbackPath;
     const fsImpl = Object.create(fs);
     fsImpl.renameSync = (source, target) => {
-      if (source === rollbackPath && target === keyPath) {
+      if (source.endsWith('.rollback') && target === keyPath) {
+        rollbackPath = source;
         throw new Error('restore rename failed');
       }
       return fs.renameSync(source, target);
@@ -600,3 +609,79 @@ test('main process consults durable clear state before load and legacy migration
   assert.match(source, /if \(action === 'remove-legacy'\)/);
   assert.match(source, /markOpenAiAsrKeyCleared\(\)/);
 });
+
+for (const kind of ['key', 'rollback', 'clear']) {
+  test(`${kind} temporary-file collision never overwrites or removes another file`, () => {
+    withKeyDirectory((keyPath) => {
+      save(keyPath, 'old-key');
+      const victim = path.join(path.dirname(keyPath), 'victim');
+      fs.writeFileSync(victim, 'untouched');
+      let collisionPath;
+      const fsImpl = Object.create(fs);
+      fsImpl.openSync = (target, flags, mode) => {
+        assert.strictEqual(flags, 'wx');
+        assert.strictEqual(mode, 0o600);
+        const selected = kind === 'rollback' ? target.endsWith('.rollback')
+          : kind === 'clear' ? target.includes('.cleared.') : !target.endsWith('.rollback');
+        if (selected) {
+          collisionPath = target;
+          if (process.platform === 'win32') fs.writeFileSync(target, 'untouched');
+          else fs.symlinkSync(victim, target);
+        }
+        return fs.openSync(target, flags, mode);
+      };
+      assert.throws(() => kind === 'clear'
+        ? markEncryptedKeyClearedAtomically({ fs: fsImpl, path, keyPath, processId: 123, now: 456 })
+        : save(keyPath, 'new-key', safeStorage(), fsImpl));
+      assert.ok(collisionPath);
+      assert.strictEqual(fs.readFileSync(victim, 'utf8'), 'untouched');
+      assert.strictEqual(fs.readFileSync(collisionPath, 'utf8'), 'untouched');
+      assert.strictEqual(decryptedEnvelope(keyPath).key, 'old-key');
+    });
+  });
+}
+
+test('failed partial temporary write is cleaned without changing the old credential', () => {
+  withKeyDirectory((keyPath) => {
+    save(keyPath, 'old-key');
+    const fsImpl = Object.create(fs);
+    fsImpl.writeFileSync = (fd) => {
+      fs.writeSync(fd, Buffer.from('partial'));
+      throw new Error('disk full');
+    };
+    assert.throws(() => save(keyPath, 'new-key', safeStorage(), fsImpl));
+    assert.strictEqual(decryptedEnvelope(keyPath).key, 'old-key');
+    assert.deepStrictEqual(fs.readdirSync(path.dirname(keyPath)), [path.basename(keyPath)]);
+  });
+});
+
+test('source slices fail loudly when either marker is missing', () => {
+  assert.throws(() => sourceBetween('missing-start', 'missing-end'), /Missing start marker/);
+  assert.throws(() => sourceBetween('function getTranscriptionEnv()', 'missing-end'), /Missing end marker/);
+});
+
+for (const migrated of [true, false]) {
+  test(`key rotation awaits plaintext cleanup (cleanup succeeds: ${migrated})`, async () => {
+    const vm = require('node:vm');
+    let handler;
+    let stored = 'old-key';
+    let resolveMigration;
+    const pending = new Promise((resolve) => { resolveMigration = resolve; });
+    vm.runInNewContext(sourceBetween(
+      "ipcMain.handle('set-openai-asr-key',",
+      "ipcMain.handle('list-parakeet-models',",
+    ), {
+      ipcMain: { handle: (_name, callback) => { handler = callback; } },
+      migrateLegacyOpenAiAsrApiKey: () => pending,
+      getOpenAiAsrEndpointOrigin: () => ORIGIN,
+      saveOpenAiAsrKey: (key) => { stored = key; return true; },
+      loadOpenAiAsrKey: () => stored,
+    });
+    const resultPromise = handler({}, 'replacement-key');
+    assert.strictEqual(stored, 'old-key', 'rotation must wait for cleanup');
+    resolveMigration(migrated);
+    const result = await resultPromise;
+    assert.strictEqual(result.success, migrated);
+    assert.strictEqual(stored, migrated ? 'replacement-key' : 'old-key');
+  });
+}

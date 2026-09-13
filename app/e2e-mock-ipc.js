@@ -656,6 +656,9 @@ function install({ ipcMain }) {
       model: state.openAiAsrModel,
     }),
     'set-openai-asr-config': async (_event, cfg) => {
+      if (process.env.STENOAI_E2E_OAI_ASR_CONFIG_RACE === '1') {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
       if (process.env.STENOAI_E2E_OAI_ASR_SAVE_FAIL === '1') {
         return { success: false, error: 'mock save rejected' };
       }
@@ -673,7 +676,7 @@ function install({ ipcMain }) {
         return { success: false, error: 'mock save rejected' };
       }
       if (process.env.STENOAI_E2E_OAI_ASR_KEY_RACE === '1' && key) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await new Promise((resolve) => setTimeout(resolve, 500));
       }
       state.openAiAsrKeySet = Boolean(key);
       return { success: true, api_key_set: state.openAiAsrKeySet };

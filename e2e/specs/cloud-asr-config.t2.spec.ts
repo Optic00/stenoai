@@ -1,7 +1,7 @@
 import { test, expect } from '../fixtures/electron';
 import { realUserDataDir, fileSig } from '../fixtures/real-user-data';
 import { readUserConfig } from '../fixtures/user-config';
-import { existsSync } from 'fs';
+import { existsSync, writeFileSync } from 'fs';
 import path from 'path';
 
 /**
@@ -125,6 +125,18 @@ test('openai-asr API key is stored encrypted (safeStorage), not in config.json',
   await expect.poll(async () => (await getConfig(page)).api_key_set).toBe(true);
   // ...and the plaintext key never appears in config.json.
   expect(JSON.stringify(readUserConfig(userDataDir))).not.toContain(SECRET);
+
+  // Introduce a legacy value after startup migration has completed, then
+  // rotate directly: success must not depend on a later settings refresh.
+  writeFileSync(path.join(userDataDir, 'config.json'), JSON.stringify({
+    ...readUserConfig(userDataDir),
+    openai_asr_api_key: 'legacy-synthetic-key',
+  }));
+  const rotation = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.openaiAsr.setKey('replacement-synthetic-key'),
+  );
+  expect(rotation.success).toBe(true);
+  expect(readUserConfig(userDataDir)).not.toHaveProperty('openai_asr_api_key');
 
   // A bearer token is scoped to the canonical endpoint origin. Changing the
   // provider must leave the encrypted blob inert until the user saves a key
