@@ -71,6 +71,7 @@ export interface Meeting {
    *  the audio (re-transcribe, speaker samples, any future re-diarization) is
    *  quietly unavailable without it. */
   has_audio?: boolean;
+  steno_transfer?: { sourceMeetingID: string };
   /** User notes as persisted + returned by the backend (`_parse_meeting_markdown` -> `user_notes`). */
   user_notes?: string | null;
   /** Renderer-side notes for the in-progress / draft recording (live + processing views). */
@@ -1004,6 +1005,11 @@ export interface ShortcutStartRecordingEvent {
   sessionName: string | null;
 }
 
+export interface MeetingTransferImportedEvent {
+  summaryFile: string;
+  duplicate: boolean;
+}
+
 // ---------- bridge shape ----------
 type RequestFn<Args extends unknown[], Res> = (...args: Args) => Promise<Res>;
 type SendFn<Args extends unknown[]> = (...args: Args) => void;
@@ -1151,6 +1157,15 @@ export interface StenoaiBridge {
       Result<Record<string, never>>
     >;
     deleteReport: RequestFn<[summaryFile: string, reportId: string], Result<Record<string, never>>>;
+  };
+
+  meetingTransfer: {
+    importPackage: RequestFn<
+      [filePath?: string],
+      Result<{ cancelled?: boolean; summaryFile?: string; duplicate?: boolean }>
+    >;
+    exportPackage: RequestFn<[summaryFile: string], Result<{ cancelled?: boolean }>>;
+    ready: RequestFn<[], Result<Record<string, never>>>;
   };
 
   query: {
@@ -1438,6 +1453,7 @@ export interface StenoaiBridge {
     generateNotesRequested: Subscribe<{ summaryFile: string; name?: string | null }>;
     navigateToMeeting: Subscribe<{ summaryFile: string }>;
     trayOpenSettings: Subscribe<void>;
+    meetingTransferImported: Subscribe<MeetingTransferImportedEvent>;
     showQuitDialog: Subscribe<{ type: 'recording' | 'processing'; jobCount?: number }>;
     showNotification: Subscribe<{
       id?: string;

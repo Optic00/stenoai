@@ -3073,6 +3073,33 @@ def _parse_meeting_markdown(md_path):
     }
 
 
+def _has_transfer_audio(summary_file, stem, receipt):
+    """Only report retained tracks in this meeting's own non-symlink media tree."""
+    if not isinstance(receipt, dict) or not re.fullmatch(
+        r"transfer_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", stem
+    ):
+        return False
+    tracks = receipt.get("audio")
+    if receipt.get("mediaDirectory") != stem or not isinstance(tracks, list) or len(tracks) > 15:
+        return False
+    try:
+        root = summary_file.parent.resolve() / ".meeting-transfer"
+        media = root / stem
+        for directory in (root, media):
+            if directory.is_symlink() or not directory.is_dir() or directory.resolve() != directory:
+                return False
+        for index, track in enumerate(tracks, 1):
+            name = f"track-{index}.caf"
+            if not isinstance(track, dict) or track.get("name") != name:
+                continue
+            candidate = media / name
+            if not candidate.is_symlink() and candidate.is_file() and candidate.stat().st_size > 0:
+                return True
+    except OSError:
+        pass
+    return False
+
+
 @cli.command()
 def list_meetings():
     """List all processed meetings - optimized for fast loading"""
@@ -3160,6 +3187,7 @@ def list_meetings():
     # Single-pass: read each file once, extract sort key and data together
     for summary_file, stem in summaries:
         try:
+            transfer_receipt = None
             if summary_file.suffix == '.md':
                 parsed = _parse_meeting_markdown(summary_file)
                 sort_key = parsed.get('session_info', {}).get('processed_at', '')
@@ -3174,6 +3202,7 @@ def list_meetings():
             else:
                 with open(summary_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
+                    transfer_receipt = data.get("steno_transfer")
                     sort_key = data.get('session_info', {}).get('processed_at', '')
                     essential_meeting = {
                         "session_info": data.get("session_info", {}),
@@ -3194,7 +3223,9 @@ def list_meetings():
             # future re-diarization) is silently unavailable without it,
             # with nothing in the list saying so until you open the note
             # and find the action missing.
-            essential_meeting['has_audio'] = stem in audio_stems
+            essential_meeting['has_audio'] = stem in audio_stems or _has_transfer_audio(
+                summary_file, stem, transfer_receipt
+            )
             meetings.append((sort_key, essential_meeting))
         except Exception as e:
             logger.warning(f"Failed to load {summary_file}: {e}")
@@ -3457,10 +3488,10 @@ def reprocess(summary_file, regenerate_title, retranscribe):
         if summary_path.suffix == '.md':
             session_name = existing_data.get('session_info', {}).get('name', 'Reprocessed')
             md_lines = ['---']
-            # This rebuild intentionally omits notes_generated: reprocessing a
-            # transcript-only note (#258) generates the summary, so the rewritten
-            # frontmatter naturally flips the meeting out of the "no notes yet"
-            # state. The state-flip is intended, not an accidental key drop.
+            # This rebuild intentionally omits notes_generated and notes_stale:
+            # reprocessing generates a current summary, so the rewritten
+            # frontmatter naturally flips the meeting out of both "no notes yet"
+            # and "notes are stale" states.
             md_meta = {
                 'title': session_name,
                 'date': existing_data.get('session_info', {}).get('processed_at', datetime.now().isoformat()),
@@ -3517,13 +3548,13 @@ def reprocess(summary_file, regenerate_title, retranscribe):
                 "key_points": parsed.get("key_points", []) or [],
                 "action_items": parsed.get("action_items", []) or [],
             })
-            # The regenerated summary now covers the full (possibly appended)
-            # transcript — clear the continue-recording stale marker. The .md
-            # branch clears it implicitly by omitting it from the rebuilt
-            # frontmatter (see the intentional-omission note above).
-            existing_data.get("session_info", {}).pop("notes_stale", None)
-            with open(summary_path, 'w') as f:
-                json.dump(existing_data, f, indent=2)
+            # The regenerated summary now covers the full transcript. Clear both
+            # cues that tell the UI to offer Generate notes; the .md branch does
+            # the same by omitting them from its rebuilt frontmatter.
+            session_info = existing_data.get("session_info", {})
+            session_info.pop("notes_generated", None)
+            session_info.pop("notes_stale", None)
+            _atomic_write_text(summary_path, json.dumps(existing_data, indent=2))
 
         # Signal completion only AFTER the note file is fully written. The
         # renderer reads the note the instant it sees STREAM_COMPLETE, so
@@ -3626,6 +3657,17 @@ def full_reprocess(meeting_stem, audio_file_override):
         existing_data = _parse_meeting_markdown(md_path)
     else:
         print(json.dumps({"success": False, "error": f"No summary found for meeting {meeting_stem!r}"}))
+        sys.exit(1)
+
+    # This maintenance command rebuilds from an owned recording and may delete
+    # its source. Transfer tracks instead belong to an immutable import receipt;
+    # do not hand one to that pipeline or replace its metadata with a new note.
+    if existing_data.get("steno_transfer") is not None:
+        print(json.dumps({
+            "success": False,
+            "error": "full-reprocess is not supported for imported Steno packages. "
+                     "Use reprocess to regenerate notes from the saved transcript.",
+        }))
         sys.exit(1)
 
     if audio_file_override:
