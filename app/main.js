@@ -74,13 +74,18 @@ const { registerSpeakerIpc } = require('./speaker-ipc');
 const { registerObsidianSync } = require('./obsidian-sync');
 const { registerObsidianIpc } = require('./obsidian-ipc');
 const { isSafeToAutoInstall } = require('./update-idle-gate');
-const { describeUpdateError, updateErrorPhase } = require('./update-error-copy');
+const { describeUpdateError, updateErrorPhase, isMissingUpdateFeedError } = require('./update-error-copy');
 const { isOSUpdateEligible, MIN_MACOS_FOR_AUTOUPDATE } = require('./update-os-gate');
 const processingLog = require('./processing-log');
 const { isMeetingApp, allowsDeviceLevelFallback, isMacos14Plus } = require('./meeting-detect');
+const { isLinuxLoopbackSupported, startLoopbackCapture, createFrameAligner, createSerialQueue } = require('./linux-loopback');
 const { sweepOrphanedLiveSnapshots } = require('./live-snapshot-sweep');
 const { userNotesFilePath } = require('./notes-file');
-const { buildNoteReadyNotificationOptions, buildTranscriptReadyBody } = require('./notification-copy');
+const {
+  buildNoteReadyNotificationOptions,
+  buildTranscriptReadyBody,
+  buildCaptureErrorBody,
+} = require('./notification-copy');
 const { makeLineReader } = require('./backend-stream');
 // Pure deep-link (stenoai://) parsing/sanitizing lives in ./shortcut-url
 // (unit-tested). The stateful side — window creation, IPC dispatch,
@@ -274,7 +279,11 @@ function isAutoDetectSupported() {
 // Whether system-audio (loopback) capture is available on this OS at all.
 // macOS: CoreAudio Process Tap (14.4+). Windows: electron-audio-loopback uses
 // Chromium's WASAPI loopback on Windows 10+ (both Win10 and Win11 report major
-// version 10). Linux: not wired. Drives the Settings/MainToolbar toggle.
+// version 10). Linux: a PipeWire monitor-port capture (see ./linux-loopback.js)
+// bypassing Chromium's getDisplayMedia path entirely — that path would route
+// through xdg-desktop-portal's ScreenCast picker on Wayland just to get a
+// throwaway video track, a real UX regression versus mac/Windows showing no
+// dialog at all. Drives the Settings/MainToolbar toggle.
 function isSystemAudioSupported() {
   if (process.platform === 'darwin') return isCoreAudioTapSupported();
   if (process.platform === 'win32') {
@@ -285,6 +294,7 @@ function isSystemAudioSupported() {
       return true; // assume a modern Windows if the version probe fails
     }
   }
+  if (process.platform === 'linux') return isLinuxLoopbackSupported();
   return false;
 }
 
@@ -783,7 +793,6 @@ const GOOGLE_CLIENT_SECRET = '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';
 // no extra userinfo API call needed.
 const GOOGLE_SCOPES = 'openid https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email';
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
-const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 
 // Outlook Calendar OAuth2 configuration (PKCE public client — no client secret)
 const OUTLOOK_CLIENT_ID = '53a8ba1f-3a2e-4fc9-afb1-b9b8ff13de19';
@@ -938,7 +947,7 @@ function trackEvent(eventName, properties = {}) {
         ...properties
       }
     });
-  } catch (error) {
+  } catch {
     // Silent fail -- telemetry must never break the app
   }
 }
@@ -981,7 +990,7 @@ async function shutdownTelemetry() {
       posthogClient = null;
       console.log('Telemetry shut down');
     }
-  } catch (error) {
+  } catch {
     // Silent fail
   }
 }
@@ -1913,7 +1922,7 @@ if (!gotSingleInstanceLock) {
         if (mainWindow && !mainWindow.isDestroyed()) {
           try {
             await mainWindow.webContents.executeJavaScript('stopSystemAudioRecording("quit")');
-          } catch (e) {
+          } catch {
             // Best effort -- file is saved even if processing doesn't start
           }
         }
@@ -2254,7 +2263,7 @@ if (!gotSingleInstanceLock) {
           _cachedCustomStoragePath = spData.storage_path;
           console.log('Custom storage path loaded:', _cachedCustomStoragePath);
         }
-      } catch (e) {
+      } catch {
         // Non-fatal - custom path just won't be cached
       }
     }
@@ -3565,7 +3574,7 @@ ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, questi
   let validated;
   try {
     validated = await validateMeetingFilePath(summaryFile);
-  } catch (err) {
+  } catch {
     // Defense-in-depth: validateMeetingFilePath is fail-closed and shouldn't
     // throw, but if it ever does (e.g. a future refactor), don't let it become
     // an unhandled rejection that can take down the main process.
@@ -3763,7 +3772,7 @@ ipcMain.on('chat-global-stream', (event, queryId, question, folderId) => {
             proc.kill();
             activeQueryProcs.delete(queryId);
           }
-        } catch (e) { /* ignore decode errors */ }
+        } catch { /* ignore decode errors */ }
       } else if (line === 'CHAT_STREAM_COMPLETE') {
         if (!event.sender.isDestroyed()) {
           event.sender.send('query-done', { queryId, success: true });
@@ -5290,7 +5299,6 @@ let recordingRuntimeState = {
 };
 let ollamaProcess = null;  // Track spawned Ollama process for cleanup on quit
 let ollamaPid = null;      // Store PID separately since unref() disconnects the process
-let ollamaStartedByUs = false;
 
 // Content-free crash/force-quit detection (report Appendix: ~8% of macOS
 // recordings never fire recording_stopped at all -- a silent gap in the
@@ -5428,7 +5436,7 @@ function makeInactivityWatchdog(proc, ms, label) {
       activeInactivityWatchdogs.delete(watchdog);
       console.error(`${label} produced no output for ${Math.round(ms / 60000)} minutes, killing`);
       sendDebugLog(`${label} inactive for ${Math.round(ms / 60000)} minutes — killing process`);
-      try { proc.kill(); } catch (e) { /* process already gone */ }
+      try { proc.kill(); } catch { /* process already gone */ }
     }, ms);
   };
   const watchdog = {
@@ -6452,7 +6460,7 @@ async function runSpeakerModelCommand(command) {
 ipcMain.handle('speaker-model-status', async () => {
   try {
     return await runSpeakerModelCommand('speaker-model-status');
-  } catch (error) {
+  } catch {
     sendDebugLog('Speaker diarization model status check failed');
     return {
       success: false,
@@ -6470,7 +6478,7 @@ ipcMain.handle('setup-speaker-models', async () => {
       sendDebugLog('Speaker diarization models ready');
     }
     return result;
-  } catch (error) {
+  } catch {
     sendDebugLog('Speaker diarization model setup failed');
     return {
       success: false,
@@ -6769,12 +6777,14 @@ function setupAutoUpdater() {
     // download is still running forever, and About would show a stuck
     // progress bar with no way to tell it failed.
     pendingDownloadPercent = null;
-    // Until a release carrying this platform's update feed (latest.yml on
-    // Windows) is published, the updater 404s on the feed file. That's an
-    // expected transitional state, not a real failure — log it quietly so it
-    // doesn't read as a scary stack trace for alpha testers, and don't
-    // surface it to the renderer as an error.
-    if (/latest(-mac)?\.yml/i.test(msg) && /(404|cannot find)/i.test(msg)) {
+    // Until a release carrying this platform's update feed is published
+    // (latest.yml on Windows, latest-linux*.yml on Linux — which ships none
+    // at all today), the updater 404s on the feed file. That's an expected
+    // state, not a real failure — log it quietly so it doesn't read as a
+    // scary stack trace for alpha testers, and don't surface it to the
+    // renderer as an error. See isMissingUpdateFeedError for why the match
+    // is not spelled out inline any more.
+    if (isMissingUpdateFeedError(msg)) {
       sendDebugLog('Auto-updater: no update feed published for this release yet — skipping.');
       return;
     }
@@ -6841,8 +6851,10 @@ const MIC_MONITOR_HEALTHY_RESET_MS = 30_000;
 // Browsers route media capture through helper sub-processes (Safari →
 // com.apple.WebKit.GPU, Chrome → com.google.Chrome.helper, etc.), so the raw
 // app_name reads as "Safari Graphics and Media" / "Google Chrome Helper".
-// Translate those back to the user-recognisable parent app name.
+// FaceTime, Phone.app and Continuity calls use the daemon "avconferenced".
+// Translate both back to the user-recognisable parent app name.
 const APP_NAME_OVERRIDES = [
+  { match: /^com\.apple\.avconferenced/, name: 'Call' },
   { match: /^com\.apple\.WebKit/, name: 'Safari' },
   { match: /^com\.google\.Chrome/, name: 'Google Chrome' },
   { match: /^org\.chromium\./, name: 'Chromium' },
@@ -7392,7 +7404,6 @@ ipcMain.handle('setup-ollama-and-model', async () => {
         }
       });
       ollamaProcess.unref();
-      ollamaStartedByUs = true;
     }
 
     // Wait for Ollama to be ready (poll with early exit detection).
@@ -7419,7 +7430,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
           sendDebugLog(`Ollama ready after ${i + 1} seconds`);
           break;
         }
-      } catch (e) {
+      } catch {
         // Continue polling
       }
     }
@@ -7590,7 +7601,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
             let json;
             try {
               json = JSON.parse(line);
-            } catch (e) {
+            } catch {
               // Non-JSON line, log as-is
               sendDebugLog(line);
               continue;
@@ -7623,7 +7634,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
             sendDebugLog('AI model download completed successfully');
             try {
               await runPythonScript('simple_recorder.py', ['set-model', DEFAULT_AI_MODEL], true);
-            } catch (e) {
+            } catch {
               // Non-fatal -- config reset is best-effort
             }
             trackEvent('setup_completed', { step: 'ollama_and_model' });
@@ -7657,28 +7668,29 @@ ipcMain.handle('setup-ollama-and-model', async () => {
 
 ipcMain.handle('setup-parakeet', async () => {
   try {
-    // Download Parakeet TDT v3 (~572 MB) via the bundled backend. Used by
-    // the Setup wizard's step 2 for fresh installs. Emits coarse stage
-    // lines (PARAKEET_PULL_STAGE:downloading / :loading) rather than
-    // byte-level progress — see src/parakeet_models.py for why.
+    // Download Parakeet TDT v3 via the bundled backend. Used by
+    // the Setup wizard. Structured progress distinguishes cache download
+    // from model initialisation.
     const backendPath = getBackendPath();
-    sendDebugLog('Downloading Parakeet TDT v3 (~572 MB)...');
+    sendDebugLog('Downloading Parakeet TDT v3...');
     sendDebugLog(`$ ${backendPath} download-parakeet-model`);
 
     return new Promise((resolve) => {
       const proc = spawn(backendPath, ['download-parakeet-model'], { stdio: 'pipe' });
       let lastStdoutLine = '';
+      const stdoutReader = makeLineReader();
 
       proc.stdout.on('data', (data) => {
         const text = data.toString();
-        for (const line of text.split('\n')) {
+        for (const line of stdoutReader.feed(text)) {
           const trimmed = line.trim();
           if (!trimmed) continue;
           sendDebugLog(trimmed);
-          if (trimmed.startsWith('PARAKEET_PULL_STAGE:')) {
-            const stage = trimmed.slice('PARAKEET_PULL_STAGE:'.length);
+          if (trimmed.startsWith('PARAKEET_PULL_PROGRESS:')) {
+            let progress;
+            try { progress = JSON.parse(trimmed.slice('PARAKEET_PULL_PROGRESS:'.length)); } catch (_) { continue; }
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('parakeet-pull-progress', { stage });
+              mainWindow.webContents.send('parakeet-pull-progress', progress);
             }
           } else {
             lastStdoutLine = trimmed;
@@ -7694,7 +7706,7 @@ ipcMain.handle('setup-parakeet', async () => {
       proc.on('close', (code) => {
         let parsed = null;
         try { parsed = JSON.parse(lastStdoutLine); } catch (_) { /* not JSON */ }
-        const ok = code === 0 && (!parsed || parsed.success !== false);
+        const ok = code === 0 && parsed?.success === true;
         if (ok) {
           sendDebugLog('Parakeet model ready');
           resolve({ success: true, message: 'Parakeet model ready' });
@@ -7836,56 +7848,6 @@ ipcMain.handle('get-ai-prompts', async () => {
   }
 });
 
-// Helper function to ensure Ollama service is running
-async function ensureOllamaRunning() {
-  try {
-    // Check if Ollama service is responding
-    const http = require('http');
-    const response = await new Promise((resolve) => {
-      const req = http.get('http://127.0.0.1:11434/api/version', { timeout: 3000 }, (res) => {
-        resolve(res.statusCode === 200);
-      });
-      req.on('error', () => resolve(false));
-      req.on('timeout', () => { req.destroy(); resolve(false); });
-    });
-
-    if (response) {
-      return true; // Service is running
-    }
-
-    // Service not running, try to start it.
-    // The macOS-14 gate only applies to mac (os.release() is the NT build on
-    // Windows, which would always trigger the < 23 check).
-    if (process.platform === 'darwin') {
-      const macRelease = os.release();
-      if (parseInt(macRelease.split('.')[0], 10) < 23) {
-        sendDebugLog('macOS version too old for bundled Ollama — requires macOS 14 (Sonoma) or later');
-        return false;
-      }
-    }
-
-    const ollamaPath = await findOllamaExecutable();
-    if (!ollamaPath) {
-      return false;
-    }
-
-    // Start Ollama service in background with proper env vars for dylibs
-    ollamaProcess = spawn(ollamaPath, ['serve'], { detached: true, stdio: 'ignore', env: getOllamaEnv() });
-    ollamaPid = ollamaProcess.pid;
-    try { require('fs').writeFileSync(path.join(getBackendCwd(), '_internal', 'ollama.pid'), String(ollamaPid)); } catch (_) {}
-    ollamaProcess.on('exit', () => { ollamaPid = null; });
-    ollamaProcess.unref();
-    ollamaStartedByUs = true;
-
-    // Wait for service to start
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    return true;
-  } catch (error) {
-    console.error('Error ensuring Ollama is running:', error);
-    return false;
-  }
-}
-
 // Check if Ollama is installed (for setup wizard)
 ipcMain.handle('check-ollama-installed', async () => {
   try {
@@ -7909,7 +7871,7 @@ ipcMain.handle('check-model-installed', async (event, modelName) => {
       try {
         const data = JSON.parse(lines[i]);
         return { success: true, installed: data.installed };
-      } catch (e) {
+      } catch {
         continue;
       }
     }
@@ -8267,8 +8229,7 @@ ipcMain.handle('pull-whisper-model', async (event, modelName) => {
 ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
   // Mirrors pull-whisper-model: settle-gate + SIGTERM-then-SIGKILL escalation
   // so a stalled HF download can never leave the renderer spinner hanging.
-  // Progress is coarse — we relay PARAKEET_PULL_STAGE:<stage> lines from the
-  // Python child rather than byte counts. See src/parakeet_models.py for why.
+  // Relay structured progress from the Python downloader.
   try {
     sendDebugLog(`Pulling Parakeet model: ${modelId || '<default>'}`);
     return new Promise((resolve) => {
@@ -8276,6 +8237,7 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
       if (modelId) args.push(modelId);
       const proc = spawn(getBackendPath(), args, { cwd: getBackendCwd() });
       let lastStdoutLine = '';
+      const stdoutReader = makeLineReader();
       let timedOut = false;
       let settled = false;
       let sigkillTimer = null;
@@ -8309,14 +8271,15 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
       }, 30 * 60 * 1000);
       proc.stdout.on('data', (data) => {
         const text = data.toString();
-        for (const line of text.split('\n')) {
+        for (const line of stdoutReader.feed(text)) {
           const trimmed = line.trim();
           if (!trimmed) continue;
           sendDebugLog(trimmed);
-          if (trimmed.startsWith('PARAKEET_PULL_STAGE:')) {
-            const stage = trimmed.slice('PARAKEET_PULL_STAGE:'.length);
+          if (trimmed.startsWith('PARAKEET_PULL_PROGRESS:')) {
+            let progress;
+            try { progress = JSON.parse(trimmed.slice('PARAKEET_PULL_PROGRESS:'.length)); } catch (_) { continue; }
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('parakeet-pull-progress', { model: modelId, stage });
+              mainWindow.webContents.send('parakeet-pull-progress', { ...progress, model: modelId });
             }
           } else {
             lastStdoutLine = trimmed;
@@ -8330,7 +8293,7 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
       proc.on('close', (code) => {
         let pullResult = null;
         try { pullResult = JSON.parse(lastStdoutLine); } catch (_) { /* not JSON */ }
-        const succeeded = !timedOut && code === 0 && (!pullResult || pullResult.success !== false);
+        const succeeded = !timedOut && code === 0 && pullResult?.success === true;
         if (succeeded) {
           finishOnce(
             { success: true, model: modelId },
@@ -8410,16 +8373,20 @@ ipcMain.handle('show-silence-auto-stop-notification', async (_event, payload) =>
 });
 
 // Fired by useSystemAudioCapture.ts when an enabled loopback acquisition
-// genuinely fails (for example, System Audio Recording permission is denied).
-// It is not fired when the user turns system audio off or the OS is unsupported.
-// Clicking it opens Settings via the same tray-open-settings event the tray
-// menu uses.
+// genuinely fails (for example, System Audio Recording permission is denied),
+// or when a live Linux capture dies mid-recording. It is not fired when the
+// user turns system audio off or the OS is unsupported. Clicking it opens
+// Settings via the same tray-open-settings event the tray menu uses.
 ipcMain.handle('show-system-audio-mic-only-notification', async () => {
   try {
     if (!(await notificationsEnabled())) return { success: true, shown: false };
     const notif = new Notification({
       title: 'Recording mic-only',
-      body: 'System audio could not be captured. Check Steno’s Screen & System Audio Recording access in System Settings.',
+      // The permissions hint is macOS-only; elsewhere there is no such setting
+      // to send the user to.
+      body: process.platform === 'darwin'
+        ? 'System audio could not be captured. Check Steno’s Screen & System Audio Recording access in System Settings.'
+        : 'System audio could not be captured. Continuing with the microphone only.',
       iconType: 'alert',
     });
     notif.on('click', () => {
@@ -9729,6 +9696,66 @@ ipcMain.handle('close-system-audio-file', async () => {
   }
 });
 
+// Linux system-audio loopback — spawns pw-record and streams raw PCM to the
+// renderer instead of going through Chromium's capture path (see
+// ./linux-loopback.js for why). Module-level, like activeSysAudioWriteStream.
+let activeLinuxLoopback = null;
+
+// Serialises start/stop — see createSerialQueue in ./linux-loopback.js for why.
+const queueLinuxLoopback = createSerialQueue();
+
+ipcMain.handle('start-linux-loopback', () => queueLinuxLoopback(async () => {
+  try {
+    // Reclaim an unstopped prior capture, same as open-system-audio-file above
+    // — and not a rare race: a renderer reload remounts useSystemAudioCapture
+    // with a fresh activeRef, which restarts capture off main's still-
+    // 'recording' status. Leaving the old process running would feed the
+    // renderer's new subscription both streams interleaved, and stop-linux-
+    // loopback only knows the newer one.
+    if (activeLinuxLoopback) {
+      const prior = activeLinuxLoopback;
+      activeLinuxLoopback = null;
+      sendDebugLog('[linux-loopback] abandoning unstopped prior capture');
+      prior.stdout.removeAllListeners('data');
+      await prior.stop();
+    }
+    const capture = await startLoopbackCapture({
+      onError: (err) => sendDebugLog(`[linux-loopback] capture error: ${err.message}`),
+    });
+    const align = createFrameAligner(2 * capture.channels); // s16 = 2 bytes/sample
+    capture.stdout.on('data', (chunk) => {
+      const whole = align(chunk);
+      if (whole) mainWindow?.webContents.send('linux-loopback-chunk', whole);
+    });
+    capture.proc.on('exit', (code, signal) => {
+      // stop() clears the ref before killing, so reaching here still-referenced
+      // means pw-record died on its own. Tell the renderer — otherwise the
+      // recording continues with a dead system channel and no warning.
+      if (activeLinuxLoopback?.proc === capture.proc) {
+        sendDebugLog(`[linux-loopback] pw-record exited unexpectedly (code=${code}, signal=${signal})`);
+        activeLinuxLoopback = null;
+        mainWindow?.webContents.send('linux-loopback-ended', { code, signal });
+      }
+    });
+    activeLinuxLoopback = capture;
+    sendDebugLog(`[linux-loopback] capturing from ${capture.target}`);
+    return { success: true, sampleRate: capture.sampleRate, channels: capture.channels };
+  } catch (error) {
+    sendDebugLog(`[linux-loopback] start failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}));
+
+ipcMain.handle('stop-linux-loopback', () => queueLinuxLoopback(async () => {
+  const capture = activeLinuxLoopback;
+  activeLinuxLoopback = null;
+  if (!capture) return { success: true };
+  capture.stdout.removeAllListeners('data');
+  await capture.stop();
+  sendDebugLog('[linux-loopback] stopped');
+  return { success: true };
+}));
+
 // A failed renderer-side capture (mic permission denied, no audio device)
 // would otherwise be silent — the optimistic "recording" pill is dropped via
 // system-audio-recording-state, but the user gets no reason. Surface a native
@@ -9748,11 +9775,13 @@ function showRecordingFailedNotification(body) {
   }
 }
 
-ipcMain.on('recording-capture-error', (_event, message) => {
-  sendDebugLog(`[sysaudio] capture error: ${message}`);
-  showRecordingFailedNotification(
-    message ? `Recording couldn't start: ${message}` : "Recording couldn't start.",
-  );
+ipcMain.on('recording-capture-error', (_event, message, name, phase) => {
+  // The raw text stays in the debug log, where it is what a diagnosis needs —
+  // and ONLY there. What reaches the notification is prose built from the
+  // error's name and the caller's phase; see buildCaptureErrorBody for why the
+  // message itself is never consulted.
+  sendDebugLog(`[sysaudio] capture error (${phase || 'start'}): ${name ? `${name}: ` : ''}${message}`);
+  showRecordingFailedNotification(buildCaptureErrorBody({ name, phase }));
 });
 
 ipcMain.handle('process-system-audio-recording', async (event, audioFilePath, sessionName) => {
@@ -10135,7 +10164,7 @@ async function checkForUpdates() {
       let url;
       try {
         url = new URL(urlStr);
-      } catch (e) {
+      } catch {
         resolve({ success: false, error: 'Invalid update URL' });
         return;
       }
@@ -10161,7 +10190,7 @@ async function checkForUpdates() {
           let next;
           try {
             next = new URL(res.headers.location, urlStr).toString();
-          } catch (e) {
+          } catch {
             resolve({ success: false, error: 'Invalid redirect URL' });
             return;
           }
@@ -10667,7 +10696,7 @@ function exchangeCodeForTokens(code, codeVerifier, port) {
           // Store expiry as absolute timestamp
           parsed.expires_at = Date.now() + (parsed.expires_in * 1000);
           resolve(parsed);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse token response'));
         }
       });
@@ -10754,7 +10783,7 @@ function refreshAccessToken(refreshToken) {
             return;
           }
           resolve(parsed);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse refresh response'));
         }
       });
@@ -10794,7 +10823,7 @@ async function fetchGoogleCalendarList(accessToken, signal) {
             return;
           }
           resolve(parsed.items || []);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse calendar list response'));
         }
       });
@@ -10805,7 +10834,7 @@ async function fetchGoogleCalendarList(accessToken, signal) {
 }
 
 function fetchGoogleEventsForCalendar(accessToken, calendarId, params, signal) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const options = {
       hostname: 'www.googleapis.com',
       path: `/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${params.toString()}`,
@@ -10848,38 +10877,34 @@ async function fetchCalendarEvents(accessToken, maxResults = 50, signal) {
     fields: 'items(id,status,summary,description,start,end,attendees,htmlLink,conferenceData,colorId)'
   });
 
-  try {
-    const calendars = await fetchGoogleCalendarList(accessToken, signal);
-    const selectedCalendars = calendars.filter(c => c.selected);
-    if (selectedCalendars.length === 0) return [];
+  const calendars = await fetchGoogleCalendarList(accessToken, signal);
+  const selectedCalendars = calendars.filter(c => c.selected);
+  if (selectedCalendars.length === 0) return [];
 
-    const results = [];
-    const concurrency = 3;
-    for (let i = 0; i < selectedCalendars.length; i += concurrency) {
-      const chunk = selectedCalendars.slice(i, i + concurrency);
-      const chunkPromises = chunk.map(async (cal) => {
-        const items = await fetchGoogleEventsForCalendar(accessToken, cal.id, params, signal);
-        items.forEach(item => { 
-          item.calendarBackgroundColor = cal.backgroundColor; 
-          item._sourceCalendarId = cal.id;
-        });
-        return items;
+  const results = [];
+  const concurrency = 3;
+  for (let i = 0; i < selectedCalendars.length; i += concurrency) {
+    const chunk = selectedCalendars.slice(i, i + concurrency);
+    const chunkPromises = chunk.map(async (cal) => {
+      const items = await fetchGoogleEventsForCalendar(accessToken, cal.id, params, signal);
+      items.forEach(item => {
+        item.calendarBackgroundColor = cal.backgroundColor;
+        item._sourceCalendarId = cal.id;
       });
-      const chunkResults = await Promise.all(chunkPromises);
-      results.push(...chunkResults);
-    }
-    let allEvents = results.flat();
-    
-    allEvents.sort((a, b) => {
-      const startA = new Date(a.start?.dateTime || a.start?.date || 0);
-      const startB = new Date(b.start?.dateTime || b.start?.date || 0);
-      return startA.getTime() - startB.getTime();
+      return items;
     });
-
-    return allEvents.slice(0, maxResults);
-  } catch (err) {
-    throw err;
+    const chunkResults = await Promise.all(chunkPromises);
+    results.push(...chunkResults);
   }
+  const allEvents = results.flat();
+
+  allEvents.sort((a, b) => {
+    const startA = new Date(a.start?.dateTime || a.start?.date || 0);
+    const startB = new Date(b.start?.dateTime || b.start?.date || 0);
+    return startA.getTime() - startB.getTime();
+  });
+
+  return allEvents.slice(0, maxResults);
 }
 
 // ── Outlook Calendar: OAuth2 Flow with PKCE ─────────────────────────────
@@ -11073,7 +11098,7 @@ function exchangeOutlookCodeForTokens(code, codeVerifier, port) {
           }
           parsed.expires_at = Date.now() + (parsed.expires_in * 1000);
           resolve(parsed);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse token response'));
         }
       });
@@ -11165,7 +11190,7 @@ function refreshOutlookAccessToken(refreshToken) {
             return;
           }
           resolve(parsed);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse refresh response'));
         }
       });
@@ -11199,7 +11224,7 @@ async function fetchOutlookCalendarList(accessToken, signal) {
             return;
           }
           resolve(parsed.value || []);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse Outlook calendar list response'));
         }
       });
@@ -11210,7 +11235,7 @@ async function fetchOutlookCalendarList(accessToken, signal) {
 }
 
 function fetchOutlookEventsForCalendar(accessToken, calendarId, params, signal) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const options = {
       hostname: 'graph.microsoft.com',
       path: `/v1.0/me/calendars/${encodeURIComponent(calendarId)}/calendarView?${params.toString()}`,
@@ -11257,52 +11282,48 @@ async function fetchOutlookCalendarEvents(accessToken, maxResults = 50, signal) 
     $select: 'id,subject,body,start,end,attendees,webLink,onlineMeeting,isOnlineMeeting,isAllDay,isCancelled,responseStatus,categories'
   });
 
-  try {
-    const calendars = await fetchOutlookCalendarList(accessToken, signal);
-    if (calendars.length === 0) return [];
+  const calendars = await fetchOutlookCalendarList(accessToken, signal);
+  if (calendars.length === 0) return [];
 
-    const results = [];
-    const concurrency = 3;
-    for (let i = 0; i < calendars.length; i += concurrency) {
-      const chunk = calendars.slice(i, i + concurrency);
-      const chunkPromises = chunk.map(async (cal) => {
-        const items = await fetchOutlookEventsForCalendar(accessToken, cal.id, params, signal);
-        
-        let hexColor = undefined;
-        switch (cal.color) {
-          case 'lightBlue': hexColor = '#3B82F6'; break;
-          case 'lightGreen': hexColor = '#10B981'; break;
-          case 'lightOrange': hexColor = '#F97316'; break;
-          case 'lightGray': hexColor = '#6B7280'; break;
-          case 'lightYellow': hexColor = '#EAB308'; break;
-          case 'lightTeal': hexColor = '#14B8A6'; break;
-          case 'lightPink': hexColor = '#EC4899'; break;
-          case 'lightBrown': hexColor = '#92400E'; break;
-          case 'lightRed': hexColor = '#EF4444'; break;
-          default: hexColor = '#3B82F6';
-        }
-        
-        items.forEach(item => { 
-          item.calendarBackgroundColor = hexColor; 
-          item.id = `${cal.id}_${item.id}`;
-        });
-        return items;
+  const results = [];
+  const concurrency = 3;
+  for (let i = 0; i < calendars.length; i += concurrency) {
+    const chunk = calendars.slice(i, i + concurrency);
+    const chunkPromises = chunk.map(async (cal) => {
+      const items = await fetchOutlookEventsForCalendar(accessToken, cal.id, params, signal);
+
+      let hexColor;
+      switch (cal.color) {
+        case 'lightBlue': hexColor = '#3B82F6'; break;
+        case 'lightGreen': hexColor = '#10B981'; break;
+        case 'lightOrange': hexColor = '#F97316'; break;
+        case 'lightGray': hexColor = '#6B7280'; break;
+        case 'lightYellow': hexColor = '#EAB308'; break;
+        case 'lightTeal': hexColor = '#14B8A6'; break;
+        case 'lightPink': hexColor = '#EC4899'; break;
+        case 'lightBrown': hexColor = '#92400E'; break;
+        case 'lightRed': hexColor = '#EF4444'; break;
+        default: hexColor = '#3B82F6';
+      }
+
+      items.forEach(item => {
+        item.calendarBackgroundColor = hexColor;
+        item.id = `${cal.id}_${item.id}`;
       });
-      const chunkResults = await Promise.all(chunkPromises);
-      results.push(...chunkResults);
-    }
-    let allEvents = results.flat();
-    
-    allEvents.sort((a, b) => {
-      const startA = new Date(a.start?.dateTime || a.start?.date || 0);
-      const startB = new Date(b.start?.dateTime || b.start?.date || 0);
-      return startA.getTime() - startB.getTime();
+      return items;
     });
-
-    return allEvents.slice(0, maxResults);
-  } catch (err) {
-    throw err;
+    const chunkResults = await Promise.all(chunkPromises);
+    results.push(...chunkResults);
   }
+  const allEvents = results.flat();
+
+  allEvents.sort((a, b) => {
+    const startA = new Date(a.start?.dateTime || a.start?.date || 0);
+    const startB = new Date(b.start?.dateTime || b.start?.date || 0);
+    return startA.getTime() - startB.getTime();
+  });
+
+  return allEvents.slice(0, maxResults);
 }
 
 function normalizeOutlookEvent(event) {
@@ -11393,7 +11414,7 @@ ipcMain.handle('google-auth-status', async () => {
   try {
     const tokens = loadGoogleTokens();
     return { success: true, connected: !!tokens, email: tokens?.email ?? null };
-  } catch (error) {
+  } catch {
     return { success: false, connected: false };
   }
 });
@@ -11420,7 +11441,7 @@ ipcMain.handle('google-auth-disconnect', async () => {
           req.on('error', () => resolve()); // Best-effort
           req.end();
         });
-      } catch (e) {
+      } catch {
         // Best-effort revocation -- ignore errors
       }
     }
@@ -12019,7 +12040,7 @@ ipcMain.handle('outlook-auth-status', async () => {
   try {
     const tokens = loadOutlookTokens();
     return { success: true, connected: !!tokens, email: tokens?.email ?? null };
-  } catch (error) {
+  } catch {
     return { success: false, connected: false };
   }
 });
@@ -12141,7 +12162,7 @@ function clearOrgSession() {
     if (fs.existsSync(p)) fs.unlinkSync(p);
     orgSessionGeneration++;
     return true;
-  } catch (e) {
+  } catch {
     return false;
   }
 }

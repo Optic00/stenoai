@@ -416,6 +416,7 @@ class Config:
         "de": "German",
         "nl": "Dutch",
         "pt": "Portuguese",
+        "ru": "Russian",
         "ja": "Japanese",
         "zh-Hans": "Chinese (Simplified)",
         "zh-Hant": "Chinese (Traditional)",

@@ -174,10 +174,20 @@ const SEED_REPORT = {
 // switch across the invalidate → get-meeting refetch, like the real sidecar.
 let seedActiveReport = null;
 
-const seededMeeting = () =>
-  process.env.STENOAI_E2E_SEED_REPORT === '1'
-    ? { ...SEED_MEETING, reports: [SEED_REPORT], active_report: seedActiveReport }
+const seededMeeting = () => {
+  const meeting = process.env.STENOAI_E2E_SEED_DIARISED_EXPORT === '1'
+    ? {
+        ...SEED_MEETING,
+        transcript: '',
+        is_diarised: true,
+        diarised_text:
+          '[00:00] [You] We should ship Friday.\n[00:02] [You] I will prepare the release.\n[00:06] [Others] Sounds good.',
+      }
     : SEED_MEETING;
+  return process.env.STENOAI_E2E_SEED_REPORT === '1'
+    ? { ...meeting, reports: [SEED_REPORT], active_report: seedActiveReport }
+    : meeting;
+};
 
 // A diarised meeting for the speaker-review T1 spec -- seeded only when
 // STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS=1. summary_file's stem
@@ -305,7 +315,11 @@ function install({ ipcMain }) {
     active: false,
     paused: false,
     processing: false,
-    sessionName: null,
+    // STENOAI_E2E_STALE_SESSION_NAME seeds the state main.js is left in after a
+    // capture start that failed in the renderer: no recording, but the session
+    // NAME retained. See the get-queue-status handler for why that state is not
+    // otherwise reachable through this mock.
+    sessionName: process.env.STENOAI_E2E_STALE_SESSION_NAME || null,
     // The append/resume target (summary file) of the active recording, mirrored
     // into get-queue-status.recordingSummaryFile so the detail view can match
     // "recording this note" by identity (not display name).
@@ -472,6 +486,10 @@ function install({ ipcMain }) {
   // real ipcMain.handle callback. Mirror the real handlers' return shapes from
   // app/main.js (get-ai-provider ~5950, org-* ~7990).
   const MOCKS = {
+    // The permissive default ({success:true}) would leave sampleRate/channels
+    // undefined, making the renderer's bytesPerFrame NaN. Mirror the real
+    // handler's shape (main.js start-linux-loopback) instead.
+    'start-linux-loopback': async () => ({ success: true, sampleRate: 48000, channels: 2 }),
     'start-recording-ui': async (_event, name, _trigger, appendTo) => {
       rec.active = true;
       rec.paused = false;
@@ -552,7 +570,20 @@ function install({ ipcMain }) {
         elapsedSeconds: rec.active
           ? Math.floor(((rec.paused ? rec.pausedAt : Date.now()) - rec.startedAt) / 1000)
           : 0,
-        sessionName: rec.active || rec.processing ? rec.sessionName : null,
+        // The real main.js does NOT clear currentRecordingSessionName when the
+        // renderer reports its capture inactive — it deliberately keeps the
+        // name so a brief capture flap can't drop the "which meeting is live"
+        // label, on the assumption that "a stale name while hasRecording is
+        // false is inert" (main.js, system-audio-recording-state handler).
+        // This mock nulls it instead, which is a *more* correct contract than
+        // the app implements — and is why no T1 spec could ever reproduce the
+        // phantom "Recording" row a failed capture start left behind.
+        // STENOAI_E2E_STALE_SESSION_NAME reproduces main's actual behaviour so
+        // that regression stays covered; opt-in, so no existing spec shifts.
+        sessionName:
+          rec.active || rec.processing || process.env.STENOAI_E2E_STALE_SESSION_NAME
+            ? rec.sessionName
+            : null,
         recordingSummaryFile: rec.active ? rec.appendTo : null,
       };
     },
@@ -884,11 +915,24 @@ function install({ ipcMain }) {
     // download-progress spec can observe the bar. The app is torn down at test
     // end. Without the flag they resolve success, matching the permissive
     // default so nothing else changes.
+    'create-folder': async () => {
+      if (process.env.STENOAI_E2E_FOLDER_CREATE_PENDING !== '1') return { success: true };
+      const state = global.__folderCreateTest ||= { calls: 0, finish: null };
+      state.calls++;
+      return new Promise(resolve => { state.finish = resolve; });
+    },
+    'pull-parakeet-model': async (event, model) => {
+      if (process.env.STENOAI_E2E_SETUP_PROGRESS !== '1') return { success: true };
+      event.sender.send('parakeet-pull-progress', {
+        model, stage: 'downloading', completed_files: 1, total_files: 2, file_bytes: 120000000,
+      });
+      return new Promise(() => {});
+    },
     'setup-parakeet': async (event) => {
       if (process.env.STENOAI_E2E_SETUP_PROGRESS === '1') {
         const wc = event && event.sender;
         if (wc && !wc.isDestroyed()) {
-          // Parakeet exposes only coarse stages (no byte counts).
+          // First event may arrive before any file/byte measurement.
           wc.send('parakeet-pull-progress', { stage: 'downloading' });
         }
         return new Promise(() => {});
@@ -1392,8 +1436,8 @@ function install({ ipcMain }) {
       supported_models: {
         [PARAKEET_MODEL_ID]: {
           name: 'Parakeet TDT v3',
-          size: '572MB',
-          installed: true,
+          size: process.platform === 'darwin' ? '2.5GB' : '670MB',
+          installed: process.env.STENOAI_E2E_MOCK_PARAKEET_INSTALLED !== '0',
           description:
             'Highest quality. Supports live transcription in English and 25 European languages — Spanish, French, German, Italian, Portuguese, Dutch, Russian, Polish, Czech, and 16 others.',
           speed: 'very fast',
@@ -1519,6 +1563,11 @@ function install({ ipcMain }) {
     },
   };
 
+  // Invoked-channel log, readable from a spec via app.evaluate(). The
+  // contextBridge object is frozen, so a spec cannot spy on the renderer side;
+  // this is the observable seam for "which IPC did the renderer actually call".
+  global.__mockIpcCalls = [];
+
   const originalHandle = ipcMain.handle.bind(ipcMain);
   ipcMain.handle = (channel, realFn) => {
     let fn;
@@ -1535,8 +1584,12 @@ function install({ ipcMain }) {
       // never installed under mock IPC.
       fn = async () => ({ success: true });
     }
-    return originalHandle(channel, fn);
+    return originalHandle(channel, (...args) => {
+      global.__mockIpcCalls.push(channel);
+      return fn(...args);
+    });
   };
+
 }
 
 module.exports = { install };

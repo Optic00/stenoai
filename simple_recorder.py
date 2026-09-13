@@ -657,7 +657,7 @@ Summary output language: {config.get_language_name(output_language)}
             "output_language": output_language,
             "speaker_clusters": speaker_clusters,
             "turn_manifest": turn_manifest,
-            # Fraction of transcription windows that came back usable, worst
+            # Fraction of audio read by usable transcription windows, worst
             # channel, or None where the backend does no windowing of its own.
             # None means "unknown", not "complete" -- see the live-transcript
             # fallback in process_streaming.
@@ -1017,7 +1017,7 @@ try:
 except ImportError:
     _SILENCE_SENTINEL = "No speech detected in audio"
 
-# Below this share of usable transcription windows a batch transcript stops
+# Below this share of audio read by usable windows, a batch transcript stops
 # being "the transcript" and the complete live transcript is the better
 # rescue. Deliberately low: a meeting that lost a window or two is still far
 # better than the streaming text, and swapping too eagerly is how the old
@@ -1035,7 +1035,7 @@ def _unusable_batch_reason(
     None when it can.
 
     Three ways it can't: the transcription crashed, it came back as exactly
-    the silence sentinel, or it lost more than half its transcription windows
+    the silence sentinel, or it lost more than half its audio
     (see _MIN_BATCH_WINDOW_COVERAGE). Deliberately NOT length -- a five-minute
     stand-up is allowed to be short, and an earlier length threshold here
     replaced correct transcripts because of it.
@@ -1051,7 +1051,7 @@ def _unusable_batch_reason(
     if batch_text.strip() == _SILENCE_SENTINEL:
         return "returned only silence"
     if window_coverage is not None and window_coverage < _MIN_BATCH_WINDOW_COVERAGE:
-        return f"covered only {window_coverage:.0%} of its transcription windows"
+        return f"read only {window_coverage:.0%} of the audio"
     return None
 
 
@@ -1258,7 +1258,7 @@ def process_streaming(audio_file, name, notes, live_transcript, append_to):
         # unusable (failed or silence sentinel). Any non-whitespace live content
         # is better than a silent failure — even a brief session deserves rescue.
         # Third case, added later: a batch that neither crashed nor returned
-        # silence, but lost most of its transcription windows. The onnx
+        # silence, but lost most of its audio. The onnx
         # backend skips a window whose recognize() raises on purpose, so one
         # bad window doesn't fail a meeting -- but the transcript then covers
         # less audio than the recording holds, and nothing said so. Such a
@@ -1898,15 +1898,7 @@ def warmup_parakeet_cmd():
 @cli.command(name='download-parakeet-model')
 @click.argument('model_id', required=False)
 def download_parakeet_model_cmd(model_id):
-    """Download a Parakeet snapshot from HuggingFace.
-
-    Emits ``PARAKEET_PULL_STAGE:<stage>`` lines (parsed by main.js into a
-    parakeet-pull-progress IPC event) before the final JSON result. Stages
-    are coarse (``downloading`` / ``loading``) because the snapshot is
-    multiple files and threading byte-level progress through
-    huggingface_hub's tqdm isn't worth the wire complexity for a one-time
-    ~600 MB download.
-    """
+    """Download a snapshot, emitting structured progress before the result."""
     from src.parakeet_models import (
         DEFAULT_MODEL_ID,
         SUPPORTED_PARAKEET_MODELS,
@@ -1921,8 +1913,8 @@ def download_parakeet_model_cmd(model_id):
         print(json.dumps({"success": True, "model": target, "already_installed": True}))
         return
 
-    def emit(stage: str):
-        print(f"PARAKEET_PULL_STAGE:{stage}", flush=True)
+    def emit(progress: dict):
+        print("PARAKEET_PULL_PROGRESS:" + json.dumps(progress), flush=True)
 
     ok = download(target, emit)
     if ok:

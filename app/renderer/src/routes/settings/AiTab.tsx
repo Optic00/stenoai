@@ -1,3 +1,4 @@
+import { parakeetProgressLabel } from '@/lib/parakeetProgress';
 import * as React from 'react';
 import { Building2, Check, ChevronDown, ChevronRight, Cloud, Laptop, Loader2, Server, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -170,7 +171,7 @@ export function SpeakerIdentificationSetting() {
   return (
     <SettingRow
       label="Speaker identification"
-      description="Optional and off by default. By enabling this, you confirm that you will inform the people you record and that you are authorised to create and use their numerical biometric voice profiles. Profiles stay on this device and are used only to suggest people across meetings. This opt-in does not by itself establish legal compliance. Anonymous per-meeting speaker splitting (Speaker 2, Speaker 3, ...) remains available when this is off."
+      description="Optional and off by default."
       descriptionId="speaker-identification-description"
     >
       <Switch
@@ -363,6 +364,12 @@ function TranscriptionModelList() {
             </SelectItem>
           </SelectContent>
         </Select>
+        {parakeetDownloading && (
+          <p role="status" className="mt-2 max-w-[240px] text-xs text-muted-foreground">
+            {parakeetProgressLabel(pullParakeet.progress[parakeetModel.name])}
+          </p>
+        )}
+        {pullParakeet.isError && <p role="alert">{String(pullParakeet.error.message)}</p>}
       </SettingRow>
 
       {activeEngine === 'openai-asr' && <OpenAiAsrConfig />}
