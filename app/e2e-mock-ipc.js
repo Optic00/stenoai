@@ -23,6 +23,42 @@
 const fs = require('fs');
 const { EXPORT_CANCELED } = require('./ipc-sentinels');
 
+// A real, silent, 16-bit mono 8kHz WAV -- valid enough for the renderer's
+// blob: URL + <audio> path to actually decode, unlike a placeholder string.
+//
+// It has real DURATION, and that is the point. The previous fixture was a
+// 44-byte header with zero sample data, so the media element reported
+// duration 0 and fired `ended` about 300ms after play() -- measured in this
+// very renderer. PlaySampleButton flips its label back to "Play sample" on
+// `ended`, so the "toggling to stop" spec was racing a state that existed
+// for a third of a second: green on a Mac, red on a CI runner whose first
+// assertion poll landed after the clip had already finished. A spec about
+// playing a sample needs a sample that plays.
+const SILENT_WAV_SECONDS = 5;
+const SILENT_WAV_SAMPLE_RATE = 8000;
+
+function buildSilentWavBase64(seconds, sampleRate) {
+  const bytesPerSample = 2; // 16-bit
+  const dataBytes = seconds * sampleRate * bytesPerSample;
+  const buf = Buffer.alloc(44 + dataBytes); // zero-filled == silence
+  buf.write('RIFF', 0);
+  buf.writeUInt32LE(36 + dataBytes, 4);
+  buf.write('WAVE', 8);
+  buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16); // PCM fmt chunk size
+  buf.writeUInt16LE(1, 20); // PCM
+  buf.writeUInt16LE(1, 22); // mono
+  buf.writeUInt32LE(sampleRate, 24);
+  buf.writeUInt32LE(sampleRate * bytesPerSample, 28); // byte rate
+  buf.writeUInt16LE(bytesPerSample, 32); // block align
+  buf.writeUInt16LE(16, 34); // bits per sample
+  buf.write('data', 36);
+  buf.writeUInt32LE(dataBytes, 40);
+  return buf.toString('base64');
+}
+
+const MINIMAL_WAV_BASE64 = buildSilentWavBase64(SILENT_WAV_SECONDS, SILENT_WAV_SAMPLE_RATE);
+
 // A deterministic meeting the transcript-export T1 spec navigates to. Seeded
 // only when STENOAI_E2E_SEED_MEETING=1 so the other T1 specs keep an empty Home.
 // Shape mirrors the renderer's Meeting (session_info + transcript/notes/etc.);
@@ -31,7 +67,7 @@ const { EXPORT_CANCELED } = require('./ipc-sentinels');
 const SEED_MEETING = {
   session_info: {
     name: 'Epsilon Planning',
-    summary_file: 'epsilon_summary.json',
+    summary_file: process.env.STENOAI_E2E_EDIT_MARKDOWN === '1' ? 'epsilon_summary.md' : 'epsilon_summary.json',
     processed_at: '2026-06-19T12:00:00Z',
     duration_seconds: 1500,
     transcription_failed: false,
@@ -67,6 +103,27 @@ const PENDING_MEETING = {
   },
   transcript: '[00:03] [You] we ship Friday.\n[00:06] [Others] I will prep the release notes.',
   is_diarised: true,
+  summary: '',
+  key_points: [],
+  action_items: [],
+  discussion_areas: [],
+  participants: [],
+};
+
+// A note imported from a .stenomeeting package. Swift-authored notes carry
+// their body as user_notes and have no generated summary, so the detail view
+// should open directly on My notes. Opt-in to keep every existing T1 seed
+// unchanged.
+const TRANSFER_MEETING = {
+  steno_transfer: { sourceMeetingID: '11111111-2222-4333-8444-555555555555' },
+  session_info: {
+    name: 'Imported Swift note',
+    summary_file: 'imported-swift-note_summary.md',
+    processed_at: '2026-09-12T04:00:00Z',
+    duration_seconds: 0,
+  },
+  transcript: '',
+  user_notes: 'Notes written on iPhone and transferred to this Mac.',
   summary: '',
   key_points: [],
   action_items: [],
@@ -138,10 +195,67 @@ const SEED_REPORT = {
 // switch across the invalidate → get-meeting refetch, like the real sidecar.
 let seedActiveReport = null;
 
-const seededMeeting = () =>
-  process.env.STENOAI_E2E_SEED_REPORT === '1'
-    ? { ...SEED_MEETING, reports: [SEED_REPORT], active_report: seedActiveReport }
+const seededMeeting = () => {
+  const meeting = process.env.STENOAI_E2E_SEED_DIARISED_EXPORT === '1'
+    ? {
+        ...SEED_MEETING,
+        transcript: '',
+        is_diarised: true,
+        diarised_text:
+          '[00:00] [You] We should ship Friday.\n[00:02] [You] I will prepare the release.\n[00:06] [Others] Sounds good.',
+      }
     : SEED_MEETING;
+  return process.env.STENOAI_E2E_SEED_REPORT === '1'
+    ? { ...meeting, reports: [SEED_REPORT], active_report: seedActiveReport }
+    : meeting;
+};
+
+// A diarised meeting for the speaker-review T1 spec -- seeded only when
+// STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS=1. summary_file's stem
+// ("speaker-review-mtg") matches the meetingStem key used by the
+// speakerState.suggestions seed below, since SpeakerReviewPanel derives the
+// stem from summary_file client-side (meetingStemFromSummaryFile).
+const SPEAKER_SEED_MEETING = {
+  session_info: {
+    name: 'Speaker Review Meeting',
+    summary_file: 'speaker-review-mtg_summary.json',
+    processed_at: '2026-06-19T12:00:00Z',
+    duration_seconds: 900,
+    transcription_failed: false,
+  },
+  transcript: '',
+  is_diarised: true,
+  has_speaker_sidecar: true,
+  diarised_text:
+    '[00:05] [Speaker 2] hello there\n\n' +
+    '[00:10] [Speaker 3] another participant\n\n' +
+    '[00:15] [Speaker 4] a third participant\n\n' +
+    '[00:20] [Others] fallback channel speech',
+  participants: [],
+  summary: 'A test meeting for speaker review.',
+  key_points: [],
+  action_items: [],
+  discussion_areas: [],
+};
+
+// The sidecar can retain several clusters even where the transcript correctly
+// keeps its legacy non-diarised labels. This test-only mode exercises that
+// distinction with the same multi-cluster payload as the normal speaker seed.
+const seededSpeakerMeeting = () =>
+  process.env.STENOAI_E2E_SEED_SPEAKER_SIDECAR === '1'
+    ? { ...SPEAKER_SEED_MEETING, is_diarised: false }
+    : SPEAKER_SEED_MEETING;
+
+const MANY_PERSON_PROFILES = [
+  { person_id: 'p-alex', display_name: 'Alex Morgan', prototype_counts: { remote: 1 }, hard_negative_counts: {}, updated_at: 0 },
+  { person_id: 'p-bao', display_name: 'Bao Nguyen', prototype_counts: { in_person: 2 }, hard_negative_counts: {}, updated_at: 0 },
+  { person_id: 'p-daria', display_name: 'Daria Novak', prototype_counts: { remote: 1 }, hard_negative_counts: {}, updated_at: 0 },
+  { person_id: 'p-emil', display_name: 'Emil Fischer', prototype_counts: { in_person: 1 }, hard_negative_counts: {}, updated_at: 0 },
+  { person_id: 'p-fatima', display_name: 'Fatima Rahman', prototype_counts: { remote: 2 }, hard_negative_counts: {}, updated_at: 0 },
+  { person_id: 'p-greta', display_name: 'Greta Silva', prototype_counts: { in_person: 1 }, hard_negative_counts: {}, updated_at: 0 },
+  { person_id: 'p-hugo', display_name: 'Hugo Costa', prototype_counts: { remote: 1 }, hard_negative_counts: {}, updated_at: 0 },
+  { person_id: 'p-zora', display_name: 'Zora Quinn', prototype_counts: {}, hard_negative_counts: {}, updated_at: 0 },
+].map((profile) => ({ ...profile, sample_available: false }));
 
 /**
  * Carried-over segments for the resume/continue case, keyed off
@@ -165,6 +279,35 @@ function seedPriorSegments(rec) {
   ];
 }
 
+// Two notes differing ONLY in whether their original recording still exists,
+// for the overview's audio indicator (STENOAI_E2E_SEED_AUDIO_MEETINGS=1).
+// keep_recordings defaults off, so "no audio" is the normal case -- the pair
+// is what proves the icon tracks the flag rather than always rendering.
+const AUDIO_SEED_MEETINGS = [
+  {
+    session_info: {
+      name: 'With audio',
+      summary_file: 'with-audio_summary.md',
+      processed_at: '2026-08-02T12:00:00Z',
+      duration_seconds: 600,
+    },
+    summary: 'A note whose recording was kept.',
+    has_audio: true,
+    key_points: [], action_items: [], discussion_areas: [], participants: [],
+  },
+  {
+    session_info: {
+      name: 'Without audio',
+      summary_file: 'without-audio_summary.md',
+      processed_at: '2026-08-02T11:00:00Z',
+      duration_seconds: 900,
+    },
+    summary: 'A note whose recording was discarded after processing.',
+    has_audio: false,
+    key_points: [], action_items: [], discussion_areas: [], participants: [],
+  },
+];
+
 function install({ ipcMain }) {
   // In-memory stand-in for the org session + provider config that the real
   // handlers persist to disk. Mutated by the org-login / org-logout / set-ai
@@ -178,6 +321,10 @@ function install({ ipcMain }) {
     cloudModel: 'gpt-4o',
     remoteUrl: '', // remote Ollama URL (empty = not configured)
     autoInstallWhenIdle: true, // idle auto-install toggle (config default on)
+    transcriptionEngine: process.env.STENOAI_E2E_MOCK_ENGINE || 'parakeet',
+    openAiAsrUrl: 'https://api.openai.com/v1',
+    openAiAsrModel: 'whisper-1',
+    openAiAsrKeySet: process.env.STENOAI_E2E_OAI_ASR_KEY_SET === '1',
   };
 
   // In-memory recording state machine for the pill-dock T1: start/pause/
@@ -189,7 +336,11 @@ function install({ ipcMain }) {
     active: false,
     paused: false,
     processing: false,
-    sessionName: null,
+    // STENOAI_E2E_STALE_SESSION_NAME seeds the state main.js is left in after a
+    // capture start that failed in the renderer: no recording, but the session
+    // NAME retained. See the get-queue-status handler for why that state is not
+    // otherwise reachable through this mock.
+    sessionName: process.env.STENOAI_E2E_STALE_SESSION_NAME || null,
     // The append/resume target (summary file) of the active recording, mirrored
     // into get-queue-status.recordingSummaryFile so the detail view can match
     // "recording this note" by identity (not display name).
@@ -228,10 +379,158 @@ function install({ ipcMain }) {
     return o ? { ...m, ...o } : m;
   };
 
+  // Speaker-review (SpeakerReviewPanel) mock state -- seeded only when a
+  // spec sets STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS=1 so the other T1 specs
+  // are unaffected. Shape mirrors the real suggest-speakers/list-person-
+  // profiles JSON (see src.speaker_suggestions + app/docs/ipc-contract.md's
+  // "6b. Speakers" section). Mutated by confirm/create/rename/delete so a
+  // spec can click a real action and assert the panel re-renders from the
+  // (mocked) refetch, the same way org-login/org-status do for org state.
+  const seedSpeakers =
+    process.env.STENOAI_E2E_SEED_SPEAKER_SUGGESTIONS === '1'
+    || process.env.STENOAI_E2E_SEED_SPEAKER_SIDECAR === '1'
+    || process.env.STENOAI_E2E_SEED_SPEAKER_SINGLE_CLUSTER === '1'
+    || process.env.STENOAI_E2E_SEED_MANY_PEOPLE === '1';
+  const speakerState = {
+    personProfiles: seedSpeakers
+      ? [
+          { person_id: 'p-alpha', display_name: 'Person Alpha', prototype_counts: { remote: 2 }, hard_negative_counts: {}, sample_available: true, updated_at: 0 },
+          { person_id: 'p-beta', display_name: 'Person Beta', prototype_counts: { remote: 1 }, hard_negative_counts: {}, sample_available: false, updated_at: 0 },
+          ...(process.env.STENOAI_E2E_SEED_MANY_PEOPLE === '1' ? MANY_PERSON_PROFILES : []),
+        ]
+      : [],
+    // channels -> { diarization_speaker_id: SpeakerSuggestion }
+    suggestions: seedSpeakers
+      ? {
+          mic: {
+            SPEAKER_0: {
+              status: 'confirmed', suggested_person_id: 'p-alpha', suggested_name: 'Person Alpha',
+              merged_from: [],
+              candidates: [{ person_id: 'p-alpha', display_name: 'Person Alpha', distance: 0.05, hard_negative_conflict: false, negative_distance: null }],
+              reasons: [],
+              speech_duration_seconds: 245, segment_count: 60, first_timestamp: '02:10',
+              sample_text: 'I think we should ship this on Friday',
+              // Several excerpts so the row can expand. The third has no
+              // transcript text (a real, common case -- a diarized segment
+              // no transcript line covers); it stays in the list because
+              // dropping it would shift every later play button's index.
+              // The fourth is a turn the backend could not place in the
+              // audio: extract_segment_samples collapses those to
+              // start === end and extract_speaker_sample_audio refuses to
+              // cut them, so the row must not offer a play button for it.
+              samples: [
+                { start: 130.0, end: 138.0, text: 'I think we should ship this on Friday' },
+                { start: 400.0, end: 406.0, text: 'the migration is the risky part' },
+                { start: 900.0, end: 904.0, text: null },
+                { start: 1200.0, end: 1200.0, text: 'a line with no audio to match it' },
+              ],
+              contains_multiple_speakers: false,
+              is_likely_artifact: false,
+              confirmed_by_user: null,
+            },
+            // "possible" still carries a suggested_person_id/suggested_name
+            // (the real suggest_speaker always attaches the best candidate,
+            // regardless of confidence tier) -- only "none" has them null.
+            SPEAKER_1: {
+              status: 'possible', suggested_person_id: 'p-beta', suggested_name: 'Person Beta',
+              merged_from: [],
+              candidates: [{ person_id: 'p-beta', display_name: 'Person Beta', distance: 0.28, hard_negative_conflict: false, negative_distance: null }],
+              reasons: [],
+              speech_duration_seconds: 80, segment_count: 20, first_timestamp: '05:45',
+              sample_text: 'let me check the numbers again',
+              samples: [{ start: 345.0, end: 351.0, text: 'let me check the numbers again' }],
+              contains_multiple_speakers: false,
+              is_likely_artifact: false,
+              confirmed_by_user: null,
+            },
+            // status "none" but with a below-threshold candidate still
+            // attached -- shown (Change/New person/Keep, no Approve),
+            // unlike a truly empty-candidates "none" row (hidden).
+            SPEAKER_2: {
+              status: 'none', suggested_person_id: null, suggested_name: null,
+              merged_from: [],
+              candidates: [{ person_id: 'p-alpha', display_name: 'Person Alpha', distance: 0.55, hard_negative_conflict: false, negative_distance: null }],
+              reasons: [],
+              speech_duration_seconds: 30, segment_count: 8, first_timestamp: '00:42',
+              sample_text: null,
+              samples: [{ start: 42.0, end: 46.0, text: null }],
+              contains_multiple_speakers: false,
+              is_likely_artifact: false,
+              confirmed_by_user: null,
+            },
+            SPEAKER_3: {
+              status: 'none', suggested_person_id: null, suggested_name: null,
+              merged_from: [], candidates: [], reasons: [],
+              speech_duration_seconds: 5, segment_count: 1, first_timestamp: '10:02',
+              sample_text: null,
+              samples: [],
+              contains_multiple_speakers: false,
+              is_likely_artifact: false,
+              confirmed_by_user: null,
+            },
+            // Real-library shape (short scattered turns) -- hidden by
+            // default behind the panel's "Show N filtered rows" toggle.
+            SPEAKER_4: {
+              status: 'possible', suggested_person_id: 'p-beta', suggested_name: 'Person Beta',
+              merged_from: [],
+              candidates: [{ person_id: 'p-beta', display_name: 'Person Beta', distance: 0.35, hard_negative_conflict: false, negative_distance: null }],
+              reasons: [],
+              speech_duration_seconds: 12, segment_count: 20, first_timestamp: '08:03',
+              sample_text: null,
+              samples: [],
+              contains_multiple_speakers: false,
+              is_likely_artifact: true,
+              confirmed_by_user: null,
+            },
+          },
+        }
+      : {},
+  };
+
+  let speakerDiarizationRunId = 'e2e-speaker-run-1';
+  const speakerSuggestionsForResponse = () => {
+    if (process.env.STENOAI_E2E_SEED_SPEAKER_SINGLE_CLUSTER !== '1') {
+      return speakerState.suggestions;
+    }
+    const firstCluster = speakerState.suggestions.mic?.SPEAKER_0;
+    return firstCluster ? { mic: { SPEAKER_0: firstCluster } } : {};
+  };
+
+  const minimumSpeakerCount = (channels) => Math.max(
+    0,
+    ...Object.values(channels).map(
+      (clusters) =>
+        Object.keys(clusters).length
+        + Object.values(clusters).filter((cluster) => cluster.contains_multiple_speakers).length,
+    ),
+  );
+
+  // Mirrors Config._person_name_taken's case/whitespace-insensitive
+  // uniqueness check (src/config.py) -- keeps the mock's error path
+  // consistent with the real backend for the T1 duplicate-name tests.
+  function personNameTaken(name, excludeId) {
+    const foldName = (value) => value.trim().normalize('NFKC').toLowerCase()
+      .replaceAll('ß', 'ss').replaceAll('ς', 'σ');
+    const normalized = foldName(name);
+    return speakerState.personProfiles.some(
+      (p) => p.person_id !== excludeId && foldName(p.display_name) === normalized,
+    );
+  }
+
   // Channels with behaviour a test depends on. Each is (event, ...args) like a
   // real ipcMain.handle callback. Mirror the real handlers' return shapes from
   // app/main.js (get-ai-provider ~5950, org-* ~7990).
   const MOCKS = {
+    'reprocess-meeting': async () => {
+      if (process.env.STENOAI_E2E_REPROCESS_PENDING !== '1') return { success: true };
+      const state = global.__reprocessTest || (global.__reprocessTest = { calls: 0 });
+      state.calls++;
+      return new Promise(resolve => { state.finish = resolve; });
+    },
+    // The permissive default ({success:true}) would leave sampleRate/channels
+    // undefined, making the renderer's bytesPerFrame NaN. Mirror the real
+    // handler's shape (main.js start-linux-loopback) instead.
+    'start-linux-loopback': async () => ({ success: true, sampleRate: 48000, channels: 2 }),
     'start-recording-ui': async (_event, name, _trigger, appendTo) => {
       rec.active = true;
       rec.paused = false;
@@ -284,6 +583,11 @@ function install({ ipcMain }) {
       if (statePath) {
         try {
           const override = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
+          if (override.holdForTransferTest && !global.__transferQueueReleased) {
+            await new Promise(resolve => {
+              (global.__pendingTransferQueue ??= []).push(resolve);
+            });
+          }
           return {
             success: true,
             isProcessing: false,
@@ -312,7 +616,20 @@ function install({ ipcMain }) {
         elapsedSeconds: rec.active
           ? Math.floor(((rec.paused ? rec.pausedAt : Date.now()) - rec.startedAt) / 1000)
           : 0,
-        sessionName: rec.active || rec.processing ? rec.sessionName : null,
+        // The real main.js does NOT clear currentRecordingSessionName when the
+        // renderer reports its capture inactive — it deliberately keeps the
+        // name so a brief capture flap can't drop the "which meeting is live"
+        // label, on the assumption that "a stale name while hasRecording is
+        // false is inert" (main.js, system-audio-recording-state handler).
+        // This mock nulls it instead, which is a *more* correct contract than
+        // the app implements — and is why no T1 spec could ever reproduce the
+        // phantom "Recording" row a failed capture start left behind.
+        // STENOAI_E2E_STALE_SESSION_NAME reproduces main's actual behaviour so
+        // that regression stays covered; opt-in, so no existing spec shifts.
+        sessionName:
+          rec.active || rec.processing || process.env.STENOAI_E2E_STALE_SESSION_NAME
+            ? rec.sessionName
+            : null,
         recordingSummaryFile: rec.active ? rec.appendTo : null,
       };
     },
@@ -335,12 +652,46 @@ function install({ ipcMain }) {
       error: null,
     }),
 
-    // Engine is static per launch; STENOAI_E2E_MOCK_ENGINE lets the pill-dock
-    // T1 drive the Whisper variant (no live transcript, inline pause/resume).
     'get-transcription-engine': async () => ({
       success: true,
-      engine: process.env.STENOAI_E2E_MOCK_ENGINE || 'parakeet',
+      engine: state.transcriptionEngine,
     }),
+    'set-transcription-engine': async (_event, engine) => {
+      state.transcriptionEngine = engine;
+      return { success: true, engine };
+    },
+
+    // OpenAI-compatible ASR config. Shape-only for first paint; the real
+    // set/get round-trip + key storage is covered by cloud-asr-config.t2.
+    'get-openai-asr-config': async () => ({
+      success: true,
+      api_url: state.openAiAsrUrl,
+      api_key_set: state.openAiAsrKeySet,
+      model: state.openAiAsrModel,
+    }),
+    'set-openai-asr-config': async (_event, cfg) => {
+      if (process.env.STENOAI_E2E_OAI_ASR_SAVE_FAIL === '1') {
+        return { success: false, error: 'mock save rejected' };
+      }
+      if (cfg?.api_url !== undefined) state.openAiAsrUrl = cfg.api_url;
+      if (cfg?.model !== undefined) state.openAiAsrModel = cfg.model;
+      return {
+        success: true,
+        api_url: state.openAiAsrUrl,
+        api_key_set: state.openAiAsrKeySet,
+        model: state.openAiAsrModel,
+      };
+    },
+    'set-openai-asr-key': async (_event, key) => {
+      if (process.env.STENOAI_E2E_OAI_ASR_SAVE_FAIL === '1') {
+        return { success: false, error: 'mock save rejected' };
+      }
+      if (process.env.STENOAI_E2E_OAI_ASR_KEY_RACE === '1' && key) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      state.openAiAsrKeySet = Boolean(key);
+      return { success: true, api_key_set: state.openAiAsrKeySet };
+    },
 
     // Default not-installed keeps most T1 specs on their routes; the pill-dock
     // T1 sets STENOAI_E2E_MOCK_PARAKEET_INSTALLED=1 so App.tsx's first-run
@@ -391,6 +742,12 @@ function install({ ipcMain }) {
     // lives in MOCKS, which shadows DEFAULTS, so it is the single source for the
     // channel.
     'list-meetings': async () => {
+      if (process.env.STENOAI_E2E_MEETING_TRANSFER === '1') {
+        return { success: true, meetings: [TRANSFER_MEETING] };
+      }
+      if (process.env.STENOAI_E2E_SEED_AUDIO_MEETINGS === '1') {
+        return { success: true, meetings: AUDIO_SEED_MEETINGS };
+      }
       if (process.env.STENOAI_E2E_SEED_PENDING_NOTE === '1') {
         return { success: true, meetings: [PENDING_MEETING] };
       }
@@ -399,6 +756,9 @@ function install({ ipcMain }) {
       }
       if (process.env.STENOAI_E2E_SEED_PROCESSING_NOTE === '1') {
         return { success: true, meetings: [PROCESSING_MEETING] };
+      }
+      if (seedSpeakers) {
+        return { success: true, meetings: [seededSpeakerMeeting()] };
       }
       if (process.env.STENOAI_E2E_SEED_MEETING === '1') {
         return { success: true, meetings: [seededMeeting()] };
@@ -427,6 +787,12 @@ function install({ ipcMain }) {
     // by filtering list-meetings — answer it with the same seeded meeting so the
     // transcript-export detail route resolves and renders the transcript actions.
     'get-meeting': async (_event, summaryFile) => {
+      if (
+        process.env.STENOAI_E2E_MEETING_TRANSFER === '1' &&
+        summaryFile === TRANSFER_MEETING.session_info.summary_file
+      ) {
+        return { success: true, meeting: applyOverlay(TRANSFER_MEETING) };
+      }
       if (process.env.STENOAI_E2E_SEED_PENDING_NOTE === '1') {
         return { success: true, meeting: applyOverlay(PENDING_MEETING) };
       }
@@ -435,6 +801,9 @@ function install({ ipcMain }) {
       }
       if (process.env.STENOAI_E2E_SEED_PROCESSING_NOTE === '1') {
         return { success: true, meeting: applyOverlay(PROCESSING_MEETING) };
+      }
+      if (seedSpeakers) {
+        return { success: true, meeting: seededSpeakerMeeting() };
       }
       if (process.env.STENOAI_E2E_SEED_MEETING === '1') {
         // seededMeeting() carries main's optional template-report; applyOverlay
@@ -448,6 +817,20 @@ function install({ ipcMain }) {
         ? { success: true, meeting: applyOverlay(m) }
         : { success: false, error: 'meeting not found' };
     },
+
+    'meeting-transfer-ready': async () => ({ success: true }),
+    'import-meeting-package': async (event) => {
+      if (process.env.STENOAI_E2E_MEETING_TRANSFER !== '1') {
+        return { success: true, cancelled: true };
+      }
+      const payload = {
+        summaryFile: TRANSFER_MEETING.session_info.summary_file,
+        duplicate: false,
+      };
+      event.sender.send('meeting-transfer-imported', payload);
+      return { success: true, ...payload };
+    },
+    'export-meeting-package': async () => ({ success: true, cancelled: false }),
 
     // Soft-delete (#234). The permissive unknown-channel default would answer
     // `{success:true}` with no `id`, and useDeleteMeeting skips the Undo toast
@@ -631,17 +1014,58 @@ function install({ ipcMain }) {
     // download-progress spec can observe the bar. The app is torn down at test
     // end. Without the flag they resolve success, matching the permissive
     // default so nothing else changes.
+    'create-folder': async () => {
+      if (process.env.STENOAI_E2E_FOLDER_CREATE_PENDING !== '1') return { success: true };
+      const state = global.__folderCreateTest ||= { calls: 0, finish: null };
+      state.calls++;
+      return new Promise(resolve => { state.finish = resolve; });
+    },
+    'pull-parakeet-model': async (event, model) => {
+      if (process.env.STENOAI_E2E_SETUP_PROGRESS !== '1') return { success: true };
+      event.sender.send('parakeet-pull-progress', {
+        model, stage: 'downloading', completed_files: 1, total_files: 2, file_bytes: 120000000,
+      });
+      return new Promise(() => {});
+    },
     'setup-parakeet': async (event) => {
       if (process.env.STENOAI_E2E_SETUP_PROGRESS === '1') {
         const wc = event && event.sender;
         if (wc && !wc.isDestroyed()) {
-          // Parakeet exposes only coarse stages (no byte counts).
+          // First event may arrive before any file/byte measurement.
           wc.send('parakeet-pull-progress', { stage: 'downloading' });
         }
         return new Promise(() => {});
       }
       return { success: true, message: 'Parakeet model ready' };
     },
+    'speaker-model-status': async () => (
+      process.env.STENOAI_E2E_SPEAKER_MODEL_FAILURE === '1'
+        ? {
+            success: true,
+            ready: false,
+            cache_directory: '/tmp/e2e/models/speaker-diarization',
+            required_models: ['model'],
+            missing_models: ['model'],
+          }
+        : {
+            success: true,
+            ready: true,
+            cache_directory: '/tmp/e2e/models/speaker-diarization',
+            required_models: [],
+            missing_models: [],
+          }
+    ),
+    'setup-speaker-models': async () => (
+      process.env.STENOAI_E2E_SPEAKER_MODEL_FAILURE === '1'
+        ? { success: false, error: 'synthetic model setup failure' }
+        : {
+            success: true,
+            ready: true,
+            cache_directory: '/tmp/e2e/models/speaker-diarization',
+            required_models: [],
+            missing_models: [],
+          }
+    ),
     'setup-ollama-and-model': async (event) => {
       if (process.env.STENOAI_E2E_SETUP_PROGRESS === '1') {
         const wc = event && event.sender;
@@ -659,6 +1083,289 @@ function install({ ipcMain }) {
         return new Promise(() => {});
       }
       return { success: true, message: 'Ollama and AI model ready' };
+    },
+
+    'list-person-profiles': async () => ({ success: true, person_profiles: speakerState.personProfiles }),
+
+    'suggest-speakers': async (_event, meetingStem) => {
+      const channels = speakerSuggestionsForResponse();
+      return {
+        success: true,
+        schema_version: 1,
+        diarization_run_id: speakerDiarizationRunId,
+        meeting_id: meetingStem,
+        recording_available: seedSpeakers,
+        // Same conservative derivation as the backend: voices can leak across
+        // mic/system channels, so use the largest channel, not their sum.
+        minimum_speaker_count: minimumSpeakerCount(channels),
+        channels,
+      };
+    },
+
+    // Marks/clears "this cluster holds more than one person". Mirrors the
+    // real CLI's effect on a later suggest-speakers refetch, which is what
+    // the panel actually re-renders from: a marked cluster loses its
+    // suggestion AND its candidates, so the T1 spec sees the same row shape
+    // a real backend would produce rather than just a flag flipping.
+    'mark-speaker-cluster': async (_event, params) => {
+      const { channel, diarizationSpeakerId, containsMultipleSpeakers } = params || {};
+      const cluster = (speakerState.suggestions[channel] || {})[diarizationSpeakerId];
+      if (!cluster) {
+        return { success: false, error: `No cluster ${diarizationSpeakerId} in ${channel}` };
+      }
+      cluster.contains_multiple_speakers = Boolean(containsMultipleSpeakers);
+      const clearedFrom = [];
+      if (cluster.contains_multiple_speakers) {
+        // Only on the FIRST mark. Marking an already-marked cluster would
+        // otherwise snapshot the already-cleared state over the real one,
+        // and the undo would restore nothing.
+        cluster.prevSuggestion = cluster.prevSuggestion ?? {
+          status: cluster.status,
+          suggested_person_id: cluster.suggested_person_id,
+          suggested_name: cluster.suggested_name,
+          candidates: cluster.candidates,
+          confirmed_by_user: cluster.confirmed_by_user,
+          confirmed_person_id: cluster.confirmed_person_id,
+        };
+        cluster.status = 'none';
+        cluster.suggested_person_id = null;
+        cluster.suggested_name = null;
+        cluster.candidates = [];
+        // The real CLI also WITHDRAWS a confirmation already made on this
+        // cluster -- someone typically confirms first and only later, on a
+        // second excerpt, hears the second voice. Leaving it would keep a
+        // blended embedding enrolled as that person.
+        if (cluster.confirmed_by_user) {
+          clearedFrom.push(cluster.confirmed_by_user);
+          cluster.confirmed_by_user = null;
+          cluster.confirmed_person_id = null;
+        }
+        // "A human kept this generic" is superseded by "a human says it is
+        // several people" -- same transition the real CLI performs.
+        cluster.review_state = null;
+      } else if (cluster.prevSuggestion) {
+        Object.assign(cluster, cluster.prevSuggestion);
+        delete cluster.prevSuggestion;
+      }
+      return {
+        success: true,
+        resolved_diarization_speaker_id: diarizationSpeakerId,
+        contains_multiple_speakers: cluster.contains_multiple_speakers,
+        cleared_confirmation_from: clearedFrom,
+        minimum_speaker_count: minimumSpeakerCount(speakerSuggestionsForResponse()),
+      };
+    },
+
+    // Mutates the same speakerState the suggestions echo is built from, so
+    // a spec sees the marking the way the real backend delivers it: written
+    // to the sidecar, read back on the next suggest-speakers. The real CLI
+    // also clears it on a confirm and on a mixed marking (both are stronger
+    // statements about the same cluster); those transitions live in the two
+    // handlers above so the mock cannot drift from that contract.
+    'set-cluster-review-state': async (_event, params) => {
+      if (process.env.STENOAI_E2E_SET_REVIEW_FAIL === '1') {
+        return { success: false, error: 'simulated private backend detail' };
+      }
+      const { channel, diarizationSpeakerId, generic } = params || {};
+      const cluster = (speakerState.suggestions[channel] || {})[diarizationSpeakerId];
+      if (!cluster) {
+        return { success: false, error: `No cluster ${diarizationSpeakerId} in ${channel}` };
+      }
+      cluster.review_state = generic ? 'generic' : null;
+      return {
+        success: true,
+        resolved_diarization_speaker_id: diarizationSpeakerId,
+        fragment_ids: [diarizationSpeakerId],
+        review_state: cluster.review_state,
+      };
+    },
+
+    'speaker-naming-status': async (_event, meetingStem) => {
+      const clusters = Object.values(speakerState.suggestions).flatMap((c) => Object.values(c));
+      const countable = clusters.filter((c) => !c.contains_multiple_speakers);
+      return {
+        success: true,
+        meeting_id: meetingStem,
+        has_sidecar: seedSpeakers,
+        total_clusters: countable.length,
+        named_clusters: countable.filter((c) => c.confirmed_by_user).length,
+        unnamed_clusters: countable.filter((c) => !c.confirmed_by_user).length,
+      };
+    },
+
+    // Deterministic fake clip -- no real ffmpeg/audio decode in T1. Always
+    // "succeeds" when speaker suggestions are seeded, mirroring
+    // recording_available: true above.
+    // `segmentIndex` (which excerpt to play) is accepted and ignored: T1 has
+    // no real audio to slice, so which moment comes back is not something
+    // this tier can be honest about. That the index selects the right
+    // segment is proven where the selection actually happens -- see
+    // tests/test_speaker_multi_marking.py's sample_segments/segment_index
+    // cases and the T2 samples-ordering spec.
+    'get-speaker-sample-audio': async (_event, _meetingStem, _channel, _diarizationSpeakerId, _segmentIndex) => {
+      if (!seedSpeakers) return { success: false, error: 'no source audio available' };
+      if (process.env.STENOAI_E2E_SPEAKER_SAMPLE_FAIL === '1') {
+        return { success: false, error: 'simulated private backend detail' };
+      }
+      // A real (if silent/empty) minimal 16-bit mono WAV -- so the renderer's
+      // blob: URL construction + <audio> playback path is exercised with
+      // valid audio data, not just a placeholder string.
+      return { success: true, audio_base64: MINIMAL_WAV_BASE64 };
+    },
+
+    'get-person-sample-audio': async (_event, personId) => {
+      const profile = speakerState.personProfiles.find((person) => person.person_id === personId);
+      if (!profile?.sample_available) {
+        return { success: false, error: 'voice sample unavailable' };
+      }
+      if (process.env.STENOAI_E2E_PERSON_SAMPLE_FAIL === '1') {
+        return { success: false, error: 'simulated private backend detail' };
+      }
+      return { success: true, audio_base64: MINIMAL_WAV_BASE64 };
+    },
+
+    // Accepts either --person-id (Change) or --new-person (New person) mode,
+    // mirroring the real CLI's exactly-one-of contract. Mutates
+    // speakerState so a subsequent suggest-speakers refetch (the panel's
+    // real post-confirm behaviour) reflects the confirmation.
+    'confirm-speaker': async (_event, params) => {
+      // Test-only seam: STENOAI_E2E_CONFIRM_SPEAKER_DELAY_MS holds this
+      // mutation pending for a bit so a spec can assert on the panel's
+      // in-flight disabled state (e.g. that a SECOND row's buttons are also
+      // disabled while a FIRST row's confirm is still resolving -- a real
+      // gap found in production: overlapping confirm-speaker calls both
+      // rewrite the same saved transcript, so any two must never run
+      // concurrently). No effect when unset.
+      const delayMs = Number(process.env.STENOAI_E2E_CONFIRM_SPEAKER_DELAY_MS || 0);
+      if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if (process.env.STENOAI_E2E_CONFIRM_SPEAKER_FAIL === '1') {
+        return { success: false, error: 'simulated private backend detail' };
+      }
+      const { meetingStem, channel, diarizationSpeakerId, personId, newPersonName } = params || {};
+      if (process.env.STENOAI_E2E_STALE_SPEAKER_RUN === '1') {
+        const staleCluster = (speakerState.suggestions[channel] || {})[diarizationSpeakerId];
+        if (staleCluster) staleCluster.sample_text = 'refreshed after new analysis';
+        speakerDiarizationRunId = 'e2e-speaker-run-2';
+        return {
+          success: false,
+          error: 'This speaker analysis changed. Reload the meeting before making changes.',
+          error_code: 'stale_diarization_run',
+        };
+      }
+      if (!meetingStem || !channel || !diarizationSpeakerId) {
+        return { success: false, error: 'missing required fields' };
+      }
+      if (Boolean(personId) === Boolean(newPersonName)) {
+        return { success: false, error: 'Specify exactly one of personId or newPersonName' };
+      }
+      let person = personId
+        ? speakerState.personProfiles.find((p) => p.person_id === personId)
+        : null;
+      if (newPersonName) {
+        if (personNameTaken(newPersonName)) {
+          return { success: false, error: `A person named '${newPersonName.trim()}' already exists` };
+        }
+        person = {
+          person_id: `p-${newPersonName.toLowerCase().replace(/\s+/g, '-')}`,
+          display_name: newPersonName,
+          prototype_counts: {}, hard_negative_counts: {}, sample_available: false, updated_at: Date.now(),
+        };
+        speakerState.personProfiles.push(person);
+      }
+      if (!person) return { success: false, error: `No person profile with id ${personId}` };
+
+      // Preserve the cluster's identification anchors (duration/segment
+      // count/first_timestamp never change just because a name was
+      // confirmed) -- only the suggestion fields are overwritten.
+      const channelSuggestions = speakerState.suggestions[channel] || (speakerState.suggestions[channel] = {});
+      const previous = channelSuggestions[diarizationSpeakerId] || {
+        speech_duration_seconds: 0, segment_count: 0, first_timestamp: null,
+        sample_text: null, is_likely_artifact: false, confirmed_by_user: null,
+        confirmed_person_id: null,
+      };
+      channelSuggestions[diarizationSpeakerId] = {
+        ...previous,
+        status: 'confirmed', suggested_person_id: person.person_id, suggested_name: person.display_name,
+        merged_from: [],
+        candidates: [{ person_id: person.person_id, display_name: person.display_name, distance: 0, hard_negative_conflict: false, negative_distance: null }],
+        reasons: [],
+        // Real persisted evidence now exists for this cluster -- mirrors the
+        // real backend's confirmed_by_user derivation (a matching
+        // SpeakerPrototype), so it survives a simulated navigate-away-and-back
+        // (a fresh suggest-speakers refetch) even after this panel unmounts.
+        confirmed_by_user: person.display_name,
+        // The id travels with the name: the panel decides which people
+        // already hold a cluster of this meeting by id, never by display
+        // name (a rename can leave two profiles reading alike).
+        confirmed_person_id: person.person_id,
+        // Naming the row supersedes "a human kept this generic" -- the real
+        // CLI clears it across the whole fragment set on every confirm.
+        review_state: null,
+      };
+
+      return {
+        success: true,
+        person_id: person.person_id,
+        display_name: person.display_name,
+        prototype_id: `proto-${diarizationSpeakerId}`,
+        resolved_diarization_speaker_id: diarizationSpeakerId,
+        merged_from: [],
+        hard_negatives_added_against: [],
+        reassigned_from: [],
+        relabeled_lines: 0,
+      };
+    },
+
+    'create-person-profile': async (_event, displayName) => {
+      if (personNameTaken(displayName)) {
+        return { success: false, error: `A person named '${displayName.trim()}' already exists` };
+      }
+      const person = {
+        person_id: `p-${displayName.toLowerCase().replace(/\s+/g, '-')}`,
+        display_name: displayName,
+        prototype_counts: {}, hard_negative_counts: {}, sample_available: false, updated_at: Date.now(),
+      };
+      speakerState.personProfiles.push(person);
+      return { success: true, person_id: person.person_id, display_name: person.display_name };
+    },
+
+    'rename-person-profile': async (_event, id, displayName) => {
+      const person = speakerState.personProfiles.find((p) => p.person_id === id);
+      if (!person) return { success: false };
+      if (personNameTaken(displayName, id)) {
+        return { success: false, error: `A person named '${displayName.trim()}' already exists` };
+      }
+      person.display_name = displayName;
+      return { success: true };
+    },
+
+    // Mirrors the real backend: suggest-speakers recomputes candidates/
+    // confirmed_by_user from person_profiles on every call, so a deleted
+    // person's references disappear from any cluster that pointed at them.
+    'delete-person-profile': async (_event, id) => {
+      const delayMs = Number(process.env.STENOAI_E2E_DELETE_PERSON_DELAY_MS || 0);
+      if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if (process.env.STENOAI_E2E_DELETE_PERSON_FAIL === '1') {
+        return { success: false, error: 'simulated delete failure' };
+      }
+      const before = speakerState.personProfiles.length;
+      speakerState.personProfiles = speakerState.personProfiles.filter((p) => p.person_id !== id);
+      const deleted = speakerState.personProfiles.length < before;
+      if (deleted) {
+        for (const channelSuggestions of Object.values(speakerState.suggestions)) {
+          for (const suggestion of Object.values(channelSuggestions)) {
+            if (suggestion.suggested_person_id === id) {
+              suggestion.status = 'none';
+              suggestion.suggested_person_id = null;
+              suggestion.suggested_name = null;
+              suggestion.confirmed_by_user = null;
+              suggestion.confirmed_person_id = null;
+              suggestion.candidates = suggestion.candidates.filter((c) => c.person_id !== id);
+            }
+          }
+        }
+      }
+      return { success: deleted };
     },
   };
 
@@ -828,8 +1535,8 @@ function install({ ipcMain }) {
       supported_models: {
         [PARAKEET_MODEL_ID]: {
           name: 'Parakeet TDT v3',
-          size: '572MB',
-          installed: true,
+          size: process.platform === 'darwin' ? '2.5GB' : '670MB',
+          installed: process.env.STENOAI_E2E_MOCK_PARAKEET_INSTALLED !== '0',
           description:
             'Highest quality. Supports live transcription in English and 25 European languages — Spanish, French, German, Italian, Portuguese, Dutch, Russian, Polish, Czech, and 16 others.',
           speed: 'very fast',
@@ -955,6 +1662,11 @@ function install({ ipcMain }) {
     },
   };
 
+  // Invoked-channel log, readable from a spec via app.evaluate(). The
+  // contextBridge object is frozen, so a spec cannot spy on the renderer side;
+  // this is the observable seam for "which IPC did the renderer actually call".
+  global.__mockIpcCalls = [];
+
   const originalHandle = ipcMain.handle.bind(ipcMain);
   ipcMain.handle = (channel, realFn) => {
     let fn;
@@ -971,8 +1683,12 @@ function install({ ipcMain }) {
       // never installed under mock IPC.
       fn = async () => ({ success: true });
     }
-    return originalHandle(channel, fn);
+    return originalHandle(channel, (...args) => {
+      global.__mockIpcCalls.push(channel);
+      return fn(...args);
+    });
   };
+
 }
 
 module.exports = { install };

@@ -1,3 +1,4 @@
+import { t } from '@/i18n';
 import * as React from 'react';
 // Serialises the report markdown to an HTML string for the branded PDF, using
 // the same react-markdown renderer the detail view renders on screen.
@@ -14,6 +15,7 @@ import {
   Download,
   FileDown,
   FileText,
+  PackageOpen,
   Folder as FolderIcon,
   Globe,
   MoreHorizontal,
@@ -27,7 +29,13 @@ import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from '@/compon
 import { useQueryClient } from '@tanstack/react-query';
 import * as SelectPrimitive from '@radix-ui/react-select';
 import { MeetingsShell } from '@/components/MeetingsShell';
-import { Select, SelectContent, SelectItem, SelectSeparator } from '@/components/ui/select';
+import { SpeakerReviewPanel } from '@/components/SpeakerReviewPanel';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectSeparator,
+} from '@/components/ui/select';
 import {
   useMeeting,
   useReprocessMeeting,
@@ -48,6 +56,13 @@ import {
   useOrgBackupState,
   useUnshareFromOrgBySummary,
 } from '@/hooks/useOrg';
+import { UI_LOCALE, SYSTEM_HOUR12 } from '@/lib/locale';
+import {
+  keepNoteGenerationCause,
+  noteGenerationErrorFromResult,
+  noteGenerationErrorMessage,
+  type NoteGenerationErrorCode,
+} from '@/lib/noteGenerationError';
 import {
   Dialog,
   DialogContent,
@@ -80,6 +95,8 @@ import { useReprocessBridge } from '@/hooks/reprocessBridgeStore';
 import { useRecording } from '@/hooks/useRecording';
 import { useAutoSummarizeSetting } from '@/hooks/useSettings';
 import { NoteEditor, type NoteDraft } from './NoteEditor';
+
+import { MEETING_TRANSFER_COPY, useExportMeetingPackage } from '@/hooks/useMeetingTransfer';
 
 const LAST_OPENED_KEY = 'steno-last-opened-meeting';
 
@@ -318,7 +335,8 @@ function DetailContent({
   const [chunkProgress, setChunkProgress] = React.useState<{ step: number; total: number } | null>(
     null
   );
-  const [reprocessFailed, setReprocessFailed] = React.useState(false);
+  const [reprocessError, setReprocessError] = React.useState<NoteGenerationErrorCode | null>(null);
+  const reprocessFailed = reprocessError !== null;
   const qc = useQueryClient();
 
   // Note editing (D9): the generated note is a document until the user asks to
@@ -397,11 +415,14 @@ function DetailContent({
           setStreamText('');
           streamCache.delete(summaryFile);
         } else {
-          setReprocessFailed(true);
+          setStreamText('');
+          streamCache.delete(summaryFile);
+          setReprocessError((previous) => keepNoteGenerationCause(previous, e.error_code));
         }
         return;
       }
       setStreamPhase('done');
+      if (!e.report) setReprocessError(null);
       // Report generation reuses the summary stream. On success, refetch this
       // meeting so reports[]/active_report refresh, then land on the new report
       // (the backend marks it active) once the fresh detail payload arrives.
@@ -441,7 +462,9 @@ function DetailContent({
           setStreamText('');
           streamCache.delete(summaryFile);
         } else {
-          setReprocessFailed(true);
+          setStreamText('');
+          streamCache.delete(summaryFile);
+          setReprocessError((previous) => keepNoteGenerationCause(previous, e.error_code));
         }
         return;
       }
@@ -480,7 +503,7 @@ function DetailContent({
     setStreamText('');
     setStreamPhase('analyzing');
     setChunkProgress(null);
-    setReprocessFailed(false);
+    setReprocessError(null);
     generatingReportRef.current = true;
     streamCache.set(summaryFile, { text: '', phase: 'analyzing' });
     generateReport.mutate(
@@ -549,7 +572,7 @@ function DetailContent({
     setStreamText('');
     setStreamPhase('analyzing');
     setChunkProgress(null);
-    setReprocessFailed(false);
+    setReprocessError(null);
     streamCache.set(summaryFile, { text: '', phase: 'analyzing' });
     reprocess.mutate(
       { summaryFile, regenTitle: false, name: info.name },
@@ -559,12 +582,12 @@ function DetailContent({
         // could fire to roll the UI back — without this the analyzing/streaming
         // state would be stuck forever with no way to retry (mirrors
         // onGenerateReport's onError below).
-        onError: () => {
+        onError: (error) => {
           setStreamPhase('idle');
           setStreamText('');
           setChunkProgress(null);
           streamCache.delete(summaryFile);
-          setReprocessFailed(true);
+          setReprocessError((previous) => keepNoteGenerationCause(previous, noteGenerationErrorFromResult(error)));
         },
       }
     );
@@ -597,7 +620,7 @@ function DetailContent({
     setStreamText('');
     setStreamPhase('analyzing');
     setChunkProgress(null);
-    setReprocessFailed(false);
+    setReprocessError(null);
     streamCache.set(summaryFile, { text: '', phase: 'analyzing' });
     retranscribe.mutate(
       { summaryFile, name: info.name },
@@ -605,12 +628,12 @@ function DetailContent({
         // A rejection means the IPC/backend failed (e.g. RETRANSCRIBE_NO_AUDIO,
         // or ASR crashed) BEFORE a summary-complete could roll the UI back —
         // surface the shared reprocess failure affordance. Same as startReprocess.
-        onError: () => {
+        onError: (error) => {
           setStreamPhase('idle');
           setStreamText('');
           setChunkProgress(null);
           streamCache.delete(summaryFile);
-          setReprocessFailed(true);
+          setReprocessError((previous) => keepNoteGenerationCause(previous, noteGenerationErrorFromResult(error)));
         },
       }
     );
@@ -770,6 +793,7 @@ function DetailContent({
   // Same "is there a note here at all" test the PDF export uses, plus the two
   // states that are about to rewrite the note anyway.
   const canEditNote =
+    summaryFile.endsWith('_summary.md') &&
     canExportNotesPdf && !activeReport && streamPhase === 'idle' && !reprocess.isPending;
   const participants = asStringArray(meeting.participants);
   const keyPoints = meeting.key_points ?? [];
@@ -794,6 +818,7 @@ function DetailContent({
   // which collides for two default-"Note" notes); a recording on a *different*
   // note leaves this note's CTA untouched.
   const recording = useRecording();
+  const exportMeeting = useExportMeetingPackage();
   const isRecordingThisNote =
     recording.status !== 'idle' &&
     recording.status !== 'processing' &&
@@ -867,8 +892,10 @@ function DetailContent({
   // My notes tab: an always-available editable notes layer, independent of
   // the summary. Persists to the `## User Notes` section (autosave). Local
   // state resets per meeting because DetailContent is keyed by summaryFile.
-  const [tab, setTab] = React.useState<'summary' | 'notes'>('summary');
   const hasUserNotes = Boolean((meeting.user_notes ?? '').trim());
+  const [tab, setTab] = React.useState<'summary' | 'notes'>(() =>
+    meeting.steno_transfer && !summary && hasUserNotes ? 'notes' : 'summary'
+  );
 
   return (
     <article data-testid="meeting-detail" className="space-y-9">
@@ -891,18 +918,18 @@ function DetailContent({
             {/* Edit the generated note (D9). Only for the Standard structured
                 note (a template report is generated output with no section
                 grammar to patch) and only while nothing else is rewriting it. */}
-            {tab === 'summary' && !editing && (
+            {tab === 'summary' && !editing && summaryFile.endsWith('_summary.md') && (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <ActionIconButton
-                    label="Edit note"
+                    label={t('noteEditor.edit')}
                     onClick={() => setEditing(true)}
                     disabled={!canEditNote}
                   >
                     <PencilLine className="size-[13px]" />
                   </ActionIconButton>
                 </TooltipTrigger>
-                <TooltipContent side="bottom">Edit note</TooltipContent>
+                <TooltipContent side="bottom">{t('noteEditor.edit')}</TooltipContent>
               </Tooltip>
             )}
             <Tooltip>
@@ -1019,6 +1046,30 @@ function DetailContent({
                   <FileDown className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
                   Save notes as PDF…
                 </button>
+                {ipc().app.platform === 'darwin' && (
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-[color:var(--surface-hover)] disabled:opacity-50"
+                    style={{ color: 'var(--fg-1)' }}
+                    onClick={() => exportMeeting.mutate(info.summary_file)}
+                    disabled={
+                      exportMeeting.isPending ||
+                      recording.isLoading ||
+                      recording.reprocessingSummaryFiles.size > 0 ||
+                      recording.status === 'recording' ||
+                      recording.status === 'paused' ||
+                      recording.status === 'processing' ||
+                      isProcessing ||
+                      streamPhase !== 'idle'
+                    }
+                  >
+                    <PackageOpen
+                      className="size-[13px] shrink-0"
+                      style={{ color: 'var(--fg-2)' }}
+                    />
+                    {MEETING_TRANSFER_COPY.exportAction}
+                  </button>
+                )}
                 {/* Re-transcribe (#266): only when the source recording still
                     exists (keep-recordings was on). Disabled while a stream is on
                     screen or a recording is live on this note. */}
@@ -1266,6 +1317,7 @@ function DetailContent({
                 border: '1px solid var(--border-subtle, var(--surface-raised))',
               }}
               data-testid="reprocess-retry"
+              role="alert"
             >
               <div className="text-[15px] font-medium" style={{ color: 'var(--fg-1)' }}>
                 Notes weren’t generated
@@ -1274,8 +1326,7 @@ function DetailContent({
                 className="text-[14px] leading-[1.6]"
                 style={{ color: 'var(--fg-2)', maxWidth: '64ch' }}
               >
-                That didn’t work this time — give it another go. If it keeps failing on a long
-                meeting, switch to a smaller model in Settings.
+                {noteGenerationErrorMessage(reprocessError ?? 'generation_failed')}
               </p>
               <Button
                 className="mt-1"
@@ -1461,6 +1512,12 @@ function DetailContent({
                   </div>
                 </section>
               )}
+
+              <SpeakerReviewPanel
+                summaryFile={summaryFile}
+                isDiarised={Boolean(meeting.is_diarised)}
+                hasSpeakerSidecar={Boolean(meeting.has_speaker_sidecar)}
+              />
             </div>
           )}
         </>
@@ -1531,7 +1588,7 @@ function DetailContent({
       <ConfirmDialog
         open={confirmRegenerate}
         onOpenChange={setConfirmRegenerate}
-        title="Regenerate notes and replace your edits?"
+        title={t('noteEditor.regenerateTitle')}
         // #249: reprocess snapshots the current note as a switchable report
         // before overwriting it, so the edited version is one click away in
         // the menu next to Summary rather than gone. Say so plainly - not
@@ -1539,14 +1596,14 @@ function DetailContent({
         // by what's on screen (the Summary/report switcher), not the
         // data-testid.
         description={
-          (hasNoteEdits ? `You edited ${editedSectionsText}. ` : '') +
-          'Regenerating rewrites this note from the transcript.' +
+          (hasNoteEdits ? t('noteEditor.editedPrefix', { sections: editedSectionsText }) : '') +
+          t('noteEditor.rewriteExplanation') +
           (hasNoteEdits
-            ? ' Your edited version stays available as "Standard" with a timestamp, in the menu next to Summary.'
+            ? t('noteEditor.savedStandard')
             : '')
         }
-        confirmLabel="Regenerate notes"
-        cancelLabel="Keep my edits"
+        confirmLabel={t('noteEditor.regenerateAction')}
+        cancelLabel={t('noteEditor.keepEdits')}
         destructive
         onConfirm={() => {
           setConfirmRegenerate(false);
@@ -1557,10 +1614,10 @@ function DetailContent({
       <ConfirmDialog
         open={confirmLeaveEdit}
         onOpenChange={setConfirmLeaveEdit}
-        title="Discard your note edits?"
-        description="Your changes to this note haven't been saved yet. Leaving now discards them."
-        confirmLabel="Discard and leave"
-        cancelLabel="Keep editing"
+        title={t('noteEditor.discardTitle')}
+        description={t('noteEditor.discardDescription')}
+        confirmLabel={t('noteEditor.discardAction')}
+        cancelLabel={t('noteEditor.keepEditing')}
         destructive
         onConfirm={() => {
           setConfirmLeaveEdit(false);
@@ -2312,13 +2369,17 @@ function formatDetailDate(info: {
   if (!raw) return undefined;
   const d = new Date(raw);
   if (Number.isNaN(d.getTime())) return undefined;
-  return d.toLocaleString(undefined, {
+  // The only formatter that mixes words with a clock: English weekday/month
+  // names, but the host's 12-vs-24-hour habit — see lib/locale.ts for why those
+  // two are separated.
+  return d.toLocaleString(UI_LOCALE, {
     weekday: 'short',
     month: 'short',
     day: 'numeric',
     year: 'numeric',
     hour: 'numeric',
     minute: '2-digit',
+    hour12: SYSTEM_HOUR12,
   });
 }
 
@@ -2328,7 +2389,7 @@ function formatReportDate(raw?: string): string | undefined {
   if (!raw) return undefined;
   const d = new Date(raw);
   if (Number.isNaN(d.getTime())) return undefined;
-  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return d.toLocaleDateString(UI_LOCALE, { month: 'short', day: 'numeric' });
 }
 
 function formatDuration(seconds?: number): string | undefined {

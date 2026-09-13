@@ -107,7 +107,7 @@ vi.mock('@/lib/askBarContext', () => ({ useActiveMeeting: () => {} }));
 vi.mock('@/lib/router', () => ({ navigate: (...a: unknown[]) => h.navigate(...a) }));
 
 vi.mock('@/hooks/useRecording', () => ({
-  useRecording: () => ({ status: 'idle', recordingSummaryFile: null }),
+  useRecording: () => ({ status: 'idle', isLoading: false, reprocessingSummaryFiles: new Set(), recordingSummaryFile: null }),
 }));
 
 vi.mock('@/hooks/reprocessBridgeStore', () => ({
@@ -117,6 +117,7 @@ vi.mock('@/hooks/reprocessBridgeStore', () => ({
 
 vi.mock('@/lib/ipc', () => ({
   ipc: () => ({
+    app: { platform: 'darwin' },
     on: {
       summaryChunk: h.noop,
       summaryComplete: h.noop,

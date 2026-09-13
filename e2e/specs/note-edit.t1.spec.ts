@@ -31,7 +31,7 @@ import type { ElectronApplication, Page } from '@playwright/test';
  *    trap entirely.
  */
 
-const SUMMARY_FILE = 'epsilon_summary.json';
+const SUMMARY_FILE = 'epsilon_summary.md';
 const ORIGINAL_SUMMARY = 'The team agreed to ship on Friday; Bob owns the release notes.';
 const NEW_SUMMARY = 'The team agreed to ship on Friday, with Bob owning the release notes and QA.';
 
@@ -62,7 +62,7 @@ async function openNote(page: Page) {
 test('the note renders read-only until Edit is clicked', async ({ launchApp }) => {
   const { page } = await launchApp({
     mockIpc: true,
-    env: { STENOAI_E2E_SEED_MEETING: '1' },
+    env: { STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1' },
   });
   await openNote(page);
 
@@ -80,7 +80,7 @@ test('the note renders read-only until Edit is clicked', async ({ launchApp }) =
 test('Cancel discards the typed draft and never calls the bridge', async ({ launchApp }) => {
   const { app, page } = await launchApp({
     mockIpc: true,
-    env: { STENOAI_E2E_SEED_MEETING: '1' },
+    env: { STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1' },
   });
   await openNote(page);
 
@@ -104,7 +104,7 @@ test('Cancel discards the typed draft and never calls the bridge', async ({ laun
 test('Save calls the bridge exactly once with only the changed field', async ({ launchApp }) => {
   const { app, page } = await launchApp({
     mockIpc: true,
-    env: { STENOAI_E2E_SEED_MEETING: '1' },
+    env: { STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1' },
   });
   await openNote(page);
 
@@ -127,7 +127,7 @@ test('Save calls the bridge exactly once with only the changed field', async ({ 
 test('the regenerate confirm appears once the note carries a real edit', async ({ launchApp }) => {
   const { page } = await launchApp({
     mockIpc: true,
-    env: { STENOAI_E2E_SEED_MEETING: '1' },
+    env: { STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1' },
   });
   await openNote(page);
 
@@ -217,4 +217,11 @@ test("the floating bar's published start does nothing while the editor is open",
     .poll(async () => (await reprocessCalls(app)).length)
     .toBe(1);
   expect((await reprocessCalls(app))[0].summaryFile).toBe('stale_summary.md');
+});
+
+ test('JSON meetings do not offer the Markdown-only generated-note editor', async ({ launchApp }) => {
+  const { page } = await launchApp({ mockIpc: true, env: { STENOAI_E2E_SEED_MEETING: '1' } });
+  await page.evaluate(() => { window.location.hash = '#/meetings/epsilon_summary.json'; });
+  await expect(page.getByTestId('tab-summary-content')).toContainText(ORIGINAL_SUMMARY);
+  await expect(page.getByRole('button', { name: 'Edit note' })).toHaveCount(0);
 });

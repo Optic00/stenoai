@@ -173,13 +173,13 @@ describe('NoteEditor', () => {
     render(<NoteEditor value={DRAFT} onSave={onSave} onCancel={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: /add action item/i }));
     fireEvent.change(screen.getByLabelText('Action item 2'), {
-      target: { value: 'Ben books the room' },
+      target: { value: 'Robin books the room' },
     });
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: /save/i }));
     });
     expect(onSave).toHaveBeenCalledWith({
-      action_items: ['Anna sends the draft', 'Ben books the room'],
+      action_items: ['Anna sends the draft', 'Robin books the room'],
     });
   });
 

@@ -166,9 +166,9 @@ test('a regenerate clears the edits, so the next one does not warn', async ({
 }) => {
   test.setTimeout(90_000);
   const { summaryPath, sidecarPath } = seedNote(userDataDir, 'relooped');
-  writeUserConfig(userDataDir, { ai_provider: 'local' });
 
   const ollama = await startMockOllama({
+    port: 0,
     chatReply: [
       '## Summary',
       'A freshly generated summary.',
@@ -182,6 +182,7 @@ test('a regenerate clears the edits, so the next one does not warn', async ({
     ].join('\n'),
   });
   try {
+    writeUserConfig(userDataDir, { ai_provider: 'remote', remote_ollama_url: ollama.url, privacy_notice_seen: true });
     const { page } = await launchApp();
     const editedFields = () =>
       page.evaluate(async (file) => {

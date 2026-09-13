@@ -80,7 +80,7 @@ test('a topic without analysis renders as a bare heading', () => {
 
 test('a missing section is inserted at its canonical position, not appended', () => {
   const withoutActions = setActionItems(BODY, []);
-  const out = setActionItems(withoutActions, ['Ben books the room']);
+  const out = setActionItems(withoutActions, ['Robin books the room']);
   const actionsAt = out.indexOf('## Action Items');
   const keyPointsAt = out.indexOf('## Key Points');
   const transcriptAt = out.indexOf('## Transcript');

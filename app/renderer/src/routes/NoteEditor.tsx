@@ -1,3 +1,4 @@
+import { t } from '@/i18n';
 import * as React from 'react';
 import { Plus, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -98,11 +99,11 @@ function labelFor(
   index: number | null,
   part?: 'title' | 'analysis',
 ): string {
-  if (section === 'summary') return 'The summary';
+  if (section === 'summary') return t('noteEditor.summarySubject');
   const n = (index ?? 0) + 1;
-  if (section === 'key_points') return `Key point ${n}`;
-  if (section === 'action_items') return `Action item ${n}`;
-  return part === 'analysis' ? `Topic ${n} notes` : `Topic ${n} title`;
+  if (section === 'key_points') return t('noteEditor.keyPointNumber', { n: n });
+  if (section === 'action_items') return t('noteEditor.actionItemNumber', { n: n });
+  return part === 'analysis' ? t('noteEditor.topicNotes', { n: n }) : t('noteEditor.topicTitle', { n: n });
 }
 
 function candidateFields(patch: UpdateMeetingPatch): CandidateField[] {
@@ -283,7 +284,7 @@ function locateInDraft(draft: NoteDraft, problem: NotePatchProblem): DraftLocati
 
 function errorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error ?? '');
-  return message.trim() || 'The note could not be saved.';
+  return message.trim() || t('noteEditor.saveError');
 }
 
 /**
@@ -428,14 +429,14 @@ export function NoteEditor({ value, onSave, onCancel, onDirtyChange }: NoteEdito
       >
         <div className="flex flex-wrap items-center justify-between gap-3">
           <span className="text-[13px]" style={{ color: 'var(--fg-2)' }}>
-            Editing note
+            {t('noteEditor.editing')}
           </span>
           <div className="flex items-center gap-2">
             <Button variant="ghost" size="sm" onClick={onCancel} disabled={saving}>
-              Cancel
+              {t('noteEditor.cancel')}
             </Button>
             <Button size="sm" onClick={handleSave} disabled={!dirty || saving}>
-              {saving ? 'Saving…' : 'Save'}
+              {saving ? t('noteEditor.saving') : t('noteEditor.save')}
             </Button>
           </div>
         </div>
@@ -448,12 +449,12 @@ export function NoteEditor({ value, onSave, onCancel, onDirtyChange }: NoteEdito
 
       <div className="flex flex-col gap-9" style={EDITOR_BODY_STYLE}>
         <section className="flex flex-col gap-3">
-          <FieldLabel htmlFor={summaryId}>Summary</FieldLabel>
+          <FieldLabel htmlFor={summaryId}>{t('noteEditor.summary')}</FieldLabel>
           <GrowingTextarea
             id={summaryId}
             value={draft.summary}
             onChange={(next) => applyEdit((prev) => ({ ...prev, summary: next }))}
-            placeholder="Write the summary…"
+            placeholder={t('noteEditor.writeSummary')}
             minHeight={110}
             fontSize={15.5}
             invalid={invalid?.kind === 'summary'}
@@ -461,13 +462,13 @@ export function NoteEditor({ value, onSave, onCancel, onDirtyChange }: NoteEdito
         </section>
 
         <section className="flex flex-col gap-3">
-          <FieldLabel>Key topics</FieldLabel>
+          <FieldLabel>{t('noteEditor.topics')}</FieldLabel>
           <div className="flex flex-col gap-5">
             {draft.discussionAreas.map((area, i) => (
               <div key={i} className="flex flex-col gap-2">
                 <Row>
                   <RowInput
-                    aria-label={`Topic ${i + 1} title`}
+                    aria-label={t('noteEditor.topicTitle', { n: i + 1 })}
                     value={area.title}
                     onChange={(next) =>
                       applyEdit((prev) => ({
@@ -477,7 +478,7 @@ export function NoteEditor({ value, onSave, onCancel, onDirtyChange }: NoteEdito
                         ),
                       }))
                     }
-                    placeholder="Topic"
+                    placeholder={t('noteEditor.topic')}
                     weight={600}
                     invalid={
                       invalid?.kind === 'discussionAreas' &&
@@ -486,7 +487,7 @@ export function NoteEditor({ value, onSave, onCancel, onDirtyChange }: NoteEdito
                     }
                   />
                   <RemoveButton
-                    label={`Remove topic ${i + 1}`}
+                    label={t('noteEditor.removeTopic', { n: i + 1 })}
                     onClick={() =>
                       applyEdit((prev) => ({
                         ...prev,
@@ -496,7 +497,7 @@ export function NoteEditor({ value, onSave, onCancel, onDirtyChange }: NoteEdito
                   />
                 </Row>
                 <GrowingTextarea
-                  aria-label={`Topic ${i + 1} notes`}
+                  aria-label={t('noteEditor.topicNotes', { n: i + 1 })}
                   value={area.analysis ?? ''}
                   onChange={(next) =>
                     applyEdit((prev) => ({
@@ -506,7 +507,7 @@ export function NoteEditor({ value, onSave, onCancel, onDirtyChange }: NoteEdito
                       ),
                     }))
                   }
-                  placeholder="What was discussed…"
+                  placeholder={t('noteEditor.discussed')}
                   minHeight={64}
                   fontSize={14}
                   invalid={
@@ -518,7 +519,7 @@ export function NoteEditor({ value, onSave, onCancel, onDirtyChange }: NoteEdito
               </div>
             ))}
             <AddButton
-              label="Add topic"
+              label={t('noteEditor.addTopic')}
               onClick={() =>
                 applyEdit((prev) => ({
                   ...prev,
@@ -530,20 +531,20 @@ export function NoteEditor({ value, onSave, onCancel, onDirtyChange }: NoteEdito
         </section>
 
         <ListSection
-          title="Key points"
-          entryLabel="Key point"
-          addLabel="Add key point"
-          placeholder="A point worth remembering"
+          title={t('noteEditor.keyPoints')}
+          entryLabel={t('noteEditor.keyPoint')}
+          addLabel={t('noteEditor.addKeyPoint')}
+          placeholder={t('noteEditor.pointPlaceholder')}
           entries={draft.keyPoints}
           invalidIndex={invalid?.kind === 'keyPoints' ? invalid.index : null}
           onChange={(next) => setList('keyPoints', next)}
         />
 
         <ListSection
-          title="Action items"
-          entryLabel="Action item"
-          addLabel="Add action item"
-          placeholder="Who does what"
+          title={t('noteEditor.actionItems')}
+          entryLabel={t('noteEditor.actionItem')}
+          addLabel={t('noteEditor.addActionItem')}
+          placeholder={t('noteEditor.actionPlaceholder')}
           entries={draft.actionItems}
           invalidIndex={invalid?.kind === 'actionItems' ? invalid.index : null}
           onChange={(next) => setList('actionItems', next)}
@@ -739,7 +740,7 @@ function ListSection({
               onChange={(next) => onChange(entries.map((e, j) => (j === i ? next : e)))}
             />
             <RemoveButton
-              label={`Remove ${entryLabel.toLowerCase()} ${i + 1}`}
+              label={t('noteEditor.removeEntry', { entry: entryLabel.toLowerCase(), n: i + 1 })}
               onClick={() => onChange(entries.filter((_, j) => j !== i))}
             />
           </Row>

@@ -10,6 +10,8 @@ import { MeetingsShell } from '@/components/MeetingsShell';
 import { useNavigate } from '@/lib/router';
 import { useRecording } from '@/hooks/useRecording';
 import { useLiveMeeting } from '@/hooks/useLiveMeeting';
+import { UI_LOCALE } from '@/lib/locale';
+import { isLiveRowStatus } from '@/lib/liveMeetingRow';
 
 export function Recording() {
   const navigate = useNavigate();
@@ -18,8 +20,12 @@ export function Recording() {
 
   // If we land on /recording with no active recording (e.g. cold reload after
   // it stopped), bounce back home so we don't leave the user on a dead page.
-  // Status 'processing' is handled by the global listener which redirects to
-  // /meetings/processing.
+  // We only bounce when the session is genuinely gone: a recording/paused
+  // status means one is active or just starting (via "Take Notes" from another
+  // route, whose ~2s Parakeet warm-up leaves live.active briefly false) — never
+  // bounce that, or the user gets kicked off the page they just opened and it
+  // reads as a no-op needing a second tap. Status 'processing' is handled by
+  // the global listener which redirects to /meetings/processing.
   //
   // 500ms grace period: during a normal stop, the optimistic cache write
   // briefly transitions status (idle ↔ processing) and live.active flips off
@@ -28,17 +34,21 @@ export function Recording() {
   // home — visible most reliably when the user had been typing notes (queue
   // poll cadence + cache updates landed in a different order). The delay
   // lets the transition settle before we make any bouncing decision.
+  //
+  // isLiveRowStatus is shared with the meetings list's live row, so the row that
+  // sends the user here and this page can never disagree about whether a
+  // session runs — they used to, and the row won.
+  const hasSession = live.active || isLiveRowStatus(recording.status);
   React.useEffect(() => {
     if (recording.isLoading) return;
-    if (live.active) return;
-    if (recording.status === 'processing') return;
+    if (hasSession) return;
     const t = setTimeout(() => {
-      if (!recording.isLoading && !live.active && recording.status !== 'processing') {
+      if (!recording.isLoading && !hasSession) {
         navigate('/');
       }
     }, 500);
     return () => clearTimeout(t);
-  }, [recording.isLoading, live.active, recording.status, navigate]);
+  }, [recording.isLoading, hasSession, navigate]);
 
   const startedAt = live.startedAt ?? new Date();
 
@@ -162,7 +172,7 @@ function Chip({
 }
 
 function formatDate(d: Date): string {
-  return d.toLocaleDateString(undefined, {
+  return d.toLocaleDateString(UI_LOCALE, {
     weekday: 'short',
     day: 'numeric',
     month: 'short',

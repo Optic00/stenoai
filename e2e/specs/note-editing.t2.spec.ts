@@ -35,7 +35,7 @@ const SUMMARY_MARKDOWN = [
   '## Action Items',
   '',
   '- Anna sends the draft',
-  '- Ben books the room',
+  '- Robin books the room',
 ].join('\n');
 
 const NEW_SUMMARY = 'The team reviewed the Q3 budget and agreed to proceed on Friday.';
@@ -97,7 +97,7 @@ test('an edited note is written to the .md and survives a relaunch', async ({
   const raw = readFileSync(file, 'utf8');
   expect(raw).toContain(`## Summary\n\n${NEW_SUMMARY}`);
   expect(raw).toContain(`- ${NEW_ACTION}`);
-  expect(raw).toContain('- Ben books the room');
+  expect(raw).toContain('- Robin books the room');
   expect(raw).toContain('- Budget approved');
   expect(raw).toContain('### Budget');
   expect(raw).toContain('## Transcript');
