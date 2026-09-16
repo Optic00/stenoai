@@ -47,17 +47,25 @@ BUILTIN_TEMPLATES = {
         "name": "Product Demo",
         "icon": "presentation",
         "prompt": (
-            "Write a concise product-demo report in the same language as the speakers, "
-            "including the headings. Use each section once, with brief bullets: Stated "
-            "needs and buyer assessment; Capabilities and limitations; Commercial "
-            "terms; Open questions and next steps. Omit sections not discussed. For "
-            "each capability, state whether it was demonstrated, only promised, or "
-            "explicitly unavailable. Include stated needs and participants' own "
-            "assessment of fit; do not assess fit yourself. Preserve unsupported "
-            "requirements, conditions on pricing, and unresolved questions. Label "
-            "follow-up requests as requests until someone explicitly accepts them. "
-            "Never turn a proposed date into a deadline. Include action owners and "
-            "dates only when stated. Avoid repetition and bilingual headings."
+            "Write a concise product-demo report. Write everything, including "
+            "headings, only in the language of the meeting. Use these sections at most "
+            "once, with brief bullets, and omit any section that was not discussed: "
+            "Needs and fit; Capabilities; Commercial terms; Concerns and open "
+            "questions; Next steps. Give every capability whose status was discussed "
+            "exactly one status: "
+            "demonstrated (shown working during the meeting), available but not "
+            "shown (said to exist but not demonstrated), planned (promised for "
+            "later, with any stated timing), or not available (explicitly said to "
+            "be unsupported). Never raise a status: describing a capability is not "
+            "demonstrating it, and a plan is not availability. For each stated "
+            "need, give the status of the matching capability and the "
+            "participants' own assessment of fit; do not judge fit yourself. Keep "
+            "a need whose matching capability was not addressed under open questions "
+            "with its status marked as not established. Keep "
+            "conditions, approvals, and limits attached to the prices and offers "
+            "they apply to. A request is not an accepted task: give an owner or "
+            "date only when that person explicitly agreed to it, and otherwise "
+            "list the request as open without an owner. State each point once."
         ),
         "language": "auto",
         "format": "markdown",
@@ -67,17 +75,24 @@ BUILTIN_TEMPLATES = {
         "name": "Sales Call",
         "icon": "handshake",
         "prompt": (
-            "Write a concise sales-call report in the same language as the speakers, "
-            "including the headings. Use each section once, with brief bullets: Needs "
-            "and constraints; Budget and decision process; Alternatives; Next steps. "
-            "Omit sections not discussed. Record stated buying interest and any "
-            "explicit lack of purchase commitment. Keep buyer statements separate from "
-            "seller proposals. Preserve objections, conditions, and uncertainty. "
-            "Interest is not a purchase commitment; an estimated budget is not "
-            "approved; a proposed date is not agreed. Do not infer buying authority or "
-            "deal probability. Separate unaccepted requests from agreed actions. "
-            "Include action owners and dates only when explicitly stated. State each "
-            "fact once and avoid bilingual headings."
+            "Write a concise sales-call report. Write everything, including "
+            "headings, only in the language of the meeting. Use these sections at most "
+            "once, with brief bullets: Needs and pain points; Objections and "
+            "concerns; Budget, timeline, and decision process; Alternatives and "
+            "competitors; Commitment status; Next steps. Omit a section that was "
+            "not discussed, except Commitment status, which is always included. "
+            "Under Objections and concerns, keep every objection, hesitation, or "
+            "precondition the prospect raised, even when the seller answered it. "
+            "Under Commitment status, state plainly whether the prospect committed "
+            "to buy, committed only under conditions (name them), declined, or "
+            "made no commitment; interest alone is not a commitment. Give each "
+            "budget, date, and deadline its stated status, such as estimated, "
+            "approved, proposed, or accepted. A date suggested by one side counts "
+            "as agreed only when the other side explicitly accepts it. Attribute "
+            "positions to the prospect or the seller, and do not infer decision "
+            "authority or deal likelihood. Under Next steps, list only actions "
+            "someone agreed to take, with owners and dates as stated, and list "
+            "unanswered requests as open. State each fact once."
         ),
         "language": "auto",
         "format": "markdown",
@@ -87,16 +102,20 @@ BUILTIN_TEMPLATES = {
         "name": "1:1",
         "icon": "user-check",
         "prompt": (
-            "Write a concise 1:1 report in the same language as the speakers, including "
-            "the headings. Use each section once, with brief bullets: Updates; Feedback "
-            "and concerns; Decisions and next steps. Omit sections not discussed. "
-            "Record each person's position when they disagree, with the speaker's name "
-            "when clear. Keep both positions without judging who is right. Distinguish "
-            "suggestions and requests from agreed decisions and actions. Keep "
-            "unresolved requests explicit. Do not infer motives, feelings, or "
-            "performance ratings. Include action owners and deadlines only when "
-            "explicitly stated, preserving tentative dates and dependencies. State each "
-            "point once and avoid bilingual headings."
+            "Write a concise 1:1 report. Write everything, including headings, only "
+            "in the language of the meeting. Use these sections at most once, with "
+            "brief bullets, and omit any section that was not discussed: Updates; "
+            "Feedback; Concerns; Differing views; Decisions; Actions and open "
+            "requests. Under Differing views, give each disagreement its own "
+            "bullet: the topic, then each person's position attributed by name, "
+            "then whether it was resolved. Keep a disagreement even when it was "
+            "brief or left unresolved, and do not say who is right. Attribute "
+            "feedback, concerns, and feelings to the person who expressed them; do "
+            "not infer motives or judge performance. A suggestion or request is "
+            "not a decision: record a decision or action only when it was "
+            "explicitly agreed, and mark deferred or unanswered items as open. "
+            "Include owners, dates, and conditions only as stated. State each point "
+            "once."
         ),
         "language": "auto",
         "format": "markdown",
@@ -106,16 +125,20 @@ BUILTIN_TEMPLATES = {
         "name": "Standup",
         "icon": "list-checks",
         "prompt": (
-            "Write concise standup notes in the language of the speakers. Use one short "
-            "bullet list per identified person, and a separate topic list for "
-            "unattributed work. Each bullet should preserve the actual status: "
-            "completed, still in progress, tentative, blocked, or resolved. Keep the "
-            "specific work item attached to its status and any dependency; for example, "
-            "a plan to test an export is not a plan to test a completed login fix. "
-            "Capture explicit requests for help and accepted actions with stated owners "
-            "and times. Leave unassigned work unassigned. Include only information "
-            "discussed. Avoid empty status categories, repeated updates, and a separate "
-            "summary."
+            "Write concise standup notes. Write everything, including headings, only "
+            "in the language of the meeting. Give each identified person a short "
+            "bullet list and, if any work has no stated owner, end with one separate "
+            "list for it. "
+            "For every work item, give its status as stated: done, in progress, "
+            "planned, conditional (with the condition), blocked (with the blocker), "
+            "or unblocked. Keep each status, plan, condition, and blocker attached "
+            "to the exact item it was said about; when a person mentions several "
+            "items, never move a status, plan, or condition from one item to "
+            "another. Record requests for help. When someone agrees to help or to "
+            "take over work, list that action under the person who agreed, with "
+            "any stated time. Mention each item once: work without an owner appears "
+            "only in the final list. Include only what was said, with no empty "
+            "categories and no closing summary."
         ),
         "language": "auto",
         "format": "markdown",

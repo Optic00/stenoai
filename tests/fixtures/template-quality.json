@@ -1,90 +1,210 @@
 [
   {
+    "id": "product-demo-dev-en",
     "template": "product-demo",
+    "split": "development",
     "language": "en",
-    "transcript": "Maya (buyer): We need SSO and offline access. Leo (vendor): Here is the CSV export working in the demo. SSO is planned for December, not available today. Offline access is not supported. Maya: Then we cannot yet confirm it fits. Leo: List price is 20 euros per seat; a discount needs approval. Maya: Could you send security details next week? Leo: I need to check who can do that; no date agreed.",
+    "transcript": "Dana (buyer): We need SSO, offline access, and an audit log. Max (vendor): Here is the CSV export working in the demo. SSO is planned for December, not available today. Offline access is not supported. Dana: Then we cannot yet confirm it fits. Max: List price is 20 euros per seat; a discount needs approval. Dana: Could you send security details next week? Max: I need to check who can do that; no date agreed.",
     "expectations": [
       "CSV export demonstrated; SSO is a future plan",
-      "Offline unsupported and fit unconfirmed",
+      "Offline unsupported, audit-log status not established, and fit unconfirmed",
       "20 euros is list price; discount not approved",
       "Security follow-up requested but no accepted owner/deadline"
     ]
   },
   {
+    "id": "product-demo-dev-de",
     "template": "product-demo",
+    "split": "development",
     "language": "de",
-    "transcript": "Mara (Kundin): Wir benötigen SSO und Offline-Zugriff. Leon (Anbieter): Hier sehen Sie den CSV-Export in der Demo. SSO ist für Dezember geplant, heute aber nicht verfügbar. Offline-Zugriff wird nicht unterstützt. Mara: Dann ist die Eignung noch offen. Leon: Der Listenpreis ist 20 Euro je Nutzer, Rabatt muss genehmigt werden. Mara: Könnten Sie nächste Woche Sicherheitsunterlagen schicken? Leon: Ich muss erst klären, wer das übernehmen kann. Einen Termin haben wir nicht vereinbart.",
+    "transcript": "Sarah (Kundin): Wir brauchen SSO, Offline-Zugriff und ein Änderungsprotokoll. Tom (Anbieter): Hier sehen Sie den CSV-Export in der Demo. SSO ist für Dezember geplant, heute aber nicht verfügbar. Offline-Zugriff wird nicht unterstützt. Sarah: Dann ist die Eignung noch offen. Tom: Der Listenpreis ist 20 Euro je Nutzer, Rabatt muss genehmigt werden. Sarah: Könnten Sie nächste Woche Sicherheitsunterlagen schicken? Tom: Ich muss erst klären, wer das übernehmen kann. Einen Termin haben wir nicht vereinbart.",
     "expectations": [
       "CSV gezeigt; SSO nur geplant",
-      "Offline nicht unterstützt; Eignung offen",
-      "Listenpreis20Euro; Rabatt ungeklärt",
+      "Offline nicht unterstützt; Status des Änderungsprotokolls ungeklärt; Eignung offen",
+      "Listenpreis 20 Euro; Rabatt ungeklärt",
       "Unterlagen nur angefragt, kein vereinbarter Verantwortlicher/Termin"
     ]
   },
   {
+    "id": "sales-call-dev-en",
     "template": "sales-call",
+    "split": "development",
     "language": "en",
-    "transcript": "Ava (prospect): The manual export is our main problem. We are interested, but this is not a purchase commitment. I estimate a budget of 8000 euros; finance has not approved it. Ben (seller): Could we sign on Friday? Ava: No, legal must review first. I am not the final decision maker. We also use Atlas. Ben: I will email the security questionnaire tomorrow. Ava: Thanks, agreed. We have not agreed a signing date.",
+    "transcript": "Casey (prospect): The manual export is our main problem. We are interested, but this is not a purchase commitment. I estimate a budget of 8000 euros; finance has not approved it. Sam (seller): Could we sign on Friday? Casey: No, legal must review first. I am not the final decision maker. We also use Acme. Sam: I will email the security questionnaire tomorrow. Casey: Thanks, agreed. We have not agreed a signing date.",
     "expectations": [
       "Interest is not commitment",
       "8000 estimated, not approved",
       "Legal dependency, no signing deadline or inferred authority",
-      "Seller commits questionnaire tomorrow; competitor Atlas mentioned"
+      "Seller commits questionnaire tomorrow; competitor Acme mentioned"
     ]
   },
   {
+    "id": "sales-call-dev-de",
     "template": "sales-call",
+    "split": "development",
     "language": "de",
-    "transcript": "Eva (Interessentin): Unser Hauptproblem ist der manuelle Export. Wir sind interessiert, sagen aber keinen Kauf zu. Ich schätze das Budget auf 8000 Euro, die Finanzabteilung hat es nicht genehmigt. Tom (Vertrieb): Können wir Freitag unterschreiben? Eva: Nein, zuerst muss die Rechtsabteilung prüfen. Ich entscheide nicht abschließend. Wir nutzen auch Atlas. Tom: Ich schicke morgen den Sicherheitsfragebogen. Eva: Danke, einverstanden. Einen Termin für die Unterschrift haben wir nicht vereinbart.",
+    "transcript": "Dana (Interessentin): Unser Hauptproblem ist der manuelle Export. Wir sind interessiert, sagen aber keinen Kauf zu. Ich schätze das Budget auf 8000 Euro, die Finanzabteilung hat es nicht genehmigt. Max (Vertrieb): Können wir Freitag unterschreiben? Dana: Nein, zuerst muss die Rechtsabteilung prüfen. Ich entscheide nicht abschließend. Wir nutzen auch Acme. Max: Ich schicke morgen den Sicherheitsfragebogen. Dana: Danke, einverstanden. Einen Termin für die Unterschrift haben wir nicht vereinbart.",
     "expectations": [
       "Interesse keine Kaufzusage",
-      "8000Euro geschätzt und nicht genehmigt",
+      "8000 Euro geschätzt und nicht genehmigt",
       "Rechtsprüfung offen; Freitag nicht vereinbart",
-      "Tom schickt morgen Fragebogen; Atlas erwähnt"
+      "Max schickt morgen Fragebogen; Acme erwähnt"
     ]
   },
   {
+    "id": "one-on-one-dev-en",
     "template": "one-on-one",
+    "split": "development",
     "language": "en",
-    "transcript": "Nora: The handover documentation is finished. I feel overloaded this week. Kai: I think priorities were clear. Nora: I disagree. Kai: Maybe we could reduce meetings next month. Nora: Let's discuss that later; no decision today. Kai: I will review the workload with you on Tuesday. Nora: Agreed. I would like mentoring, but we have not assigned a mentor or date.",
+    "transcript": "Alice: The handover documentation is finished. I feel overloaded this week. Bob: I think priorities were clear. Alice: I disagree. Bob: Maybe we could reduce meetings next month. Alice: Let's discuss that later; no decision today. Bob: I will review the workload with you on Tuesday. Alice: Agreed. I would like mentoring, but we have not assigned a mentor or date.",
     "expectations": [
-      "Documentation finished; overload attributed to Nora",
+      "Documentation finished; overload attributed to Alice",
       "Priority disagreement preserved, no performance judgment",
       "Fewer meetings suggestion not decision",
-      "Kai workload review Tuesday agreed; mentoring request unassigned"
+      "Bob workload review Tuesday agreed; mentoring request unassigned"
     ]
   },
   {
+    "id": "one-on-one-dev-de",
     "template": "one-on-one",
+    "split": "development",
     "language": "de",
-    "transcript": "Nora: Die Übergabedokumentation ist fertig. Ich fühle mich diese Woche überlastet. Kai: Ich finde, die Prioritäten waren klar. Nora: Da widerspreche ich. Kai: Vielleicht könnten wir nächsten Monat weniger Meetings machen. Nora: Das besprechen wir später, heute entscheiden wir das nicht. Kai: Ich schaue mir mit dir am Dienstag die Arbeitslast an. Nora: Einverstanden. Ich wünsche mir Mentoring, aber wir haben weder eine Person noch einen Termin festgelegt.",
+    "transcript": "Sarah: Die Übergabedokumentation ist fertig. Ich fühle mich diese Woche überlastet. Tom: Ich finde, die Prioritäten waren klar. Sarah: Da widerspreche ich. Tom: Vielleicht könnten wir nächsten Monat weniger Meetings machen. Sarah: Das besprechen wir später, heute entscheiden wir das nicht. Tom: Ich schaue mir mit dir am Dienstag die Arbeitslast an. Sarah: Einverstanden. Ich wünsche mir Mentoring, aber wir haben weder eine Person noch einen Termin festgelegt.",
     "expectations": [
-      "Dokumentation fertig; Überlastung als Noras Aussage",
+      "Dokumentation fertig; Überlastung als Aussage von Sarah",
       "Uneinigkeit erhalten, kein Leistungsurteil",
       "Weniger Meetings nur Vorschlag",
-      "Kai Dienstag Arbeitslast vereinbart; Mentoring ohne Zuordnung"
+      "Tom Dienstag Arbeitslast vereinbart; Mentoring ohne Zuordnung"
     ]
   },
   {
+    "id": "standup-dev-en",
     "template": "standup",
+    "split": "development",
     "language": "en",
-    "transcript": "Lee: The login fix is finished. The export is still in progress. I might test it tomorrow if the test server is ready. Sam: I was blocked by access yesterday, but that is resolved now. Today I plan to review the tests. Unidentified speaker: The migration still needs an owner. Lee: Can someone help with the export? Sam: I will pair with Lee after lunch.",
+    "transcript": "Carol: The login fix is finished. The export is still in progress. I might test it tomorrow if the test server is ready. Sam: I was blocked by access yesterday, but that is resolved now. Today I plan to review the tests. Unidentified speaker: The migration still needs an owner. Carol: Can someone help with the export? Sam: I will pair with Carol after lunch.",
     "expectations": [
       "Login done, export ongoing",
       "Testing tomorrow conditional",
-      "Sam access blocker resolved",
-      "Migration unassigned; Sam pairing after lunch agreed"
+      "Access blocker for Sam resolved",
+      "Migration unassigned; Sam pairing with Carol after lunch agreed"
     ]
   },
   {
+    "id": "standup-dev-de",
     "template": "standup",
+    "split": "development",
     "language": "de",
-    "transcript": "Lea: Der Login-Fix ist fertig. Am Export arbeite ich noch. Vielleicht teste ich ihn morgen, falls der Testserver bereit ist. Sam: Gestern fehlte mir der Zugriff, das ist inzwischen gelöst. Heute plane ich, die Tests zu prüfen. Unbekannte Person: Für die Migration fehlt noch ein Verantwortlicher. Lea: Kann mir jemand beim Export helfen? Sam: Ich unterstütze Lea nach dem Mittagessen.",
+    "transcript": "Dana: Der Login-Fix ist fertig. Am Export arbeite ich noch. Vielleicht teste ich ihn morgen, falls der Testserver bereit ist. Sam: Gestern fehlte mir der Zugriff, das ist inzwischen gelöst. Heute plane ich, die Tests zu prüfen. Unbekannte Person: Für die Migration fehlt noch ein Verantwortlicher. Dana: Kann mir jemand beim Export helfen? Sam: Ich unterstütze Dana nach dem Mittagessen.",
     "expectations": [
       "Login fertig, Export laufend",
       "Test morgen bedingt",
-      "Sams Zugriffsproblem gelöst",
-      "Migration ohne Verantwortlichen; Sam hilft nach Mittag"
+      "Zugriffsproblem von Sam gelöst",
+      "Migration ohne Verantwortlichen; Sam hilft Dana nach Mittag"
+    ]
+  },
+  {
+    "id": "product-demo-heldout-en",
+    "template": "product-demo",
+    "split": "held-out",
+    "language": "en",
+    "transcript": "Casey (vendor): Let me share my screen. This is the scheduling board; I will drag a shift to another day so you can see it update live. Sarah (buyer): Our supervisors mostly work from tablets. Casey: There is a tablet app, but it is not installed on this laptop, so I cannot show it today. Sarah: What about a payroll connection? Casey: That is on our roadmap for the second half of next year, with no firm date. One location costs 400 dollars a month, and the multi-site discount only applies with a two-year contract. Sarah: We do not run our own servers. Casey: Good, because we do not offer a self-hosted edition. Sarah: The board looks good, but I cannot say whether it suits us until the supervisors have tried it. Can you give us a trial account? Casey: Yes, I will set one up by Thursday. Sarah: And could someone walk our accountant through invoicing? Casey: I will ask a colleague whether that is possible.",
+    "expectations": [
+      "Scheduling board shown working; tablet app said to exist but not shown",
+      "Payroll connection only on the roadmap without a date; self-hosting explicitly not offered",
+      "400 dollars a month per location; multi-site discount requires a two-year contract; buyer leaves fit open until the supervisors try it",
+      "Casey accepted the trial account by Thursday; invoicing walkthrough has no owner, Casey only agreed to ask a colleague"
+    ]
+  },
+  {
+    "id": "product-demo-heldout-de",
+    "template": "product-demo",
+    "split": "held-out",
+    "language": "de",
+    "transcript": "Casey (Anbieterin): Ich teile kurz meinen Bildschirm. Das ist die Schichtplanung; ich ziehe jetzt eine Schicht auf einen anderen Tag, damit Sie sehen, wie sie sich sofort aktualisiert. Sarah (Kundin): Unsere Schichtleitungen arbeiten meist mit Tablets. Casey: Es gibt eine Tablet-App, aber sie ist auf diesem Laptop nicht installiert, deshalb kann ich sie heute nicht zeigen. Sarah: Und eine Anbindung an die Lohnabrechnung? Casey: Die steht für die zweite Hälfte nächsten Jahres auf unserer Roadmap, ein festes Datum gibt es nicht. Ein Standort kostet 400 Euro im Monat, der Rabatt für mehrere Standorte gilt nur bei zwei Jahren Vertragslaufzeit. Sarah: Wir betreiben keine eigenen Server. Casey: Gut, eine selbst gehostete Version bieten wir auch nicht an. Sarah: Die Planung sieht gut aus, aber ob sie zu uns passt, kann ich erst sagen, wenn die Schichtleitungen sie ausprobiert haben. Können Sie uns einen Testzugang einrichten? Casey: Ja, den richte ich bis Donnerstag ein. Sarah: Und könnte jemand unserer Buchhaltung die Rechnungsstellung erklären? Casey: Ich frage eine Kollegin, ob das möglich ist.",
+    "expectations": [
+      "Schichtplanung live gezeigt; Tablet-App vorhanden, aber nicht gezeigt",
+      "Lohnabrechnung nur auf der Roadmap ohne Datum; Selbsthosting ausdrücklich nicht angeboten",
+      "400 Euro im Monat je Standort; Mehrstandort-Rabatt nur bei zwei Jahren Laufzeit; Eignung bleibt bis zum Test der Schichtleitungen offen",
+      "Testzugang bis Donnerstag von Casey zugesagt; Rechnungserklärung ohne Verantwortliche, Casey fragt nur nach"
+    ]
+  },
+  {
+    "id": "sales-call-heldout-en",
+    "template": "sales-call",
+    "split": "held-out",
+    "language": "en",
+    "transcript": "Tom (seller): Thanks for making time. Carol (prospect): Our reps type every order in again by hand, which costs us about two days a month. My worry is that your tool needs a full data import before we see any benefit. Tom: Most customers import in one afternoon. Carol: Maybe, but I still expect IT to push back on yet another vendor login. We are also looking at Acme, which our parent company already uses. Tom: Could we start a pilot on the first of next month? Carol: I cannot agree to a start date before IT has seen your data-protection documents. Let us speak again next Wednesday. Tom: Wednesday works for me. Carol: If IT signs off and the pilot shows the time savings, we would buy twenty licences. I can approve up to 15000 euros on my own; anything above that goes to our finance director. Tom: I will send the data-protection documents today.",
+    "expectations": [
+      "Two days a month lost to manual order entry; import-effort and IT-login objections kept even though Tom answered the first",
+      "Commitment is conditional: twenty licences only if IT signs off and the pilot shows the savings",
+      "Pilot start date proposed by Tom and not agreed; call next Wednesday proposed by Carol and accepted by Tom",
+      "Carol can approve up to 15000 euros alone, larger amounts go to the finance director; Acme under consideration; Tom sends the documents today"
+    ]
+  },
+  {
+    "id": "sales-call-heldout-de",
+    "template": "sales-call",
+    "split": "held-out",
+    "language": "de",
+    "transcript": "Tom (Vertrieb): Danke, dass Sie sich Zeit nehmen. Carol (Interessentin): Unser Außendienst tippt jede Bestellung von Hand neu ein, das kostet uns etwa zwei Tage im Monat. Meine Sorge ist, dass Ihr Werkzeug erst einen vollständigen Datenimport braucht, bevor wir überhaupt einen Nutzen sehen. Tom: Die meisten Kunden importieren an einem Nachmittag. Carol: Mag sein, trotzdem rechne ich damit, dass die IT sich gegen noch einen Anbieter-Login sperrt. Wir schauen uns außerdem Acme an, das unser Mutterkonzern schon nutzt. Tom: Könnten wir am Ersten des nächsten Monats mit einem Pilot starten? Carol: Einem Starttermin kann ich erst zustimmen, wenn die IT Ihre Datenschutzunterlagen gesehen hat. Lassen Sie uns nächsten Mittwoch wieder sprechen. Tom: Mittwoch passt mir. Carol: Wenn die IT zustimmt und der Pilot die Zeitersparnis zeigt, kaufen wir zwanzig Lizenzen. Allein freigeben kann ich bis 15000 Euro, alles darüber entscheidet unsere Finanzleitung. Tom: Ich schicke Ihnen die Datenschutzunterlagen heute.",
+    "expectations": [
+      "Zwei Tage im Monat für manuelle Erfassung; Einwände zu Importaufwand und IT-Login bleiben, obwohl Tom den ersten beantwortet hat",
+      "Kaufzusage nur unter Bedingungen: zwanzig Lizenzen, wenn die IT zustimmt und der Pilot die Ersparnis zeigt",
+      "Pilotstart von Tom vorgeschlagen und nicht vereinbart; Gespräch nächsten Mittwoch von Carol vorgeschlagen und von Tom angenommen",
+      "Carol gibt bis 15000 Euro allein frei, darüber entscheidet die Finanzleitung; Acme wird geprüft; Tom schickt die Unterlagen heute"
+    ]
+  },
+  {
+    "id": "one-on-one-heldout-en",
+    "template": "one-on-one",
+    "split": "held-out",
+    "language": "en",
+    "transcript": "Sam: Before we start, the onboarding guide for new hires is now published. Max: Nice work, the new hires already use it. One thing: your code reviews often arrive late in the day, which holds the others up. Sam: I see that differently. They arrive late because I am in customer calls every morning. Max: I still think reviews should come first. Sam: I disagree; the customer calls are what I was hired for. Max: Then let us try this: you block one hour after lunch for reviews for two weeks, and then we look at it again. Sam: Fine, two weeks. I would also like to attend the conference in May. Max: I cannot approve that myself. I will ask the budget owner this week, but I cannot promise anything. Sam: One more thing, your handover to me last quarter felt rushed. Max: Fair point, I will keep that in mind.",
+    "expectations": [
+      "Onboarding guide published by Sam; feedback in both directions: Max on late reviews, Sam on a rushed handover",
+      "Disagreement kept with both positions attributed: Max wants reviews first, Sam prioritises morning customer calls",
+      "Decision: one hour after lunch for reviews as a two-week trial, then revisit",
+      "Conference not approved; Max only agreed to ask the budget owner this week; no action agreed on the handover feedback"
+    ]
+  },
+  {
+    "id": "one-on-one-heldout-de",
+    "template": "one-on-one",
+    "split": "held-out",
+    "language": "de",
+    "transcript": "Sam: Vorweg, der Einarbeitungsleitfaden für neue Kolleginnen und Kollegen ist jetzt veröffentlicht. Max: Gute Arbeit, die Neuen nutzen ihn schon. Eine Sache: Deine Code-Reviews kommen oft erst spät am Tag, das hält die anderen auf. Sam: Das sehe ich anders. Sie kommen spät, weil ich jeden Vormittag Kundentermine habe. Max: Ich finde trotzdem, Reviews sollten Vorrang haben. Sam: Da bin ich anderer Meinung, für die Kundentermine wurde ich eingestellt. Max: Dann probieren wir Folgendes: Du blockst dir zwei Wochen lang nach dem Mittagessen eine Stunde für Reviews, und danach schauen wir es uns wieder an. Sam: Einverstanden, zwei Wochen. Ich würde außerdem gern im Mai zur Konferenz fahren. Max: Das kann ich nicht selbst genehmigen. Ich frage diese Woche bei der Budgetverantwortlichen nach, versprechen kann ich aber nichts. Sam: Noch etwas, deine Übergabe an mich im letzten Quartal wirkte gehetzt. Max: Berechtigter Punkt, das behalte ich im Hinterkopf.",
+    "expectations": [
+      "Einarbeitungsleitfaden von Sam veröffentlicht; Rückmeldung in beide Richtungen: Max zu späten Reviews, Sam zur gehetzten Übergabe",
+      "Uneinigkeit mit beiden Positionen erhalten: Max will Reviews zuerst, Sam priorisiert die Kundentermine am Vormittag",
+      "Entscheidung: zwei Wochen Test mit einer Stunde Reviews nach dem Mittagessen, danach neu bewerten",
+      "Konferenz nicht genehmigt; Max fragt nur diese Woche bei der Budgetverantwortlichen nach; zur Übergabe keine Maßnahme vereinbart"
+    ]
+  },
+  {
+    "id": "standup-heldout-en",
+    "template": "standup",
+    "split": "held-out",
+    "language": "en",
+    "transcript": "Dana: Yesterday I finished the invoice template. Today I start on the refund screen, and I will only deploy it on Friday if the design review is done by then. Bob: The search bug is fixed. The reporting page is still waiting for the data team to review the queries, so I cannot continue there. Dana: Carol is out today; she asked me to pass on that her translation update is ready for review. Bob: Someone reported that the mobile menu covers the logo, and nobody has picked that up yet. Could someone check the search fix on older phones? Dana: I can do that this afternoon.",
+    "expectations": [
+      "Dana: invoice template done; refund screen started, with the Friday deploy conditional on the design review and attached only to the refund screen",
+      "Bob: search bug fixed; reporting page blocked by the data team's query review",
+      "Translation update ready for review is attributed to Carol, relayed by Dana, not recorded as Dana's own work",
+      "Mobile menu issue listed once as unowned; Dana accepted checking the search fix on older phones this afternoon"
+    ]
+  },
+  {
+    "id": "standup-heldout-de",
+    "template": "standup",
+    "split": "held-out",
+    "language": "de",
+    "transcript": "Dana: Gestern habe ich die Rechnungsvorlage fertiggestellt. Heute fange ich mit der Erstattungsmaske an und spiele sie am Freitag nur aus, wenn bis dahin das Design-Review durch ist. Bob: Der Suchfehler ist behoben. Die Berichtsseite wartet noch darauf, dass das Datenteam die Abfragen prüft, da komme ich nicht weiter. Dana: Carol ist heute nicht da; sie hat mich gebeten auszurichten, dass ihr Übersetzungsupdate zur Prüfung bereit ist. Bob: Jemand hat gemeldet, dass das mobile Menü das Logo verdeckt, und bisher kümmert sich niemand darum. Könnte jemand die Suchkorrektur auf älteren Handys prüfen? Dana: Das kann ich heute Nachmittag machen.",
+    "expectations": [
+      "Dana: Rechnungsvorlage fertig; Erstattungsmaske begonnen, Ausspielen am Freitag nur nach Design-Review und nur für die Erstattungsmaske",
+      "Bob: Suchfehler behoben; Berichtsseite blockiert durch die Abfrageprüfung des Datenteams",
+      "Übersetzungsupdate gehört zu Carol, nur von Dana ausgerichtet, nicht als eigene Arbeit von Dana",
+      "Menüproblem einmal und ohne Verantwortliche aufgeführt; Dana prüft die Suchkorrektur heute Nachmittag auf älteren Handys"
     ]
   }
 ]
