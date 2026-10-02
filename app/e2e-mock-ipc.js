@@ -521,7 +521,10 @@ function install({ ipcMain }) {
   // real ipcMain.handle callback. Mirror the real handlers' return shapes from
   // app/main.js (get-ai-provider ~5950, org-* ~7990).
   const MOCKS = {
-    'reprocess-meeting': async () => {
+    // Record every call for the editor guards, including requests held open
+    // so the generation-error specs can inject a failure and retry.
+    'reprocess-meeting': async (_event, summaryFile, regenerateTitle, sessionName) => {
+      global.__stenoaiE2eReprocessCalls.push({ summaryFile, regenerateTitle, sessionName });
       if (process.env.STENOAI_E2E_REPROCESS_PENDING !== '1') return { success: true };
       const state = global.__reprocessTest || (global.__reprocessTest = { calls: 0 });
       state.calls++;
@@ -865,14 +868,6 @@ function install({ ipcMain }) {
     // into `edited_fields`, mirroring app/note-snapshot.js's markEdited so the
     // regenerate guard (which reads meeting.edited_fields) sees the same shape
     // under mock IPC that it would from the real sidecar.
-    // Recorded, then answered exactly the way the permissive unknown-channel
-    // default did (`{ success: true }`, no events): the renderer stays in its
-    // "analyzing" state, which is what the floating-bar T1 already relies on.
-    'reprocess-meeting': async (_event, summaryFile, regenerateTitle, sessionName) => {
-      global.__stenoaiE2eReprocessCalls.push({ summaryFile, regenerateTitle, sessionName });
-      return { success: true };
-    },
-
     'update-meeting': async (_event, summaryFile, patch) => {
       global.__stenoaiE2eUpdateMeetingCalls.push({ summaryFile, patch });
       if (patch && typeof patch.user_notes === 'string') {
