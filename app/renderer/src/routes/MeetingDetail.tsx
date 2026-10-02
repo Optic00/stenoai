@@ -94,7 +94,7 @@ import { pendingTitleRegens, streamCache, type StreamPhase } from '@/lib/meeting
 import { useReprocessBridge } from '@/hooks/reprocessBridgeStore';
 import { useRecording } from '@/hooks/useRecording';
 import { useAutoSummarizeSetting } from '@/hooks/useSettings';
-import { NoteEditor, type NoteDraft } from './NoteEditor';
+import { NoteEditor, hasUserNotesSectionBoundary, type NoteDraft } from './NoteEditor';
 
 import { MEETING_TRANSFER_COPY, useExportMeetingPackage } from '@/hooks/useMeetingTransfer';
 
@@ -726,7 +726,7 @@ function DetailContent({
   // (react-markdown), so the PDF can't drift from what the user is looking at.
   // Hands finished HTML to the export-note-pdf IPC, which rasterises + writes it.
   const saveNotesPdf = async () => {
-    if (!canExportNotesPdf) return;
+    if (editing || !canExportNotesPdf) return;
     setExportError(null);
     try {
       const reportForPdf = activeReport
@@ -752,6 +752,7 @@ function DetailContent({
   // Copies whichever note is on screen: the open template report when one is
   // selected, otherwise the Standard structured note.
   const copyNotes = () => {
+    if (editing || streamPhase !== 'idle') return;
     const text = buildNotesCopyText(
       noteSections,
       activeReport ? { content: stripReasoning(activeReport.content) } : null
@@ -790,11 +791,6 @@ function DetailContent({
     }
     navigate('/');
   };
-  // Same "is there a note here at all" test the PDF export uses, plus the two
-  // states that are about to rewrite the note anyway.
-  const canEditNote =
-    summaryFile.endsWith('_summary.md') &&
-    canExportNotesPdf && !activeReport && streamPhase === 'idle' && !reprocess.isPending;
   const participants = asStringArray(meeting.participants);
   const keyPoints = meeting.key_points ?? [];
   const actionItems = asStringArray(meeting.action_items);
@@ -824,6 +820,13 @@ function DetailContent({
     recording.status !== 'processing' &&
     recording.recordingSummaryFile != null &&
     recording.recordingSummaryFile === info.summary_file;
+
+  // Empty Standard notes remain editable, but an active recording or a
+  // processing placeholder still has a background writer that would replace it.
+  const canEditNote =
+    summaryFile.endsWith('_summary.md') && !activeReport &&
+    streamPhase === 'idle' && !reprocess.isPending &&
+    !isProcessing && !isRecordingThisNote;
 
   // Publish this note's reprocess trigger + streaming state so the floating
   // GenerateNotesBar (mounted at App level, above the Ask bar) drives THIS
@@ -934,13 +937,13 @@ function DetailContent({
             )}
             <Tooltip>
               <TooltipTrigger asChild>
-                {/* Disabled while a summary/report stream is on screen — the
+                {/* Disabled while an editor or summary/report stream is on screen — the
                     clipboard would otherwise get the old note while the body
                     shows the in-flux streamed text. */}
                 <ActionIconButton
                   label={copied ? 'Copied' : 'Copy notes'}
                   onClick={copyNotes}
-                  disabled={streamPhase !== 'idle'}
+                  disabled={editing || streamPhase !== 'idle'}
                 >
                   {copied ? <Check className="size-[13px]" /> : <Copy className="size-[13px]" />}
                 </ActionIconButton>
@@ -1041,7 +1044,7 @@ function DetailContent({
                   className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-[color:var(--surface-hover)] disabled:opacity-50"
                   style={{ color: 'var(--fg-1)' }}
                   onClick={() => void saveNotesPdf()}
-                  disabled={!canExportNotesPdf}
+                  disabled={editing || !canExportNotesPdf}
                 >
                   <FileDown className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
                   Save notes as PDF…
@@ -1053,6 +1056,7 @@ function DetailContent({
                     style={{ color: 'var(--fg-1)' }}
                     onClick={() => exportMeeting.mutate(info.summary_file)}
                     disabled={
+                      editing ||
                       exportMeeting.isPending ||
                       recording.isLoading ||
                       recording.reprocessingSummaryFiles.size > 0 ||
@@ -1571,7 +1575,8 @@ function DetailContent({
           // the same breath - and name where it lands by what's on screen
           // (the Summary switcher), not the data-testid.
           (hasNoteEdits
-            ? ` You edited ${editedSectionsText}. Your edited version stays available as "Standard" with a timestamp, in the menu next to Summary.`
+            ? ' ' + t('noteEditor.editedPrefix', { sections: editedSectionsText }).trimEnd() +
+              t('noteEditor.savedStandard')
             : '')
         }
         confirmLabel="Re-transcribe"
@@ -1888,30 +1893,62 @@ function MyNotesEditor({
   initialNotes: string;
 }) {
   const [value, setValue] = React.useState(initialNotes);
-  const save = useUpdateUserNotes();
+  const [saveFailed, setSaveFailed] = React.useState(false);
+  // mutateAsync is stable; the mutation wrapper changes on every render.
+  const { mutateAsync: save } = useUpdateUserNotes();
   const timerRef = React.useRef<number | null>(null);
   const savedRef = React.useRef(initialNotes);
-  const valueRef = React.useRef(value);
-  valueRef.current = value;
+  const valueRef = React.useRef(initialNotes);
+  const pendingRef = React.useRef(false);
+  const mountedRef = React.useRef(true);
+  const errorId = React.useId();
+  const invalidHeading = summaryFile.endsWith('.md') && hasUserNotesSectionBoundary(value);
 
-  const flush = React.useCallback(() => {
+  const flush = React.useCallback(function flush() {
     if (timerRef.current !== null) {
       window.clearTimeout(timerRef.current);
       timerRef.current = null;
     }
-    if (valueRef.current === savedRef.current) return;
-    savedRef.current = valueRef.current;
-    save.mutate({ summaryFile, userNotes: valueRef.current });
+    const next = valueRef.current;
+    if (pendingRef.current || next === savedRef.current) return;
+    if (summaryFile.endsWith('.md') && hasUserNotesSectionBoundary(next)) return;
+    pendingRef.current = true;
+    void (async () => {
+      try {
+        await save({ summaryFile, userNotes: next });
+        savedRef.current = next;
+        if (mountedRef.current && valueRef.current === next) setSaveFailed(false);
+      } catch {
+        if (mountedRef.current && valueRef.current === next) setSaveFailed(true);
+      } finally {
+        pendingRef.current = false;
+        // A later draft must follow the in-flight write, even when it returns
+        // to the previously saved value. Never retry the same failed value
+        // automatically; blur or the explicit retry action can try it again.
+        if (valueRef.current !== next) flush();
+      }
+    })();
   }, [save, summaryFile]);
 
   // Flush any pending edit on unmount (tab switch / navigation).
-  React.useEffect(() => flush, [flush]);
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      flush();
+    };
+  }, [flush]);
 
   const onChange = (next: string) => {
+    valueRef.current = next;
     setValue(next);
+    setSaveFailed(false);
     if (timerRef.current !== null) window.clearTimeout(timerRef.current);
     timerRef.current = window.setTimeout(flush, 800);
   };
+  const error = invalidHeading
+    ? t('myNotes.headingError')
+    : saveFailed ? t('myNotes.saveError') : null;
 
   return (
     <section className="flex flex-col gap-2" data-testid="my-notes">
@@ -1919,6 +1956,8 @@ function MyNotesEditor({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         onBlur={flush}
+        aria-invalid={invalidHeading || undefined}
+        aria-describedby={error ? errorId : undefined}
         placeholder="Write notes…"
         spellCheck
         data-testid="my-notes-input"
@@ -1931,6 +1970,16 @@ function MyNotesEditor({
           maxWidth: '64ch',
         }}
       />
+      {error && (
+        <div className="flex flex-col items-start gap-2">
+          <p id={errorId} role="alert" className="text-sm" style={{ color: 'var(--danger)' }}>
+            {error}
+          </p>
+          {saveFailed && !invalidHeading && (
+            <Button variant="outline" size="sm" onClick={flush}>{t('myNotes.retry')}</Button>
+          )}
+        </div>
+      )}
     </section>
   );
 }

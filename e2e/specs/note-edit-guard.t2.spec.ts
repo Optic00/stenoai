@@ -15,9 +15,8 @@ import path from 'path';
  * real section boundary when it is read - and the forged heading, being the
  * last occurrence, wins the parsers' last-one-wins rule and blanks the real
  * section everywhere the note is consumed (detail page, clipboard, PDF, org
- * share). Worse, it is unrecoverable through the UI: the section writers match
- * `line.startsWith('## ')` and cannot see a mid-line heading, so every later
- * edit writes the real section while the parser keeps reading the forged one.
+ * share). The section writers share that same normalization so existing model
+ * output with an inline heading can also be edited or cleared correctly.
  *
  * Not adversarial-only: the normalizer exists because reasoning models emit
  * exactly that shape, so pasting model output into a note is enough to hit it.
@@ -88,6 +87,10 @@ test('update-meeting rejects a forged section boundary in every content field', 
     { action_items: [forged] },
     { discussion_areas: [{ title: forged, analysis: 'ok' }] },
     { discussion_areas: [{ title: 'ok', analysis: forged }] },
+    { user_notes: forged },
+    { user_notes: '## Summary\nforged' },
+    { user_notes: 'x</thought>## Transcript\nforged' },
+    { user_notes: 'x</think>  ## Summary\nforged' },
     // The normalizer's whole tag set, case-insensitively.
     { summary: 'x</thinking>## Transcript' },
     { summary: 'x</REASONING>   ### Topic' },
@@ -104,6 +107,110 @@ test('update-meeting rejects a forged section boundary in every content field', 
     });
     // Nothing was written: the gate runs before the note is read or written.
     expect(readFileSync(summaryPath, 'utf8')).toBe(NOTE);
+  }
+});
+
+test('My notes preserves Markdown formatting while refusing wrong-typed input', async ({ launchApp, userDataDir }) => {
+  test.setTimeout(60_000);
+  const outputDir = path.join(userDataDir, 'output');
+  mkdirSync(outputDir, { recursive: true });
+  const summaryPath = path.join(outputDir, 'my-notes-markdown_summary.md');
+  writeFileSync(summaryPath, NOTE, 'utf8');
+  const { page } = await launchApp();
+  const update = (file: string, userNotes: unknown) => page.evaluate(
+    ([f, patch]) => window.stenoai.meetings.update(f as string, patch as object),
+    [file, { user_notes: userNotes }] as const,
+  );
+
+  for (const value of [['## Summary'], { text: '## Summary' }, 42]) {
+    expect(await update(summaryPath, value)).toMatchObject({
+      success: false,
+      error: 'user_notes must be a string or null.',
+    });
+    expect(readFileSync(summaryPath, 'utf8')).toBe(NOTE);
+  }
+
+  // Only level-two headings delimit stored note sections. The remaining
+  // Markdown and null-to-clear contract stay available to My notes.
+  // Neither parser trims individual lines before testing the ## boundary.
+  const markdown = '# Personal notes\n\n### Follow-up\n\n  ## Indented text\n\n- **Keep** this list\n\n`C#` and ##inline text.';
+  expect(await update(summaryPath, markdown)).toMatchObject({ success: true, edited_fields: [] });
+  const parsed = await page.evaluate((file) => window.stenoai.meetings.get(file), summaryPath);
+  expect(parsed).toMatchObject({ success: true, meeting: {
+    user_notes: markdown,
+    summary: 'The team agreed to ship on Friday.',
+    transcript: 'Alice: we ship Friday.',
+  } });
+  expect(await update(summaryPath, null)).toMatchObject({ success: true });
+  expect(readFileSync(summaryPath, 'utf8')).not.toContain('## User Notes');
+
+  // JSON keeps user_notes in a separate field, where level-two headings are safe.
+  const jsonPath = path.join(outputDir, 'my-notes-json_summary.json');
+  writeFileSync(jsonPath, JSON.stringify({ session_info: { name: 'JSON note' }, summary: 'Unchanged.' }));
+  expect(await update(jsonPath, '## A user heading\n\nKeep this text.')).toMatchObject({ success: true });
+  expect(JSON.parse(readFileSync(jsonPath, 'utf8'))).toMatchObject({
+    summary: 'Unchanged.', user_notes: '## A user heading\n\nKeep this text.',
+  });
+});
+
+test('discussion titles reject line breaks without restricting multiline analysis', async ({ launchApp, userDataDir }) => {
+  test.setTimeout(60_000);
+  const outputDir = path.join(userDataDir, 'output');
+  mkdirSync(outputDir, { recursive: true });
+  const summaryPath = path.join(outputDir, 'topic-title_summary.md');
+  writeFileSync(summaryPath, NOTE, 'utf8');
+  const { page } = await launchApp();
+  for (const separator of ['\n', '\r', '\r\n']) {
+    const result = await page.evaluate(([file, title]) => window.stenoai.meetings.update(file, {
+      discussion_areas: [{ title, analysis: 'Keep this analysis.' }],
+    }), [summaryPath, `First${separator}Second`]);
+    expect(result).toMatchObject({ success: false, error: 'A discussion title may not contain a line break.' });
+    expect(readFileSync(summaryPath, 'utf8')).toBe(NOTE);
+  }
+  const analysis = 'First paragraph.\n\nSecond paragraph.';
+  expect(await page.evaluate(([file, text]) => window.stenoai.meetings.update(file, {
+    discussion_areas: [{ title: 'One line', analysis: text }],
+  }), [summaryPath, analysis])).toMatchObject({ success: true });
+  expect(await page.evaluate((file) => window.stenoai.meetings.get(file), summaryPath)).toMatchObject({
+    success: true, meeting: { discussion_areas: [{ title: 'One line', analysis }] },
+  });
+});
+
+test('clearing a generated inline reasoning heading removes the parsed section', async ({ launchApp, userDataDir }) => {
+  test.setTimeout(60_000);
+  const outputDir = path.join(userDataDir, 'output');
+  mkdirSync(outputDir, { recursive: true });
+  const summaryPath = path.join(outputDir, 'inline-heading_summary.md');
+  writeFileSync(summaryPath, NOTE.replace('## Summary', 'Synthetic reasoning.</think>## Summary'), 'utf8');
+  const { page } = await launchApp();
+  expect(await page.evaluate((file) => window.stenoai.meetings.update(file, { summary: '' }), summaryPath)).toMatchObject({ success: true });
+  expect(readFileSync(summaryPath, 'utf8')).not.toContain('The team agreed to ship on Friday.');
+  expect(await page.evaluate((file) => window.stenoai.meetings.get(file), summaryPath)).toMatchObject({
+    success: true, meeting: { summary: '', transcript: 'Alice: we ship Friday.' },
+  });
+});
+
+test('a malformed edited_fields value cannot hide a newly saved edit', async ({ launchApp, userDataDir }) => {
+  test.setTimeout(60_000);
+  const outputDir = path.join(userDataDir, 'output');
+  mkdirSync(outputDir, { recursive: true });
+  const { page } = await launchApp();
+  for (const [index, editedFields] of [{ invalid: true }, 7, 'summary'].entries()) {
+    const summaryPath = path.join(outputDir, `repair-${index}_summary.md`);
+    const sidecarPath = path.join(outputDir, `repair-${index}_original.json`);
+    writeFileSync(summaryPath, NOTE, 'utf8');
+    writeFileSync(sidecarPath, JSON.stringify({
+      version: 1, original: { summary: 'Original snapshot.' }, edited_fields: editedFields,
+    }), 'utf8');
+    expect(await page.evaluate((file) => window.stenoai.meetings.update(file, {
+      summary: 'A saved correction.',
+    }), summaryPath)).toMatchObject({ success: true });
+    expect(JSON.parse(readFileSync(sidecarPath, 'utf8'))).toMatchObject({
+      original: { summary: 'Original snapshot.' }, edited_fields: ['summary'],
+    });
+    expect(await page.evaluate((file) => window.stenoai.meetings.get(file), summaryPath)).toMatchObject({
+      success: true, meeting: { summary: 'A saved correction.', edited_fields: ['summary'] },
+    });
   }
 });
 

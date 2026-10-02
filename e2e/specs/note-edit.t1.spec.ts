@@ -1,5 +1,7 @@
 import { test, expect } from '../fixtures/electron';
 import type { ElectronApplication, Page } from '@playwright/test';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
+import path from 'path';
 
 /**
  * T1 - renderer-only, mock IPC, no backend. Covers the note editor's
@@ -51,6 +53,16 @@ const reprocessCalls = (app: ElectronApplication): Promise<ReprocessCall[]> =>
       (global as unknown as { __stenoaiE2eReprocessCalls: ReprocessCall[] })
         .__stenoaiE2eReprocessCalls,
   );
+
+async function releaseNoteSave(app: ElectronApplication, success: boolean) {
+  await app.evaluate((_electron, ok) => {
+    const release = (global as unknown as {
+      __stenoaiE2eReleaseNoteSave?: (success: boolean) => void;
+    }).__stenoaiE2eReleaseNoteSave;
+    if (!release) throw new Error('No note save is pending');
+    release(ok);
+  }, success);
+}
 
 async function openNote(page: Page) {
   await page.evaluate((f) => {
@@ -122,6 +134,200 @@ test('Save calls the bridge exactly once with only the changed field', async ({ 
   expect(calls[0].summaryFile).toBe(SUMMARY_FILE);
   expect(Object.keys(calls[0].patch)).toEqual(['summary']);
   expect(calls[0].patch).toEqual({ summary: NEW_SUMMARY });
+});
+
+test('a pending save locks every draft control and a failed save restores editing', async ({ launchApp }) => {
+  const { app, page } = await launchApp({
+    mockIpc: true,
+    env: {
+      STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1',
+      STENOAI_E2E_DEFER_NOTE_SAVE: '1',
+    },
+  });
+  await openNote(page);
+  await page.getByRole('button', { name: 'Edit note' }).click();
+  const editor = page.getByTestId('note-editor');
+  const summary = page.getByRole('textbox', { name: 'Summary', exact: true });
+  await summary.fill(NEW_SUMMARY);
+  await page.getByRole('button', { name: 'Add topic', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Topic 1 title', exact: true }).fill('Release');
+  await page.getByRole('textbox', { name: 'Topic 1 notes', exact: true }).fill('QA signed off.');
+  await page.getByRole('button', { name: 'Add key point', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Key point 1', exact: true }).fill('Ready to ship');
+  await page.getByRole('button', { name: 'Add action item', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Action item 1', exact: true }).fill('Bob publishes');
+  await page.getByRole('button', { name: /^save$/i }).click();
+  await expect.poll(async () => (await updateCalls(app)).length).toBe(1);
+  // Includes text fields, Add/Remove controls, Save and Cancel. A disabled
+  // Save alone still allowed later keystrokes that were lost on completion.
+  const controls = editor.locator('input, textarea, button');
+  for (const control of await controls.all()) await expect(control).toBeDisabled();
+  await releaseNoteSave(app, false);
+  await expect(editor.getByRole('alert')).toContainText('Synthetic note save failure');
+  await expect(summary).toBeEnabled();
+  await expect(summary).toHaveValue(NEW_SUMMARY);
+  await summary.fill(`${NEW_SUMMARY} Retried.`);
+  await page.getByRole('button', { name: /^save$/i }).click();
+  await expect.poll(async () => (await updateCalls(app)).length).toBe(2);
+  await releaseNoteSave(app, true);
+  await expect(editor).toHaveCount(0);
+  await expect(page.getByTestId('tab-summary-content')).toContainText(`${NEW_SUMMARY} Retried.`);
+});
+
+test('clearing the last note section still allows reopening and writing a replacement', async ({ launchApp }) => {
+  const { app, page } = await launchApp({
+    mockIpc: true,
+    env: { STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1' },
+  });
+  await openNote(page);
+  const edit = page.getByRole('button', { name: 'Edit note' });
+  await edit.click();
+  await page.getByRole('textbox', { name: 'Summary', exact: true }).fill('');
+  await page.getByRole('button', { name: /^save$/i }).click();
+  await expect(page.getByTestId('note-editor')).toHaveCount(0);
+  expect((await updateCalls(app))[0].patch).toEqual({ summary: '' });
+  await expect(edit).toBeEnabled();
+  await edit.click();
+  const summary = page.getByRole('textbox', { name: 'Summary', exact: true });
+  await expect(summary).toHaveValue('');
+  await summary.fill(NEW_SUMMARY);
+  await page.getByRole('button', { name: /^save$/i }).click();
+  await expect(page.getByTestId('tab-summary-content')).toContainText(NEW_SUMMARY);
+});
+
+test('Copy and PDF wait until the displayed draft is saved', async ({ launchApp, userDataDir }) => {
+  const exportPath = path.join(userDataDir, 'edited-note.html');
+  const { page } = await launchApp({
+    mockIpc: true,
+    env: {
+      STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1',
+      STENOAI_E2E_EXPORT_PATH: exportPath,
+    },
+  });
+  await openNote(page);
+  // Keep the OS clipboard untouched. Record only this synthetic note's text.
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+      writeText: async (text: string) => { document.body.dataset.copiedNote = text; },
+    } });
+  });
+  await page.getByRole('button', { name: 'Edit note' }).click();
+  await page.getByRole('textbox', { name: 'Summary', exact: true }).fill(NEW_SUMMARY);
+  await expect(page.getByRole('button', { name: 'Copy notes', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'More options' }).click();
+  await expect(page.getByRole('button', { name: 'Save notes as PDF…' })).toBeDisabled();
+  expect(existsSync(exportPath)).toBe(false);
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: /^save$/i }).click();
+  await expect(page.getByTestId('note-editor')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Copy notes', exact: true }).click();
+  await expect(page.locator('body')).toHaveAttribute('data-copied-note', new RegExp('release notes and QA'));
+  await page.getByRole('button', { name: 'More options' }).click();
+  await page.getByRole('button', { name: 'Save notes as PDF…' }).click();
+  await expect.poll(() => existsSync(exportPath)).toBe(true);
+  expect(readFileSync(exportPath, 'utf8')).toContain(NEW_SUMMARY);
+});
+
+test('a heading exposed after a reasoning tag is rejected beside its field before IPC', async ({ launchApp }) => {
+  const { app, page } = await launchApp({
+    mockIpc: true,
+    env: { STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1' },
+  });
+  await openNote(page);
+  await page.getByRole('button', { name: 'Edit note' }).click();
+  const summary = page.getByRole('textbox', { name: 'Summary', exact: true });
+  await summary.fill('Reviewed.</think>## Transcript');
+  await page.getByRole('button', { name: /^save$/i }).click();
+  await expect(page.getByTestId('note-editor').getByRole('alert')).toContainText(/summary.*heading/i);
+  await expect(summary).toHaveAttribute('aria-invalid', 'true');
+  expect(await updateCalls(app)).toHaveLength(0);
+});
+
+test('My notes explains unsupported H2 headings and saves the corrected Markdown', async ({ launchApp }) => {
+  const { app, page } = await launchApp({
+    mockIpc: true,
+    env: {
+      STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1',
+      STENOAI_E2E_DEFER_NOTE_SAVE: '1',
+    },
+  });
+  await openNote(page);
+  await page.getByTestId('tab-notes').click();
+  const input = page.getByTestId('my-notes-input');
+  for (const invalid of ['## Summary\nMy own notes.', 'Reviewed.</think>## Transcript']) {
+    await input.fill(invalid);
+    await input.blur();
+    await expect(page.getByTestId('my-notes').getByRole('alert')).toContainText('##');
+    await expect(input).toHaveValue(invalid);
+    expect(await updateCalls(app)).toHaveLength(0);
+  }
+  const corrected = '# My own notes\n\n### Follow-up\nSend the deck.';
+  await input.fill(corrected);
+  await input.blur();
+  await expect.poll(async () => (await updateCalls(app)).length).toBe(1);
+  expect((await updateCalls(app))[0].patch).toEqual({ user_notes: corrected });
+  // A successful older write must not clear the newer invalid draft's warning.
+  const newerInvalid = `${corrected}\n## Another heading`;
+  await input.fill(newerInvalid);
+  await input.blur();
+  await releaseNoteSave(app, true);
+  await expect.poll(async () => page.evaluate(async (file) => {
+    const result = await window.stenoai.meetings.get(file);
+    return result.success ? result.meeting.user_notes : undefined;
+  }, SUMMARY_FILE)).toBe(corrected);
+  await expect(page.getByTestId('my-notes').getByRole('alert')).toContainText('##');
+  await expect(input).toHaveValue(newerInvalid);
+  expect(await updateCalls(app)).toHaveLength(1);
+
+  const finalNotes = `${corrected}\n### Another heading`;
+  await input.fill(finalNotes);
+  await input.blur();
+  await expect.poll(async () => (await updateCalls(app)).length).toBe(2);
+  await releaseNoteSave(app, true);
+  await expect(page.getByTestId('my-notes').getByRole('alert')).toHaveCount(0);
+  await expect.poll(async () => page.evaluate(async (file) => {
+    const result = await window.stenoai.meetings.get(file);
+    return result.success ? result.meeting.user_notes : undefined;
+  }, SUMMARY_FILE)).toBe(finalNotes);
+});
+
+test('a processing placeholder cannot open the generated-note editor', async ({ launchApp }) => {
+  const { app, page } = await launchApp({
+    mockIpc: true,
+    env: { STENOAI_E2E_SEED_PROCESSING_NOTE: '1' },
+  });
+  await page.evaluate(() => { window.location.hash = '#/meetings/processing_summary.md'; });
+  await expect(page.getByTestId('note-processing')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Edit note' })).toBeDisabled();
+  await expect(page.getByTestId('note-editor')).toHaveCount(0);
+  expect(await updateCalls(app)).toHaveLength(0);
+});
+
+test('an active paused recording locks only its own generated-note editor', async ({ launchApp, userDataDir }) => {
+  // Seed the queue as paused, so useRecording sees an active session without
+  // starting renderer capture, requesting devices, or calling recording.start.
+  const queuePath = path.join(userDataDir, 'paused-recording.json');
+  writeFileSync(queuePath, JSON.stringify({
+    hasRecording: true, isPaused: true, sessionName: 'Synthetic paused note',
+    recordingSummaryFile: SUMMARY_FILE,
+  }));
+  const { page } = await launchApp({
+    mockIpc: true,
+    env: {
+      STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1',
+      STENOAI_E2E_QUEUE_STATE_PATH: queuePath,
+    },
+  });
+  await openNote(page);
+  await expect(page.getByRole('button', { name: 'Edit note' })).toBeDisabled();
+  await expect(page.getByTestId('note-editor')).toHaveCount(0);
+  writeFileSync(queuePath, JSON.stringify({
+    hasRecording: true, isPaused: true, sessionName: 'Another synthetic note',
+    recordingSummaryFile: 'another_summary.md',
+  }));
+  await page.reload();
+  await expect(page.getByTestId('meeting-detail-title')).toContainText('Epsilon Planning');
+  await expect(page.getByRole('button', { name: 'Edit note' })).toBeEnabled();
 });
 
 test('the regenerate confirm appears once the note carries a real edit', async ({ launchApp }) => {

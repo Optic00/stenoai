@@ -870,6 +870,16 @@ function install({ ipcMain }) {
     // under mock IPC that it would from the real sidecar.
     'update-meeting': async (_event, summaryFile, patch) => {
       global.__stenoaiE2eUpdateMeetingCalls.push({ summaryFile, patch });
+      // Hold an actual note write until the T1 releases it. Metadata writes
+      // remain immediate; only the explicit test seam enables this.
+      if (process.env.STENOAI_E2E_DEFER_NOTE_SAVE === '1' && patch &&
+          ['summary', 'key_points', 'action_items', 'discussion_areas', 'user_notes'].some((key) => patch[key] !== undefined)) {
+        const success = await new Promise((resolve) => {
+          global.__stenoaiE2eReleaseNoteSave = resolve;
+        });
+        delete global.__stenoaiE2eReleaseNoteSave;
+        if (!success) return { success: false, error: 'Synthetic note save failure' };
+      }
       if (patch && typeof patch.user_notes === 'string') {
         meetingOverlay[summaryFile] = {
           ...(meetingOverlay[summaryFile] || {}),

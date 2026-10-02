@@ -52,5 +52,8 @@
   "noteEditor.removeEntry": "Remove {{entry}} {{n}}",
   "noteEditor.editedPrefix": "You edited {{sections}}. ",
   "noteEditor.rewriteExplanation": "Regenerating rewrites this note from the transcript.",
-  "noteEditor.savedStandard": " Your edited version stays available as \"Standard\" with a timestamp, in the menu next to Summary."
+  "noteEditor.savedStandard": " Your edited version stays available as \"Standard\" with a timestamp, in the menu next to Summary.",
+  "myNotes.headingError": "These notes haven't been saved. Headings starting with \"## \" aren't supported here. Use \"### \" or plain text instead.",
+  "myNotes.saveError": "Your notes could not be saved. Your text is still here. Try again before leaving.",
+  "myNotes.retry": "Try again"
 }

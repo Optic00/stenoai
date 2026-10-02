@@ -1,4 +1,4 @@
-const { test } = require('node:test');
+const { test, afterEach } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
@@ -12,8 +12,15 @@ const {
   editedFieldNames,
 } = require('./note-snapshot');
 
+const tmpDirs = new Set();
+afterEach(() => {
+  for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true });
+  tmpDirs.clear();
+});
+
 function tmpNote() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'note-snapshot-'));
+  tmpDirs.add(dir);
   const file = path.join(dir, 'Weekly_Sync_summary.md');
   fs.writeFileSync(file, '---\ntitle: "Weekly Sync"\n---\n\n## Summary\n\nhi\n', 'utf8');
   return file;
@@ -78,6 +85,24 @@ test('markEdited accumulates field names without duplicates and stamps a time', 
   assert.deepStrictEqual(back.edited_fields.sort(), ['action_items', 'summary']);
   assert.ok(back.edited_at);
 });
+
+for (const editedFields of [{ invalid: true }, 7, 'summary']) {
+  test(`markEdited repairs a non-array edited_fields value (${typeof editedFields})`, () => {
+    const note = tmpNote();
+    captureSnapshot(note, FIELDS, 'generation');
+    const file = noteSnapshotPath(note);
+    const snapshot = JSON.parse(fs.readFileSync(file, 'utf8'));
+    snapshot.edited_fields = editedFields;
+    fs.writeFileSync(file, JSON.stringify(snapshot), 'utf8');
+
+    const updated = markEdited(note, ['summary']);
+    assert.deepStrictEqual(updated.edited_fields, ['summary']);
+    assert.deepStrictEqual(editedFieldNames(note), ['summary']);
+    assert.deepStrictEqual(readSnapshot(note).original, FIELDS);
+    assert.strictEqual(readSnapshot(note).captured_at, snapshot.captured_at);
+    assert.ok(updated.edited_at);
+  });
+}
 
 test('a corrupt sidecar reads as null rather than throwing', () => {
   const note = tmpNote();

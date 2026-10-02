@@ -44,11 +44,24 @@ const BODY = [
 
 test('setSummary replaces only the summary and leaves every other section byte-identical', () => {
   const out = setSummary(BODY, 'We agreed the budget for Q3.');
-  assert.match(out, /## Summary\n\nWe agreed the budget for Q3\.\n/);
-  assert.match(out, /## Transcript\n\n\[You\] Hello\.\n/);
-  assert.match(out, /## User Notes\n\nmy own note\n/);
-  assert.match(out, /### Budget\n\nNumbers were reviewed\.\n/);
-  assert.strictEqual(out.includes('We agreed the budget.\n'), false);
+  assert.strictEqual(out, BODY.replace('We agreed the budget.', 'We agreed the budget for Q3.'));
+});
+
+for (const tag of ['think', 'thought', 'thinking', 'REASONING']) {
+  test(`clearing a section after </${tag}> removes the heading the parser recognizes`, () => {
+    const body = `Synthetic reasoning.</${tag}>## Summary\n\nOld summary.\n\n## Transcript\n\nKeep this transcript.\n`;
+    assert.strictEqual(
+      setSummary(body, ''),
+      `Synthetic reasoning.</${tag}>\n## Transcript\n\nKeep this transcript.\n`,
+    );
+  });
+}
+
+test('editing then clearing an inline reasoning heading cannot resurrect its old content', () => {
+  const body = 'Synthetic reasoning.</think>## Summary\n\nOld summary.\n\n## Transcript\n\nKeep this transcript.\n';
+  const edited = setSummary(body, 'New summary.');
+  assert.strictEqual(edited, 'Synthetic reasoning.</think>\n## Summary\n\nNew summary.\n\n## Transcript\n\nKeep this transcript.\n');
+  assert.strictEqual(setSummary(edited, ''), 'Synthetic reasoning.</think>\n## Transcript\n\nKeep this transcript.\n');
 });
 
 test('setKeyPoints rewrites the bullet list', () => {

@@ -177,7 +177,8 @@ function markEdited(summaryPath, changedFields) {
     );
     return null;
   }
-  const merged = new Set([...(snapshot.edited_fields || []), ...(changedFields || [])]);
+  const existing = Array.isArray(snapshot.edited_fields) ? snapshot.edited_fields : [];
+  const merged = new Set([...existing, ...(changedFields || [])]);
   snapshot.edited_fields = [...merged];
   snapshot.edited_at = new Date().toISOString();
   writeFileAtomicSync(file, JSON.stringify(snapshot, null, 2));

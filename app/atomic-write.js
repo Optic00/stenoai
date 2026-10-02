@@ -10,16 +10,36 @@ function writeFileAtomicSync(targetPath, data) {
   const dir = path.dirname(targetPath);
   const base = path.basename(targetPath);
   const tmpPath = path.join(dir, `.${base}.${crypto.randomBytes(6).toString('hex')}.tmp`);
+  let mode = 0o600;
   try {
-    fs.writeFileSync(tmpPath, data, 'utf8');
-    fs.renameSync(tmpPath, targetPath);
+    mode = fs.statSync(targetPath).mode & 0o777;
   } catch (err) {
-    try {
-      fs.unlinkSync(tmpPath);
-    } catch (_) {
-      // The temp file may never have been created. Nothing to clean up.
+    if (err.code !== 'ENOENT') throw err;
+  }
+  let fd;
+  let ownsTemp = false;
+  try {
+    fd = fs.openSync(tmpPath, 'wx', mode);
+    ownsTemp = true;
+    if (process.platform !== 'win32') fs.fchmodSync(fd, mode);
+    fs.writeFileSync(fd, data, 'utf8');
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tmpPath, targetPath);
+    ownsTemp = false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch (_) {
+        // Preserve the write error while still attempting cleanup.
+      }
     }
-    throw err;
+    try {
+      if (ownsTemp) fs.unlinkSync(tmpPath);
+    } catch (_) {
+      // Cleanup must not hide the original write error.
+    }
   }
 }
 

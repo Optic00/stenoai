@@ -119,41 +119,69 @@ test('an edited note is written to the .md and survives a relaunch', async ({
   await expect(second.page.getByText(NEW_ACTION)).toBeVisible();
 });
 
-test('leaving the view with unsaved edits asks first', async ({ launchApp, userDataDir }) => {
+// These are separate scenarios deliberately: on a hidden Windows runner the
+// combined clean/keep/discard journey exhausted the 30s test budget during the
+// final click, before its navigation assertion could run. Keep that budget and
+// the real UI path, but give each independent outcome its own fresh app.
+test('leaving an unchanged editor needs no confirmation', async ({ launchApp, userDataDir }) => {
   const file = writeMeetingMarkdown(userDataDir, 'leaving', {
     name: 'Leaving Note',
     summaryMarkdown: SUMMARY_MARKDOWN,
     transcript: 'Nothing to see here.',
   });
-
+  const before = readFileSync(file, 'utf8');
   const { page } = await launchApp();
   await page.getByText('Leaving Note').first().click();
   await page.getByRole('button', { name: 'Edit note' }).click();
-
-  const back = page.getByRole('button', { name: 'Back to home' });
-
-  // Nothing typed yet: there is nothing to lose, so no dialog.
-  await back.click();
+  await page.getByRole('button', { name: 'Back to home' }).click();
+  await expect(page).toHaveURL(/#\/$/);
   await expect(page.getByTestId('meeting-detail')).toHaveCount(0);
+  await expect(page.locator('[data-confirm-dialog]')).toHaveCount(0);
+  expect(readFileSync(file, 'utf8')).toBe(before);
+});
 
+test('keeping unsaved edits stays in the editor without writing', async ({ launchApp, userDataDir }) => {
+  const file = writeMeetingMarkdown(userDataDir, 'leaving', {
+    name: 'Leaving Note',
+    summaryMarkdown: SUMMARY_MARKDOWN,
+    transcript: 'Nothing to see here.',
+  });
+  const before = readFileSync(file, 'utf8');
+  const { page } = await launchApp();
   await page.getByText('Leaving Note').first().click();
   await page.getByRole('button', { name: 'Edit note' }).click();
   await page.getByRole('textbox', { name: 'Summary', exact: true }).fill('Typed but not saved.');
-
-  // Now one click on Home has to ask rather than discard silently.
-  await back.click();
+  const detailUrl = page.url();
+  await page.getByRole('button', { name: 'Back to home' }).click();
   await expect(page.locator('[data-confirm-dialog]')).toBeVisible();
   await page.getByRole('button', { name: 'Keep editing' }).click();
+  await expect(page.locator('[data-confirm-dialog]')).toHaveCount(0);
+  await expect(page).toHaveURL(detailUrl);
   await expect(page.getByTestId('note-editor')).toBeVisible();
   await expect(page.getByRole('textbox', { name: 'Summary', exact: true })).toHaveValue(
     'Typed but not saved.'
   );
+  expect(readFileSync(file, 'utf8')).toBe(before);
+});
 
-  // Confirming leaves, and the unsaved draft was never written.
-  await back.click();
+test('discarding unsaved edits returns home without writing', async ({ launchApp, userDataDir }) => {
+  const file = writeMeetingMarkdown(userDataDir, 'leaving', {
+    name: 'Leaving Note',
+    summaryMarkdown: SUMMARY_MARKDOWN,
+    transcript: 'Nothing to see here.',
+  });
+  const before = readFileSync(file, 'utf8');
+  const { page } = await launchApp();
+  await page.getByText('Leaving Note').first().click();
+  await page.getByRole('button', { name: 'Edit note' }).click();
+  await page.getByRole('textbox', { name: 'Summary', exact: true }).fill('Typed but not saved.');
+  await page.getByRole('button', { name: 'Back to home' }).click();
+  await expect(page.locator('[data-confirm-dialog]')).toBeVisible();
   await page.getByRole('button', { name: 'Discard and leave' }).click();
+  await expect(page).toHaveURL(/#\/$/);
   await expect(page.getByTestId('meeting-detail')).toHaveCount(0);
-  expect(readFileSync(file, 'utf8')).not.toContain('Typed but not saved.');
+  await expect(page.getByText('Leaving Note').first()).toBeVisible();
+  expect(readFileSync(file, 'utf8')).toBe(before);
 });
 
 test('a heading typed into a field is refused before it reaches the note', async ({
@@ -165,6 +193,7 @@ test('a heading typed into a field is refused before it reaches the note', async
     summaryMarkdown: SUMMARY_MARKDOWN,
     transcript: 'Nothing to see here.',
   });
+  const before = readFileSync(file, 'utf8');
 
   const { page } = await launchApp();
   await page.getByText('Guarded Note').first().click();
@@ -178,7 +207,5 @@ test('a heading typed into a field is refused before it reaches the note', async
   await expect(page.getByRole('alert')).toContainText(/heading/i);
   await expect(page.getByTestId('note-editor')).toBeVisible();
   await expect(summaryField).toHaveValue(/forged/);
-  expect(readFileSync(file, 'utf8')).toContain(
-    'The team reviewed the quarterly budget and agreed to proceed.'
-  );
+  expect(readFileSync(file, 'utf8')).toBe(before);
 });

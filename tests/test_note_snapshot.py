@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from simple_recorder import _write_original_snapshot
 
@@ -37,7 +38,9 @@ class WriteOriginalSnapshotTests(unittest.TestCase):
     reads back from the same file."""
 
     def setUp(self):
-        self.dir = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
         self.summary_path = self.dir / "Weekly_Sync_summary.md"
         self.summary_path.write_text(
             _NOTE_TEMPLATE.format(summary="We agreed the budget."), encoding="utf-8"
@@ -101,12 +104,12 @@ class WriteOriginalSnapshotTests(unittest.TestCase):
         self.assertEqual(after["capture"], "generation")
 
     def test_a_write_failure_never_raises_into_the_pipeline(self):
-        # A missing/read-only directory must not fail the whole run: the note
-        # matters, the snapshot is best-effort. This path also never gets far
-        # enough to read the (nonexistent) note back, so it exercises the
-        # broad except around the whole body, not just the write call.
-        unwritable = Path("/nonexistent-dir-for-test") / "x_summary.md"
-        _write_original_snapshot(unwritable)
+        original = self.summary_path.read_bytes()
+        with mock.patch("simple_recorder._atomic_write_json", side_effect=OSError("write failed")) as write:
+            _write_original_snapshot(self.summary_path)
+        write.assert_called_once()
+        self.assertEqual(self.summary_path.read_bytes(), original)
+        self.assertFalse((self.dir / "Weekly_Sync_original.json").exists())
 
     def test_a_path_not_ending_in_summary_md_is_rejected_without_writing(self):
         # Anchored guard, mirroring app/note-snapshot.js's noteSnapshotPath: an

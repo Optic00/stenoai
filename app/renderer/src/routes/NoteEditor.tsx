@@ -37,6 +37,14 @@ interface NoteEditorProps {
  * Main stays the authority, this is only the faster answer.
  */
 const STRUCTURAL_LINE = /^\s*#{1,6}\s/m;
+// Main's normalizeMarkdownForParsing exposes headings glued to reasoning
+// close-tags. Validate the same representation without changing the draft.
+const REASONING_TAG_HEADER = /(<\/(?:think|thought|thinking|reasoning)>)\s*(#{1,6}\s)/gi;
+
+/** My notes permits Markdown; only the parser's H2 section boundaries are unsafe. */
+export function hasUserNotesSectionBoundary(value: string): boolean {
+  return /^## /m.test(value.replace(REASONING_TAG_HEADER, '$1\n$2'));
+}
 
 /**
  * Single-line fields only. `renderBulletList` writes one `- ` line per entry
@@ -183,7 +191,7 @@ export function validateNotePatch(patch: UpdateMeetingPatch): NotePatchProblem |
   // Headings first, across every field: they are the case main also refuses, so
   // a patch carrying both should report the one that would fail the write.
   for (const field of fields) {
-    if (STRUCTURAL_LINE.test(field.value)) {
+    if (STRUCTURAL_LINE.test(field.value.replace(REASONING_TAG_HEADER, '$1\n$2'))) {
       return problemFor(field, "can't contain a markdown heading.");
     }
   }
@@ -447,7 +455,11 @@ export function NoteEditor({ value, onSave, onCancel, onDirtyChange }: NoteEdito
         )}
       </div>
 
-      <div className="flex flex-col gap-9" style={EDITOR_BODY_STYLE}>
+      <fieldset
+        disabled={saving}
+        className="m-0 flex min-w-0 flex-col gap-9 border-0 p-0"
+        style={EDITOR_BODY_STYLE}
+      >
         <section className="flex flex-col gap-3">
           <FieldLabel htmlFor={summaryId}>{t('noteEditor.summary')}</FieldLabel>
           <GrowingTextarea
@@ -549,7 +561,7 @@ export function NoteEditor({ value, onSave, onCancel, onDirtyChange }: NoteEdito
           invalidIndex={invalid?.kind === 'actionItems' ? invalid.index : null}
           onChange={(next) => setList('actionItems', next)}
         />
-      </div>
+      </fieldset>
     </div>
   );
 }

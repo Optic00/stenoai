@@ -24,6 +24,7 @@ from unittest import mock
 from click.testing import CliRunner
 
 import simple_recorder
+import src.config as config_module
 
 _MD_WITH_PARTICIPANTS_AND_ACTIONS = """\
 ---
@@ -312,6 +313,11 @@ class SingleLineInjectionGuardTests(unittest.TestCase):
 class GlobalChatContextTests(unittest.TestCase):
     """`chat-global-streaming` (cross-note chat) already included action
     items but dropped participants."""
+
+    def setUp(self):
+        config_patch = mock.patch.object(config_module, "_config_instance", None)
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
 
     def test_global_corpus_includes_participants(self):
         with tempfile.TemporaryDirectory() as tmp:

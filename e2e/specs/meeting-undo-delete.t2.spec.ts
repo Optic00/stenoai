@@ -83,7 +83,8 @@ function seedNote(userDataDir: string, stem: string, name: string) {
     }),
   );
   writeFileSync(reportsSidecar, JSON.stringify({ reports: [], active_report: null }));
-  // The note-snapshot sidecar every generated note now carries. It holds the
+  // Synthetic sidecar fixture: production creates snapshots for Markdown
+  // notes, while this delete test also checks cleanup beside legacy JSON. It holds the
   // model's own output for this meeting - summary, key points, action items,
   // discussion areas and the ATTENDEE NAMES - and no UI ever shows it, so if a
   // committed delete leaves it behind the meeting stays readable on disk

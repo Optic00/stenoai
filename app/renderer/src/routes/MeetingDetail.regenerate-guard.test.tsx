@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, vi } from 'vitest';
+import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
 import { act, render, screen, fireEvent, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -52,6 +52,12 @@ const h = vi.hoisted(() => {
     reprocess: { mutate: vi.fn(), isPending: false },
     retranscribe: { mutate: vi.fn(), isPending: false },
     recordingAvailable: { data: false as boolean | undefined },
+    recording: {
+      status: 'idle' as 'idle' | 'recording' | 'paused', isLoading: false,
+      reprocessingSummaryFiles: new Set<string>(), recordingSummaryFile: null as string | null,
+    },
+    userNotesSave: vi.fn(),
+    userNotesMutate: vi.fn(),
     publish: vi.fn(),
     clear: vi.fn(),
     navigate: vi.fn(),
@@ -83,7 +89,9 @@ vi.mock('@/hooks/useMeetings', () => ({
   useSetActiveReport: () => ({ mutate: vi.fn() }),
   useDeleteReport: () => ({ mutate: vi.fn() }),
   useUpdateMeeting: () => ({ mutate: vi.fn(), mutateAsync: vi.fn(), isPending: false }),
-  useUpdateUserNotes: () => ({ mutate: vi.fn() }),
+  // The wrapper is deliberately fresh on every render, like useMutation.
+  // Depending on the whole object would turn an effect cleanup into a save.
+  useUpdateUserNotes: () => ({ mutate: h.userNotesMutate, mutateAsync: h.userNotesSave }),
 }));
 
 vi.mock('@/hooks/useTemplates', () => ({ useTemplates: () => ({ templates: [] }) }));
@@ -107,7 +115,7 @@ vi.mock('@/lib/askBarContext', () => ({ useActiveMeeting: () => {} }));
 vi.mock('@/lib/router', () => ({ navigate: (...a: unknown[]) => h.navigate(...a) }));
 
 vi.mock('@/hooks/useRecording', () => ({
-  useRecording: () => ({ status: 'idle', isLoading: false, reprocessingSummaryFiles: new Set(), recordingSummaryFile: null }),
+  useRecording: () => h.recording,
 }));
 
 vi.mock('@/hooks/reprocessBridgeStore', () => ({
@@ -156,13 +164,13 @@ function makeMeeting(overrides: Partial<Meeting> = {}): Meeting {
   } as Meeting;
 }
 
-function renderDetail(meeting: Meeting) {
+function renderDetail(meeting: Meeting, summaryFile = SUMMARY_FILE) {
   h.meeting = meeting;
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <TooltipProvider>
-        <MeetingDetail summaryFile={SUMMARY_FILE} />
+        <MeetingDetail summaryFile={summaryFile} />
       </TooltipProvider>
     </QueryClientProvider>
   );
@@ -194,6 +202,87 @@ beforeEach(() => {
   h.reprocess = { mutate: vi.fn(), isPending: false };
   h.retranscribe = { mutate: vi.fn(), isPending: false };
   h.recordingAvailable = { data: false };
+  h.recording = {
+    status: 'idle', isLoading: false,
+    reprocessingSummaryFiles: new Set(), recordingSummaryFile: null,
+  };
+  h.userNotesSave.mockReset().mockResolvedValue(undefined);
+});
+
+afterEach(() => vi.useRealTimers());
+
+describe('My notes autosave', () => {
+  test('shows a failed write, retains the draft and retries the same unconfirmed value', async () => {
+    vi.useFakeTimers();
+    h.userNotesSave.mockRejectedValueOnce(new Error('Synthetic disk failure'));
+    renderDetail(makeMeeting({ user_notes: '' }));
+    fireEvent.click(screen.getByTestId('tab-notes'));
+    const input = screen.getByTestId('my-notes-input');
+    fireEvent.change(input, { target: { value: 'Keep this draft.' } });
+    await act(async () => { fireEvent.blur(input); });
+    expect(screen.getByRole('alert').textContent).toContain('could not be saved');
+    expect((input as HTMLTextAreaElement).value).toBe('Keep this draft.');
+    // Failure/status rerenders must not retry by themselves.
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(h.userNotesSave).toHaveBeenCalledTimes(1);
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Try again' })); });
+    expect(h.userNotesSave).toHaveBeenCalledTimes(2);
+    expect(h.userNotesSave).toHaveBeenLastCalledWith({ summaryFile: SUMMARY_FILE, userNotes: 'Keep this draft.' });
+    expect(screen.queryByRole('alert')).toBeNull();
+    fireEvent.blur(input);
+    expect(h.userNotesSave).toHaveBeenCalledTimes(2);
+  });
+
+  test('persists the latest draft after unmount, even when it returns to the confirmed value', async () => {
+    let release!: () => void;
+    h.userNotesSave.mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve; }));
+    const view = renderDetail(makeMeeting({ user_notes: 'Original' }));
+    fireEvent.click(screen.getByTestId('tab-notes'));
+    const input = screen.getByTestId('my-notes-input');
+    fireEvent.change(input, { target: { value: 'First edit' } });
+    fireEvent.blur(input);
+    expect(h.userNotesSave).toHaveBeenCalledTimes(1);
+    fireEvent.change(input, { target: { value: 'Original' } });
+    fireEvent.blur(input);
+    expect(h.userNotesSave).toHaveBeenCalledTimes(1);
+    view.unmount();
+    await act(async () => release());
+    expect(h.userNotesSave.mock.calls).toEqual([
+      [{ summaryFile: SUMMARY_FILE, userNotes: 'First edit' }],
+      [{ summaryFile: SUMMARY_FILE, userNotes: 'Original' }],
+    ]);
+    expect(h.userNotesSave).toHaveBeenCalledTimes(2);
+  });
+
+  test('debounces typing despite fresh mutation wrappers, then flushes once on unmount', async () => {
+    vi.useFakeTimers();
+    const view = renderDetail(makeMeeting({ user_notes: '' }));
+    fireEvent.click(screen.getByTestId('tab-notes'));
+    fireEvent.change(screen.getByTestId('my-notes-input'), { target: { value: 'A new note.' } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(799); });
+    expect(h.userNotesMutate).not.toHaveBeenCalled();
+    expect(h.userNotesSave).not.toHaveBeenCalled();
+    await act(async () => view.unmount());
+    expect(h.userNotesSave).toHaveBeenCalledTimes(1);
+    expect(h.userNotesSave).toHaveBeenCalledWith({ summaryFile: SUMMARY_FILE, userNotes: 'A new note.' });
+  });
+
+  test('keeps H2 headings valid for a JSON note', async () => {
+    const jsonFile = '/tmp/output/quarterly_summary.json';
+    renderDetail(makeMeeting({ user_notes: '' }), jsonFile);
+    fireEvent.click(screen.getByTestId('tab-notes'));
+    const input = screen.getByTestId('my-notes-input');
+    fireEvent.change(input, { target: { value: '## My heading' } });
+    await act(async () => { fireEvent.blur(input); });
+    expect(h.userNotesSave).toHaveBeenCalledWith({ summaryFile: jsonFile, userNotes: '## My heading' });
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+});
+
+test('an active recording on this note disables generated-note editing', () => {
+  h.recording = { ...h.recording, status: 'recording', recordingSummaryFile: SUMMARY_FILE };
+  renderDetail(makeMeeting());
+  expect((screen.getByRole('button', { name: 'Edit note' }) as HTMLButtonElement).disabled).toBe(true);
 });
 
 describe('the regenerate guard', () => {
@@ -295,6 +384,10 @@ describe('the regenerate guard', () => {
     // Human section names, not the raw field keys the sidecar stores.
     expect(within(box).getByText(/Key topics/)).toBeTruthy();
     expect(box.textContent).not.toContain('discussion_areas');
+    expect(within(box).getByText(/This re-runs transcription/).textContent).toBe(
+      'This re-runs transcription with your current transcription settings, replacing the transcript and regenerating the summary.' +
+      ' You edited Key topics. Your edited version stays available as "Standard" with a timestamp, in the menu next to Summary.'
+    );
     // The edited version's fate is stated once, not "replaced" and "kept" in
     // the same breath, and it names the on-screen control (the menu next to
     // the Summary switcher) rather than the data-testid.

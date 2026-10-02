@@ -1,6 +1,7 @@
 // Pure, section-scoped transforms over the BODY of a meeting note (.md) -
 // everything after the closing frontmatter '---'. Every function replaces
-// exactly one '## ' section and leaves the CONTENT of every other section
+// exactly one '## ' section after applying the parser's reasoning-tag heading
+// normalization. Apart from that normalization, other section content stays
 // intact, with one deliberate exception: joinSections trims the tail of the
 // whole body, so trailing whitespace on the last line of the LAST section is
 // dropped even when that section was not the one edited. That trim is what
@@ -16,6 +17,14 @@
 //
 // Section headings are matched case-insensitively because parseMeetingMarkdown
 // lowercases them; they are WRITTEN in canonical casing.
+
+// Shared by the parser and section writers. Keep the tag set and replacement
+// equivalent to simple_recorder._normalize_markdown_for_parsing (#346).
+const REASONING_TAG_HEADER_PATTERN = /(<\/(?:think|thought|thinking|reasoning)>)\s*(#{1,6}\s)/gi;
+
+function normalizeMarkdownForParsing(mdText) {
+  return mdText.replace(REASONING_TAG_HEADER_PATTERN, '$1\n$2');
+}
 
 const SECTION_ORDER = [
   'Summary',
@@ -49,7 +58,7 @@ function canonicalRank(heading) {
 // before the first '## ' heading and has heading === null.
 function splitSections(body) {
   const blocks = [{ heading: null, lines: [] }];
-  for (const line of String(body ?? '').split('\n')) {
+  for (const line of normalizeMarkdownForParsing(String(body ?? '')).split('\n')) {
     // '### Topic' does NOT match: index 2 is '#', not a space. Same rule as
     // parseMeetingMarkdown, so topics stay inside their parent section.
     if (line.startsWith('## ')) {
@@ -79,10 +88,8 @@ function sectionLines(content) {
 }
 
 // Replace (or insert, or with empty content remove) exactly one '## ' section.
-// Every other section keeps its heading, its position and its text; the one
-// thing not preserved is trailing whitespace at the very end of the body, which
-// joinSections trims (see above). Say it precisely rather than promising
-// byte-for-byte identity the trim does not deliver.
+// Every other section keeps its position and normalized text. joinSections
+// trims trailing whitespace at the very end of the body (see above).
 function setSection(body, heading, content) {
   const blocks = splitSections(body);
   const trimmed = String(content ?? '').replace(/\s+$/, '');
@@ -164,6 +171,7 @@ const setDiscussionAreas = (body, areas) => setSection(body, 'Key Topics', rende
 
 module.exports = {
   SECTION_ORDER,
+  normalizeMarkdownForParsing,
   containsStructuralLine,
   setSection,
   setSummary,

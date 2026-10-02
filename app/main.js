@@ -89,6 +89,7 @@ const {
   setActionItems,
   setDiscussionAreas,
   containsStructuralLine,
+  normalizeMarkdownForParsing,
 } = require('./note-sections');
 const { writeFileAtomicSync } = require('./atomic-write');
 const { readSnapshot, captureSnapshot, markEdited, editedFieldNames } = require('./note-snapshot');
@@ -2756,25 +2757,6 @@ async function readReportsSidecar(meetingPath, allowedOutputDirs) {
   }
 }
 
-// Port of simple_recorder._REASONING_TAG_HEADER_PATTERN / _normalize_markdown_for_parsing.
-// A reasoning-model summary can emit its closing think tag inline with the first
-// header (e.g. `</thought>## Summary`); without a break the section-splitter never
-// sees the `## ` at line start and drops the whole summary. This pushes the header
-// onto its own line before splitting. Scoped to think/thought/thinking/reasoning so
-// unrelated inline markup can't trigger a spurious break.
-//   Kept equivalent to the Python side for the ASCII tags + whitespace that
-//   actually occur in model output (same tag set: `i` = Python re.IGNORECASE,
-//   `g` = re.sub replaces all occurrences, `\s` spans the space/newline between
-//   tag and header). JS and Python `\s`/IGNORECASE differ only on exotic Unicode
-//   whitespace and non-ASCII case folds, which don't appear here. Any edit MUST
-//   be mirrored in simple_recorder._normalize_markdown_for_parsing (see #346).
-const REASONING_TAG_HEADER_PATTERN = /(<\/(?:think|thought|thinking|reasoning)>)\s*(#{1,6}\s)/gi;
-
-function normalizeMarkdownForParsing(mdText) {
-  // Ensure headers immediately following a reasoning tag start on a new line.
-  return mdText.replace(REASONING_TAG_HEADER_PATTERN, '$1\n$2');
-}
-
 // Mirrors simple_recorder._parse_meeting_markdown so the detail page (get-meeting)
 // can render .md meetings without a Python round-trip. The two parsers MUST stay
 // byte-for-byte equivalent on everything they surface into session_info / the
@@ -4292,6 +4274,7 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
     if (!updates || typeof updates !== 'object') {
       return { success: false, error: 'Invalid update payload' };
     }
+    const isMarkdown = realPath.endsWith('.md');
 
     // Type-check the note content fields before anything is read or written.
     // The section writers coerce with String(), so a wrong-typed value would
@@ -4327,6 +4310,9 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
     if (updates.summary !== undefined && typeof updates.summary !== 'string') {
       return { success: false, error: 'summary must be a string.' };
     }
+    if (updates.user_notes !== undefined && updates.user_notes !== null && typeof updates.user_notes !== 'string') {
+      return { success: false, error: 'user_notes must be a string or null.' };
+    }
     if (updates.key_points !== undefined) {
       if (!isStringArray(updates.key_points)) {
         return { success: false, error: 'key_points must be an array of strings.' };
@@ -4343,11 +4329,16 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
         return { success: false, error: 'An action item may not contain a line break.' };
       }
     }
-    if (updates.discussion_areas !== undefined && !isDiscussionAreaList(updates.discussion_areas)) {
-      return {
-        success: false,
-        error: 'discussion_areas must be an array of { title, analysis } objects.',
-      };
+    if (updates.discussion_areas !== undefined) {
+      if (!isDiscussionAreaList(updates.discussion_areas)) {
+        return {
+          success: false,
+          error: 'discussion_areas must be an array of { title, analysis } objects.',
+        };
+      }
+      if (updates.discussion_areas.some((area) => LINE_BREAK.test(area.title))) {
+        return { success: false, error: 'A discussion title may not contain a line break.' };
+      }
     }
 
     // The renderer is untrusted: a field containing a '## ' line would forge a
@@ -4373,7 +4364,12 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
         ? updates.discussion_areas.flatMap((area) => [area && area.title, area && area.analysis])
         : []),
     ].filter((value) => typeof value === 'string');
-    if (textCandidates.some((value) => containsStructuralLine(normalizeMarkdownForParsing(value)))) {
+    // My notes supports Markdown. Only level-two headings split the stored
+    // .md note into sections; other heading levels remain ordinary notes.
+    // JSON notes store this field separately and need no heading restriction.
+    const userNotesBoundary = isMarkdown && typeof updates.user_notes === 'string'
+      && /^## /m.test(normalizeMarkdownForParsing(updates.user_notes));
+    if (userNotesBoundary || textCandidates.some((value) => containsStructuralLine(normalizeMarkdownForParsing(value)))) {
       return { success: false, error: 'A note field may not contain a markdown heading.' };
     }
 
@@ -4385,7 +4381,6 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
       };
     }
 
-    const isMarkdown = realPath.endsWith('.md');
     let data;
 
     if (isMarkdown) {
