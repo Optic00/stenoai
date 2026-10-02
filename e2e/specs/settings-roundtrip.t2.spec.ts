@@ -170,6 +170,16 @@ test('settings setters persist each value to the right config.json key; real dir
   expect(fileSig(realUserDataDir())).toBe(realDirBefore);
 });
 
+test('Italian language survives the backend settings round-trip', async ({ launchApp, userDataDir }) => {
+  const { page } = await launchApp();
+  const result = await page.evaluate(() => window.stenoai.settings.setLanguage('it'));
+  expect(result).toMatchObject({ success: true, language: 'it' });
+  await expect.poll(() => readUserConfig(userDataDir).language).toBe('it');
+
+  const reloaded = await page.evaluate(() => window.stenoai.settings.getLanguage());
+  expect(reloaded).toMatchObject({ success: true, language: 'it' });
+});
+
 // set-microphone takes two args (device_id, label) and writes two config
 // keys, so it doesn't fit the single-value CASES shape above — same reason
 // set-storage-path gets its own test below.
