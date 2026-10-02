@@ -618,9 +618,8 @@ for (const kind of ['key', 'rollback', 'clear']) {
       fs.writeFileSync(victim, 'untouched');
       let collisionPath;
       const fsImpl = Object.create(fs);
-      fsImpl.openSync = (target, flags, mode) => {
-        assert.strictEqual(flags, 'wx');
-        assert.strictEqual(mode, 0o600);
+      const collide = (target) => {
+        if (typeof target !== 'string' || collisionPath) return;
         const selected = kind === 'rollback' ? target.endsWith('.rollback')
           : kind === 'clear' ? target.includes('.cleared.') : !target.endsWith('.rollback');
         if (selected) {
@@ -628,15 +627,30 @@ for (const kind of ['key', 'rollback', 'clear']) {
           if (process.platform === 'win32') fs.writeFileSync(target, 'untouched');
           else fs.symlinkSync(victim, target);
         }
-        return fs.openSync(target, flags, mode);
       };
-      assert.throws(() => kind === 'clear'
-        ? markEncryptedKeyClearedAtomically({ fs: fsImpl, path, keyPath, processId: 123, now: 456 })
-        : save(keyPath, 'new-key', safeStorage(), fsImpl));
+      // Cover both descriptor and direct path writes, so reverting to the old
+      // writeFileSync(path) code demonstrates the actual overwritten file.
+      fsImpl.openSync = (target, ...args) => {
+        collide(target);
+        return fs.openSync(target, ...args);
+      };
+      fsImpl.writeFileSync = (target, ...args) => {
+        collide(target);
+        return fs.writeFileSync(target, ...args);
+      };
+      let failure;
+      try {
+        if (kind === 'clear') {
+          markEncryptedKeyClearedAtomically({ fs: fsImpl, path, keyPath, processId: 123, now: 456 });
+        } else save(keyPath, 'new-key', safeStorage(), fsImpl);
+      } catch (error) {
+        failure = error;
+      }
       assert.ok(collisionPath);
       assert.strictEqual(fs.readFileSync(victim, 'utf8'), 'untouched');
       assert.strictEqual(fs.readFileSync(collisionPath, 'utf8'), 'untouched');
       assert.strictEqual(decryptedEnvelope(keyPath).key, 'old-key');
+      assert.ok(failure, 'a collision must fail without changing any existing file');
     });
   });
 }

@@ -411,13 +411,16 @@ function OpenAiAsrConfig() {
   const [model, setModel] = React.useState('');
   const [apiKey, setApiKey] = React.useState('');
   const [saveError, setSaveError] = React.useState<string | null>(null);
+  const configSaveTail = React.useRef<Promise<unknown>>(Promise.resolve());
   const keySaveTail = React.useRef<Promise<unknown>>(Promise.resolve());
   const fieldEdits = React.useRef({ api_url: 0, model: 0 });
   const dirtyFields = React.useRef({ api_url: false, model: false });
+  const committedFields = React.useRef({ api_url: DEFAULT_OPENAI_ASR_URL, model: DEFAULT_OPENAI_ASR_MODEL });
   const keyEdit = React.useRef(0);
 
   React.useEffect(() => {
     if (config.data) {
+      committedFields.current = { api_url: config.data.api_url, model: config.data.model };
       if (!dirtyFields.current.api_url) setApiUrl(config.data.api_url);
       if (!dirtyFields.current.model) setModel(config.data.model);
     }
@@ -427,8 +430,14 @@ function OpenAiAsrConfig() {
 
   const saveEndpointField = (field: 'api_url' | 'model', value: string) => {
     const edit = fieldEdits.current[field];
-    void setConfig.mutateAsync({ [field]: value })
+    // Preserve blur order even when a later edit returns to the cached value.
+    const operation = configSaveTail.current
+      .catch(() => undefined)
+      .then(() => setConfig.mutateAsync({ [field]: value }));
+    configSaveTail.current = operation;
+    void operation
       .then((saved) => {
+        committedFields.current[field] = saved[field] ?? (field === 'api_url' ? DEFAULT_OPENAI_ASR_URL : DEFAULT_OPENAI_ASR_MODEL);
         if (fieldEdits.current[field] !== edit) return;
         dirtyFields.current[field] = false;
         setSaveError(null);
@@ -442,8 +451,8 @@ function OpenAiAsrConfig() {
         // displayed committed value instead of leaving a value that is not
         // actually active, especially important for an audio-upload endpoint.
         setSaveError(t('settings.ai.cloudAsr.saveSettingError'));
-        if (field === 'api_url') setApiUrl(config.data?.api_url ?? DEFAULT_OPENAI_ASR_URL);
-        else setModel(config.data?.model ?? DEFAULT_OPENAI_ASR_MODEL);
+        if (field === 'api_url') setApiUrl(committedFields.current.api_url);
+        else setModel(committedFields.current.model);
       });
   };
 
@@ -496,7 +505,7 @@ function OpenAiAsrConfig() {
             // otherwise the stale value would return on the next refresh.
             const next = apiUrl.trim() || DEFAULT_OPENAI_ASR_URL;
             if (next !== apiUrl) setApiUrl(next);
-            if (next !== config.data?.api_url) saveEndpointField('api_url', next);
+            if (dirtyFields.current.api_url || next !== config.data?.api_url) saveEndpointField('api_url', next);
             else dirtyFields.current.api_url = false;
           }}
           className={COMPACT_INPUT}
@@ -524,7 +533,7 @@ function OpenAiAsrConfig() {
             // rather than persisting a blank (which the backend rejects).
             const next = model.trim() || DEFAULT_OPENAI_ASR_MODEL;
             if (next !== model) setModel(next);
-            if (next !== config.data?.model) saveEndpointField('model', next);
+            if (dirtyFields.current.model || next !== config.data?.model) saveEndpointField('model', next);
             else dirtyFields.current.model = false;
           }}
           className={COMPACT_INPUT}
