@@ -2,6 +2,7 @@ import * as React from 'react';
 import { ipc, type ChatRequest } from '@/lib/ipc';
 import { GENERAL_SCOPE, ORG_SHARED_SCOPE } from '@/components/FolderScopePicker';
 import { buildOrgChatPayload } from '@/lib/orgChat';
+import { CHART_INSTRUCTIONS } from '@/lib/chatChart';
 
 export type StreamStatus = 'streaming' | 'done' | 'error';
 
@@ -194,7 +195,7 @@ export function useStreamingQuery() {
       ...(history ?? []),
       { role: 'user' as const, content: question },
     ];
-    ipc().org.chatStream(id, { system, messages });
+    ipc().org.chatStream(id, { system: `${system}\n\n${CHART_INSTRUCTIONS}`, messages });
     return id;
   }, []);
 

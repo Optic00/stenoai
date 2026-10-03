@@ -309,6 +309,10 @@ const AUDIO_SEED_MEETINGS = [
 ];
 
 function install({ ipcMain }) {
+  // Renderer tests can save and reopen chat turns without a backend or disk.
+  let chatSessions = { sessions: [] };
+  let privacyNoticeSeen = true;
+  let delayPrivacyNotice = process.env.STENOAI_E2E_DELAY_PRIVACY_NOTICE === '1';
   // In-memory stand-in for the org session + provider config that the real
   // handlers persist to disk. Mutated by the org-login / org-logout / set-ai
   // mocks so a test can assert the UI reacts to its own actions.
@@ -508,6 +512,28 @@ function install({ ipcMain }) {
   // real ipcMain.handle callback. Mirror the real handlers' return shapes from
   // app/main.js (get-ai-provider ~5950, org-* ~7990).
   const MOCKS = {
+    'get-privacy-notice-seen': async () => {
+      if (delayPrivacyNotice) {
+        delayPrivacyNotice = false;
+        return new Promise(resolve => {
+          // Let the modal-stacking spec resolve the initial query explicitly.
+          global.__resolvePrivacyNotice = seen => {
+            privacyNoticeSeen = seen;
+            resolve({ success: true, privacy_notice_seen: seen });
+          };
+        });
+      }
+      return { success: true, privacy_notice_seen: privacyNoticeSeen };
+    },
+    'set-privacy-notice-seen': async () => {
+      privacyNoticeSeen = true;
+      return { success: true, privacy_notice_seen: true };
+    },
+    'load-chat-sessions': async () => ({ success: true, data: chatSessions }),
+    'save-chat-sessions': async (_event, data) => {
+      chatSessions = data;
+      return { success: true };
+    },
     'reprocess-meeting': async () => {
       if (process.env.STENOAI_E2E_REPROCESS_PENDING !== '1') return { success: true };
       const state = global.__reprocessTest || (global.__reprocessTest = { calls: 0 });
@@ -1387,7 +1413,7 @@ function install({ ipcMain }) {
   let slowUpdateStatusCallsLeft = process.env.STENOAI_E2E_SLOW_UPDATE_STATUS === '1' ? 1 : 0;
 
   const DEFAULTS = {
-    'get-app-version': { success: true, version: '0.0.0-e2e', name: 'Steno' },
+    'get-app-version': { success: true, version: process.env.STENOAI_E2E_APP_VERSION || '0.0.0-e2e', name: 'Steno' },
     // Read-only display poll for the About tab's "Check for Updates" button
     // (settings-about.t1). Fully hermetic — no real GitHub call under mock
     // IPC, so this is the only source of truth for that flow in T1.
@@ -1670,7 +1696,12 @@ function install({ ipcMain }) {
   const originalHandle = ipcMain.handle.bind(ipcMain);
   ipcMain.handle = (channel, realFn) => {
     let fn;
-    if (MOCKS[channel]) {
+    if (channel === 'open-external' && process.env.STENOAI_E2E_OPEN_EXTERNAL === '1') {
+      // Interactive previews can open docs in the user's browser. Tests that
+      // opt in replace shell.openExternal with a spy before clicking a link.
+      // Retain the production URL validation; all other T1 runs stay inert.
+      fn = realFn;
+    } else if (MOCKS[channel]) {
       fn = MOCKS[channel];
     } else if (Object.prototype.hasOwnProperty.call(DEFAULTS, channel)) {
       const value = DEFAULTS[channel];
