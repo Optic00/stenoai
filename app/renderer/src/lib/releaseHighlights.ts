@@ -30,6 +30,14 @@ export const RELEASE_HIGHLIGHTS: readonly ReleaseHighlight[] = [
     route: '/chat',
     visual: 'chart',
   },
+  {
+    id: 'speaker-models',
+    title: 'Choose when to add individual speakers',
+    description:
+      'On macOS, speaker models are optional during setup. Download them later in AI settings, with progress shown as they install.',
+    action: 'Open AI settings',
+    route: '/settings?tab=ai',
+  },
 ];
 
 export const WHATS_NEW_COPY = {
@@ -44,7 +52,7 @@ export const WHATS_NEW_COPY = {
 };
 
 export const LAST_SEEN_RELEASE_KEY = 'steno-last-seen-release';
-export const CHANGELOG_URL = 'https://docs.stenoai.co/changelog';
+export const CHANGELOG_URL = `https://github.com/stenolabs/stenoai/releases/tag/v${RELEASE_VERSION}`;
 
 /** Stable releases only. Downgrades and same-version restarts stay quiet. */
 export function isUnseenRelease(current: string, seen: string | null): boolean {
