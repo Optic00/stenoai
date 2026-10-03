@@ -9687,6 +9687,9 @@ def spike_parakeet_cmd():
                 err=True,
             )
             sys.exit(2)
+    # The spike imports parakeet_mlx directly; the bundle has no librosa.
+    from src._mel import install_librosa_shim
+    install_librosa_shim()
     sys.exit(spike_main())
 
 
