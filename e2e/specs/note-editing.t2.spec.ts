@@ -1,5 +1,5 @@
 import { test, expect } from '../fixtures/electron';
-import { writeMeetingMarkdown } from '../fixtures/user-config';
+import { writeMeetingMarkdown, writeUserConfig } from '../fixtures/user-config';
 import { readFileSync } from 'fs';
 
 /**
@@ -16,6 +16,12 @@ import { readFileSync } from 'fs';
  *  - the edit is still there after a real quit + relaunch (not just in the
  *    react-query cache).
  */
+
+// The first-run privacy notice is a modal over the meeting list; these specs
+// are about the editor, so start past it like the other note-detail T2 specs.
+test.beforeEach(({ userDataDir }) => {
+  writeUserConfig(userDataDir, { privacy_notice_seen: true });
+});
 
 const SUMMARY_MARKDOWN = [
   '## Summary',
