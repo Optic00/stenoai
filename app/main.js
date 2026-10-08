@@ -112,6 +112,7 @@ const {
 const { parseSetupCheckOutput } = require('./setup-check-parse');
 const { parseSpeakerModelStatusOutput } = require('./speaker-model-status');
 const { createSpeakerModelPreparer } = require('./speaker-model-prepare');
+const { reprepareSpeakerModelsAfterUpgrade } = require('./speaker-model-upgrade');
 const { isDiagnosticStdoutLine, sanitizeArgsForLog } = require('./diagnostics-filter');
 // Pure analytics bucketing/classification/sanitization lives in
 // ./analytics-helpers (unit-tested). trackEvent() itself and every IPC
@@ -146,7 +147,9 @@ const { autoUpdater } = require('electron-updater');
 
 // E2E test-harness hooks. Set via env vars; production sees none of these.
 //   STENOAI_USER_DATA_DIR — per-test temp userData dir (must be set before app.whenReady)
-//   STENOAI_E2E=1         — skip tray, auto-updater, PostHog telemetry
+//   STENOAI_E2E=1         — skip tray, auto-updater, PostHog telemetry, and
+//                           the post-upgrade speaker-model re-download unless
+//                           STENOAI_E2E_SPEAKER_UPGRADE=1 opts a spec into it
 //   STENOAI_E2E_MOCK_IPC=1 — install deterministic mock IPC handlers
 //   STENOAI_E2E_HEADLESS=1 - keep the main window rendered but never visible/focused
 if (process.env.STENOAI_USER_DATA_DIR) {
@@ -2073,6 +2076,23 @@ if (!gotSingleInstanceLock) {
     // helper encrypts, verifies a decrypt/readback, then asks the backend to
     // remove plaintext only after that succeeds.
     void migrateLegacyOpenAiAsrApiKey();
+
+    // Speaker models cached before the FluidAudio 0.17 upgrade no longer
+    // load, and meeting processing never downloads; fetch them again in the
+    // background for users who had opted in (see speaker-model-upgrade.js).
+    // The shared preparer reports progress to Settings like any download.
+    // Off in e2e like the other network-bound startup work: a spec that seeds
+    // an old cache against the real sidecar must not start a real download.
+    if (!IS_E2E_MOCK_IPC && (!IS_E2E || process.env.STENOAI_E2E_SPEAKER_UPGRADE === '1')) {
+      void reprepareSpeakerModelsAfterUpgrade({
+        platform: process.platform,
+        userDataDir: getUserDataDir(),
+        env: process.env,
+        checkStatus: () => runSpeakerModelCommand('speaker-model-status'),
+        prepare: () => prepareSpeakerModels(),
+        onLog: sendDebugLog,
+      });
+    }
 
     // Application menu. macOS uses the global menu bar with mac-only roles
     // (services/hide/unhide). Windows/Linux get a slimmer, platform-correct
@@ -6854,7 +6874,18 @@ ipcMain.handle('startup-setup-check', async () => {
   }
 });
 
-async function runSpeakerModelCommand(command) {
+// Speaker-diarization engines the steno-diarize sidecar accepts. Mirrors
+// Config.VALID_DIARIZATION_ENGINES; checked here so a renderer-supplied value
+// can never reach the CLI argv as anything but a known engine name.
+const DIARIZATION_ENGINES = ['sortformer', 'nemotron3'];
+
+function isDiarizationEngine(value) {
+  return typeof value === 'string' && DIARIZATION_ENGINES.includes(value);
+}
+
+// `engine` (optional) targets that engine's models instead of the saved
+// setting -- Settings prepares a choice before persisting it.
+async function runSpeakerModelCommand(command, engine) {
   if (process.platform !== 'darwin') {
     return {
       success: false,
@@ -6862,13 +6893,20 @@ async function runSpeakerModelCommand(command) {
       error: 'Speaker diarization is unavailable on this system',
     };
   }
-  const output = await runPythonScript('simple_recorder.py', [command]);
+  const args = [command];
+  if (engine !== undefined && engine !== null) {
+    if (!isDiarizationEngine(engine)) {
+      return { success: false, ready: false, error: 'Unknown speaker detection engine' };
+    }
+    args.push('--engine', engine);
+  }
+  const output = await runPythonScript('simple_recorder.py', args);
   return parseSpeakerModelStatusOutput(output);
 }
 
-ipcMain.handle('speaker-model-status', async () => {
+ipcMain.handle('speaker-model-status', async (event, engine) => {
   try {
-    return await runSpeakerModelCommand('speaker-model-status');
+    return await runSpeakerModelCommand('speaker-model-status', engine);
   } catch {
     sendDebugLog('Speaker diarization model status check failed');
     return {
@@ -6895,9 +6933,14 @@ const prepareSpeakerModels = createSpeakerModelPreparer({
   },
 });
 
-ipcMain.handle('setup-speaker-models', async () => {
+// `engine` (optional) downloads that engine's models instead of the saved
+// setting's -- Settings prepares a choice before persisting it.
+ipcMain.handle('setup-speaker-models', async (event, engine) => {
+  if (engine !== undefined && engine !== null && !isDiarizationEngine(engine)) {
+    return { success: false, ready: false, error: 'Unknown speaker detection engine' };
+  }
   sendDebugLog('Preparing local speaker diarization models...');
-  const result = await prepareSpeakerModels();
+  const result = await prepareSpeakerModels(engine ?? undefined);
   sendDebugLog(result.success && result.ready
     ? 'Speaker diarization models ready'
     : 'Speaker diarization model setup failed');
@@ -8445,6 +8488,31 @@ ipcMain.handle('set-transcription-engine', async (event, engine) => {
     const result = await runPythonScript('simple_recorder.py', ['set-transcription-engine', engine]);
     const jsonData = JSON.parse(result.trim());
     trackEvent('model_changed', { model: engine, kind: 'transcription_engine' });
+    return { success: true, ...jsonData };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('get-diarization-engine', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-diarization-engine'], true);
+    const jsonData = JSON.parse(result.trim());
+    return { success: true, ...jsonData };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+// The CLI refuses to save a non-default engine whose models are not ready
+// (success: false, models_ready: false); the renderer prepares them first
+// via setup-speaker-models.
+ipcMain.handle('set-diarization-engine', async (event, engine) => {
+  if (!isDiarizationEngine(engine)) {
+    return { success: false, error: 'Unknown speaker detection engine' };
+  }
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['set-diarization-engine', engine]);
+    const jsonData = JSON.parse(result.trim());
+    if (jsonData.success) {
+      trackEvent('model_changed', { model: engine, kind: 'diarization_engine' });
+    }
     return { success: true, ...jsonData };
   } catch (e) { return { success: false, error: e.message }; }
 });
