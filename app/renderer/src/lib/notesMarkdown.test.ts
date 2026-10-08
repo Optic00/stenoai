@@ -14,8 +14,8 @@ const fullSections: StructuredNoteSections = {
     { title: 'Hiring' },
   ],
   keyPoints: ['Ship `v2` in July'],
-  actionItems: ['Ben: prepare <the draft>'],
-  participants: ['Ben', 'Ruzin & Alex'],
+  actionItems: ['Alice: prepare <the draft>'],
+  participants: ['Alice', 'Bob & Carol'],
 };
 
 describe('buildNotesMarkdown', () => {
@@ -43,11 +43,11 @@ describe('buildNotesMarkdown', () => {
         '',
         '## Action Items',
         '',
-        '- Ben: prepare <the draft>',
+        '- Alice: prepare <the draft>',
         '',
         '## Participants',
         '',
-        'Ben, Ruzin & Alex',
+        'Alice, Bob & Carol',
       ].join('\n'),
     );
   });
