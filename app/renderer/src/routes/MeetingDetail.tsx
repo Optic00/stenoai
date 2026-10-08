@@ -88,6 +88,7 @@ import { buildNotesMarkdown } from '@/lib/notesMarkdown';
 import { buildNotesHtml, hasNotesContent } from '@/lib/notesPdf';
 import { unwrap } from '@/lib/result';
 import { cn } from '@/lib/utils';
+import { t } from '@/i18n';
 import { navigate } from '@/lib/router';
 import { stripReasoning } from '@/lib/markdown';
 import { pendingTitleRegens, streamCache, type StreamPhase } from '@/lib/meetingDetailState';
@@ -975,8 +976,8 @@ function DetailContent({
               <PopoverTrigger asChild>
                 <button
                   type="button"
-                  aria-label="Share"
-                  title="Share"
+                  aria-label={t('noteShare.menuLabel')}
+                  title={t('noteShare.menuLabel')}
                   className="inline-flex size-7 items-center justify-center rounded-md transition-colors hover:bg-[color:var(--surface-hover)] hover:text-[color:var(--fg-1)]"
                   style={{ color: 'var(--fg-2)' }}
                 >
@@ -1037,7 +1038,7 @@ function DetailContent({
                   disabled={!canExportNotesPdf || notesExportBlocked}
                 >
                   <Download className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
-                  Save notes as .md…
+                  {t('noteShare.saveNotesMarkdown')}
                 </button>
                 <button
                   type="button"
@@ -1075,7 +1076,7 @@ function DetailContent({
                       disabled={!canExportNotesPdf || notesExportBlocked || sharing !== null}
                     >
                       <FileDown className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
-                      {sharing === 'notes-pdf' ? 'Preparing…' : 'Share notes as PDF…'}
+                      {sharing === 'notes-pdf' ? t('noteShare.preparing') : t('noteShare.notesPdf')}
                     </button>
                     <button
                       type="button"
@@ -1094,7 +1095,7 @@ function DetailContent({
                       disabled={!canExportNotesPdf || notesExportBlocked || sharing !== null}
                     >
                       <Share className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
-                      {sharing === 'notes-md' ? 'Preparing…' : 'Share notes as .md…'}
+                      {sharing === 'notes-md' ? t('noteShare.preparing') : t('noteShare.notesMarkdown')}
                     </button>
                     <button
                       type="button"
@@ -1113,7 +1114,7 @@ function DetailContent({
                       disabled={!transcriptBundle || sharing !== null}
                     >
                       <FileText className="size-[13px] shrink-0" style={{ color: 'var(--fg-2)' }} />
-                      {sharing === 'transcript' ? 'Preparing…' : 'Share transcript…'}
+                      {sharing === 'transcript' ? t('noteShare.preparing') : t('noteShare.transcript')}
                     </button>
                   </>
                 )}
