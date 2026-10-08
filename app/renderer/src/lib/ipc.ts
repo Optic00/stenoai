@@ -134,12 +134,22 @@ export interface UpdateMeetingPatch {
   user_notes?: string;
 }
 
+export interface ChatRequest {
+  scope: 'live' | 'meeting' | 'notes' | 'general';
+  question: string;
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  recordingId?: string;
+  file?: string;
+  folder?: string | null;
+}
+
 export interface ChatSessionsBlob {
   sessions: Array<{
     id: string;
     name: string;
     summaryFile?: string;
-    messages: Array<{ role: 'user' | 'assistant'; content: string; ts: number }>;
+    scopeFolderId?: string | null;
+    messages: Array<{ role: 'user' | 'assistant'; content: string; ts: number; context?: string }>;
     createdAt: number;
     updatedAt: number;
   }>;
@@ -367,6 +377,8 @@ export type PauseRecordingResponse = Result<{ message: string }>;
 export type ResumeRecordingResponse = Result<{ message: string }>;
 
 export interface QueueStatus {
+  recordingId?: string | null;
+  chatSummaryFile?: string | null;
   success: true;
   isProcessing: boolean;
   queueSize: number;
@@ -927,6 +939,17 @@ export interface ParakeetPullProgressEvent {
   completed_files?: number;
   total_files?: number;
   file_bytes?: number;
+  /** Exact bytes from the Hub's file metadata; absent when that lookup failed. */
+  downloaded_bytes?: number;
+  total_bytes?: number;
+}
+/** Speaker-diarization model download ('setup-speaker-models'). While
+ *  `downloading`, percent is the measured share of the model download; once
+ *  `compiling` (CoreML optimising for this Mac, then the small embedding
+ *  models) there is nothing to measure. Phase only ever moves forward. */
+export interface SpeakerModelsProgressEvent {
+  percent: number;
+  phase: 'listing' | 'downloading' | 'compiling';
 }
 export interface ParakeetPullCompleteEvent {
   model?: string | null;
@@ -1174,6 +1197,7 @@ export interface StenoaiBridge {
 
   query: {
     ask: RequestFn<[file: string, q: string], QueryResponse>;
+    chatContext: SendFn<[id: string, request: ChatRequest]>;
     askStream: SendFn<[id: string, file: string, q: string]>;
     chatGlobalStream: SendFn<[id: string, q: string, folderId?: string | null]>;
     cancel: SendFn<[id: string]>;
@@ -1426,6 +1450,7 @@ export interface StenoaiBridge {
     parakeetPullProgress: Subscribe<ParakeetPullProgressEvent>;
     parakeetPullComplete: Subscribe<ParakeetPullCompleteEvent>;
     setupOllamaProgress: Subscribe<SetupOllamaProgressEvent>;
+    speakerModelsProgress: Subscribe<SpeakerModelsProgressEvent>;
     liveTranscriptReady: Subscribe<LiveTranscriptReadyEvent>;
     liveTranscriptChunk: Subscribe<LiveTranscriptChunkEvent>;
     liveTranscriptError: Subscribe<LiveTranscriptErrorEvent>;

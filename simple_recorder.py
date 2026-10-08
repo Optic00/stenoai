@@ -4174,22 +4174,8 @@ def _chat_corpus_char_budget(ai_provider: str, model: str) -> int:
     return 400_000
 
 
-@cli.command(name='chat-global-streaming')
-@click.option('--question', '-q', required=True, help='Question to ask across notes')
-@click.option('--folder', '-f', default=None, help='Folder ID to scope the corpus to (default: all notes)')
-def chat_global_streaming(question, folder):
-    """Cross-note chat: gather meeting title + summary + key points, feed as
-    context to the configured LLM, stream the answer. Optionally scope to a
-    single folder; default queries every note.
-
-    Works with every provider — cloud / org adapter / local / remote Ollama.
-    The assembled corpus is capped to the active model's context window
-    (model-aware budget below), so a local model with a smaller window simply
-    answers over fewer (most-recent) notes rather than overflowing. We don't
-    have retrieval (RAG) yet, so older notes beyond the budget are omitted."""
-    import sys
-    import base64
-    from pathlib import Path
+def _build_chat_corpus(folder=None, budget=None):
+    """Bounded saved-note context, shared by global and recording-time chat."""
     from src.config import get_config, get_data_dirs
 
     config = get_config()
@@ -4228,11 +4214,7 @@ def chat_global_streaming(question, folder):
         ]
 
     if not summaries:
-        if folder and folder != 'all':
-            print("CHAT_STREAM_ERROR:No notes in this folder yet. Pick another or remove the filter.", flush=True)
-        else:
-            print("CHAT_STREAM_ERROR:No notes found yet. Record a meeting first.", flush=True)
-        return
+        return ""
 
     # Most-recent first so the model weights newer context higher when token
     # budget is tight. Each block is kept compact (title + summary + key
@@ -4245,7 +4227,7 @@ def chat_global_streaming(question, folder):
 
     # Cap the assembled corpus so a user with hundreds of meetings can't blow
     # past the active model's context window (see _chat_corpus_char_budget).
-    CORPUS_CHAR_BUDGET = _chat_corpus_char_budget(
+    CORPUS_CHAR_BUDGET = budget if budget is not None else _chat_corpus_char_budget(
         config.get_ai_provider(), config.get_model()
     )
     blocks = []
@@ -4290,6 +4272,34 @@ def chat_global_streaming(question, folder):
             " to pull it in directly._"
         )
 
+    return corpus
+
+
+@cli.command(name='chat-global-streaming')
+@click.option('--question', '-q', required=True, help='Question to ask across notes')
+@click.option('--folder', '-f', default=None, help='Folder ID to scope the corpus to (default: all notes)')
+def chat_global_streaming(question, folder):
+    """Cross-note chat: gather meeting title + summary + key points, feed as
+    context to the configured LLM, stream the answer. Optionally scope to a
+    single folder; default queries every note.
+
+    Works with every provider — cloud / org adapter / local / remote Ollama.
+    The assembled corpus is capped to the active model's context window
+    (model-aware budget below), so a local model with a smaller window simply
+    answers over fewer (most-recent) notes rather than overflowing. We don't
+    have retrieval (RAG) yet, so older notes beyond the budget are omitted."""
+    import sys
+    import base64
+    from src.config import get_config
+
+    config = get_config()
+    corpus = _build_chat_corpus(folder)
+    if not corpus:
+        error = ("No notes in this folder yet. Pick another or remove the filter."
+                 if folder and folder != 'all' else "No notes found yet. Record a meeting first.")
+        print(f"CHAT_STREAM_ERROR:{error}", flush=True)
+        return
+
     language = config.get_language()
     if language == "auto":
         language = "en"
@@ -4303,6 +4313,13 @@ def chat_global_streaming(question, folder):
         print("CHAT_STREAM_COMPLETE", flush=True)
     except Exception as e:
         print(f"CHAT_STREAM_ERROR:{e}", flush=True)
+
+
+@cli.command(name='chat-context-streaming')
+def chat_context_streaming():
+    """Chat over explicit context. Content travels over bounded stdin, never argv."""
+    from src.chat_query import run_chat_query
+    run_chat_query(_parse_meeting_markdown, _build_chat_corpus, resolve_persisted_output_language)
 
 
 @cli.command()
@@ -4379,12 +4396,75 @@ def clear_state():
         print("SUCCESS: No state file found - already clear")
 
 
-def _run_speaker_model_command(command: str, timeout: int) -> dict:
+_SPEAKER_PROGRESS_PREFIX = "STENO_PROGRESS "
+_SPEAKER_PROGRESS_PHASES = {"listing", "downloading", "compiling"}
+
+
+def _parse_speaker_progress_line(line: str) -> Optional[dict]:
+    """Validate one sidecar ``STENO_PROGRESS {json}`` stderr line.
+
+    Only a whole percent and a known phase name are passed on; any other
+    stderr text (CoreML diagnostics, error detail) is dropped here so it never
+    reaches the renderer.
+    """
+    if not line.startswith(_SPEAKER_PROGRESS_PREFIX):
+        return None
+    try:
+        event = json.loads(line[len(_SPEAKER_PROGRESS_PREFIX):])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    percent, phase = event.get("percent"), event.get("phase")
+    if not isinstance(percent, int) or isinstance(percent, bool) or not 0 <= percent <= 100:
+        return None
+    if not isinstance(phase, str) or phase not in _SPEAKER_PROGRESS_PHASES:
+        return None
+    return {"percent": percent, "phase": phase}
+
+
+def _run_sidecar_with_progress(args: list, timeout: int, on_progress):
+    """Like ``subprocess.run(capture_output=True)`` but relays progress lines
+    from stderr to ``on_progress`` while the sidecar runs."""
+    import subprocess
+    import threading
+
+    stdout_chunks: list = []
+    stderr_lines: list = []
+    with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
+        def pump_stderr():
+            for line in proc.stderr:
+                stderr_lines.append(line)
+                event = _parse_speaker_progress_line(line.strip())
+                if event is not None:
+                    on_progress(event)
+
+        # Both pipes drain on threads so wait() below enforces the timeout
+        # even if the sidecar hangs with its pipes open.
+        pumps = [
+            threading.Thread(target=pump_stderr, daemon=True),
+            threading.Thread(target=lambda: stdout_chunks.append(proc.stdout.read()), daemon=True),
+        ]
+        for pump in pumps:
+            pump.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise
+        finally:
+            for pump in pumps:
+                pump.join(timeout=5)
+    return subprocess.CompletedProcess(args, proc.returncode, "".join(stdout_chunks), "".join(stderr_lines))
+
+
+def _run_speaker_model_command(command: str, timeout: int, on_progress=None) -> dict:
     """Run a non-audio command on the macOS diarization sidecar.
 
     The sidecar is the single authority for its FluidAudio cache layout. Keep
     this wrapper deliberately narrow and return only validated JSON so stderr
-    from model loaders never crosses the renderer IPC boundary.
+    from model loaders never crosses the renderer IPC boundary. With
+    ``on_progress``, validated download progress is relayed as it arrives.
     """
     import subprocess
     from src.transcriber import _resolve_steno_diarize
@@ -4397,13 +4477,16 @@ def _run_speaker_model_command(command: str, timeout: int) -> dict:
             "error": "Speaker diarization is unavailable on this system",
         }
     try:
-        result = subprocess.run(
-            [binary, command],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        if on_progress is None:
+            result = subprocess.run(
+                [binary, command],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        else:
+            result = _run_sidecar_with_progress([binary, command], timeout, on_progress)
     except (OSError, subprocess.TimeoutExpired):
         logger.warning("Speaker diarization model command could not complete")
         return {
@@ -4458,8 +4541,15 @@ def speaker_model_status():
 
 @cli.command(name="prepare-speaker-models")
 def prepare_speaker_models():
-    """Download and compile the macOS speaker-diarization models."""
-    payload = _run_speaker_model_command("prepare-models", timeout=60 * 60)
+    """Download and compile the macOS speaker-diarization models.
+
+    Prints ``SPEAKER_MODELS_PROGRESS:{"percent": n, "phase": ...}`` lines while
+    it runs (main.js relays them to the UI), then the JSON status last.
+    """
+    def relay(event):
+        print(f"SPEAKER_MODELS_PROGRESS:{json.dumps(event)}", flush=True)
+
+    payload = _run_speaker_model_command("prepare-models", timeout=60 * 60, on_progress=relay)
     print(json.dumps(payload))
     if not payload.get("success") or not payload.get("ready"):
         sys.exit(1)
@@ -9670,6 +9760,9 @@ def spike_parakeet_cmd():
                 err=True,
             )
             sys.exit(2)
+    # The spike imports parakeet_mlx directly; the bundle has no librosa.
+    from src._mel import install_librosa_shim
+    install_librosa_shim()
     sys.exit(spike_main())
 
 

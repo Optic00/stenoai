@@ -189,6 +189,7 @@ const stenoai = {
 
   query: {
     ask: (file, q) => invoke('query-transcript', file, q),
+    chatContext: (id, request) => send('chat-context-stream', id, request),
     askStream: (id, file, q) => send('query-transcript-stream', id, file, q),
     chatGlobalStream: (id, q, folderId) => send('chat-global-stream', id, q, folderId ?? null),
     cancel: (id) => send('query-cancel', id),
@@ -433,6 +434,7 @@ const stenoai = {
     parakeetPullProgress: (cb) => subscribe('parakeet-pull-progress', cb),
     parakeetPullComplete: (cb) => subscribe('parakeet-pull-complete', cb),
     setupOllamaProgress: (cb) => subscribe('setup-ollama-progress', cb),
+    speakerModelsProgress: (cb) => subscribe('speaker-models-progress', cb),
     liveTranscriptReady: (cb) => subscribe('live-transcript-ready', cb),
     liveTranscriptChunk: (cb) => subscribe('live-transcript-chunk', cb),
     liveTranscriptError: (cb) => subscribe('live-transcript-error', cb),
