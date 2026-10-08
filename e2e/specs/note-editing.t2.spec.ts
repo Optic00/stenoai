@@ -17,8 +17,9 @@ import { readFileSync } from 'fs';
  *    react-query cache).
  */
 
-// The first-run privacy notice is a modal over the meeting list; these specs
-// are about the editor, so start past it like the other note-detail T2 specs.
+// First-run dialogs (privacy notice, release highlights) are modals over the
+// meeting list; these specs are about the editor, so start past both like the
+// other note-detail T2 specs.
 test.beforeEach(({ userDataDir }) => {
   writeUserConfig(userDataDir, { privacy_notice_seen: true });
 });
@@ -74,7 +75,7 @@ test('an edited note is written to the .md and survives a relaunch', async ({
   });
   const before = readFileSync(file, 'utf8');
 
-  const first = await launchApp();
+  const first = await launchApp({ releaseHighlightsSeen: true });
   const page = first.page;
 
   await page.getByText('Budget Review').first().click();
@@ -119,7 +120,7 @@ test('an edited note is written to the .md and survives a relaunch', async ({
   await first.app.close();
 
   // A fresh process, same user data dir: the edit came from the file, not a cache.
-  const second = await launchApp();
+  const second = await launchApp({ releaseHighlightsSeen: true });
   await second.page.getByText('Budget Review').first().click();
   await expect(second.page.getByTestId('tab-summary-content')).toContainText('Q3 budget');
   await expect(second.page.getByText(NEW_ACTION)).toBeVisible();
@@ -136,7 +137,7 @@ test('leaving an unchanged editor needs no confirmation', async ({ launchApp, us
     transcript: 'Nothing to see here.',
   });
   const before = readFileSync(file, 'utf8');
-  const { page } = await launchApp();
+  const { page } = await launchApp({ releaseHighlightsSeen: true });
   await page.getByText('Leaving Note').first().click();
   await page.getByRole('button', { name: 'Edit note' }).click();
   await page.getByRole('button', { name: 'Back to home' }).click();
@@ -153,7 +154,7 @@ test('keeping unsaved edits stays in the editor without writing', async ({ launc
     transcript: 'Nothing to see here.',
   });
   const before = readFileSync(file, 'utf8');
-  const { page } = await launchApp();
+  const { page } = await launchApp({ releaseHighlightsSeen: true });
   await page.getByText('Leaving Note').first().click();
   await page.getByRole('button', { name: 'Edit note' }).click();
   await page.getByRole('textbox', { name: 'Summary', exact: true }).fill('Typed but not saved.');
@@ -177,7 +178,7 @@ test('discarding unsaved edits returns home without writing', async ({ launchApp
     transcript: 'Nothing to see here.',
   });
   const before = readFileSync(file, 'utf8');
-  const { page } = await launchApp();
+  const { page } = await launchApp({ releaseHighlightsSeen: true });
   await page.getByText('Leaving Note').first().click();
   await page.getByRole('button', { name: 'Edit note' }).click();
   await page.getByRole('textbox', { name: 'Summary', exact: true }).fill('Typed but not saved.');
@@ -201,7 +202,7 @@ test('a heading typed into a field is refused before it reaches the note', async
   });
   const before = readFileSync(file, 'utf8');
 
-  const { page } = await launchApp();
+  const { page } = await launchApp({ releaseHighlightsSeen: true });
   await page.getByText('Guarded Note').first().click();
   await page.getByRole('button', { name: 'Edit note' }).click();
 
