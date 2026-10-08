@@ -68,6 +68,9 @@ test('an edited note is written to the .md and survives a relaunch', async ({
   launchApp,
   userDataDir,
 }) => {
+  // Two real launches, each reloaded once to skip the release highlights:
+  // a hidden Windows runner needs about 31 s for that, over the 30 s default.
+  test.setTimeout(90_000);
   const file = writeMeetingMarkdown(userDataDir, 'editable', {
     name: 'Budget Review',
     summaryMarkdown: SUMMARY_MARKDOWN,
