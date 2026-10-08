@@ -23,7 +23,9 @@ test('real org sign-in persists session + config into the temp dir, real dir unt
 
   const adapter = await startMockAdapter();
   try {
-    const { app, page } = await launchApp();
+    // Start past the release announcement: its modal otherwise covers the
+    // Settings sign-in form and swallows the click on a slow runner.
+    const { app, page } = await launchApp({ releaseHighlightsSeen: true });
 
     // safeStorage is required to persist the session. On a headless runner with
     // no usable keyring it is unavailable — skip rather than emit a misleading
