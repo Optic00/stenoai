@@ -104,7 +104,8 @@ test('Copy transcript includes a readable diarised view and the timestamped sour
   await openDetail(page);
   await installClipboardRecorder(page);
 
-  await page.getByRole('button', { name: 'Copy transcript' }).click();
+  const menu = await openShareMenu(page);
+  await menu.getByRole('button', { name: 'Copy transcript' }).click();
 
   const writes = await clipboardWrites(page);
   expect(writes).toHaveLength(1);

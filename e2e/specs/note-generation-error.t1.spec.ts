@@ -1,4 +1,5 @@
 import { test, expect } from '../fixtures/electron';
+import { openShareMenu } from '../fixtures/share-menu';
 
 const summaryFile = 'pending_summary.md';
 
@@ -28,7 +29,11 @@ for (const scenario of [
     }, { code: scenario.code, stream: Boolean(scenario.stream), file: summaryFile });
     const alert = page.getByRole('alert');
     await expect(alert).toContainText(scenario.message);
-    await expect(page.getByRole('button', { name: 'Copy transcript' })).toBeVisible();
+    // The transcript stays reachable from the Share menu while notes failed.
+    const failedMenu = await openShareMenu(page);
+    await expect(failedMenu.getByRole('button', { name: 'Copy transcript' })).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(failedMenu).toBeHidden();
     await expect(alert.getByRole('button', { name: 'Generate notes', exact: true })).toBeEnabled();
     await expect(page.getByText('Unfinished synthetic summary', { exact: true })).toHaveCount(0);
     await expect(page.locator('body')).not.toContainText('internal.invalid');
@@ -43,7 +48,8 @@ for (const scenario of [
     }, summaryFile);
     await expect(alert).toHaveCount(0);
     await expect(page.getByTestId('generate-notes-dock-button')).toBeEnabled();
-    await expect(page.getByRole('button', { name: 'Copy transcript' })).toBeVisible();
+    const menu = await openShareMenu(page);
+    await expect(menu.getByRole('button', { name: 'Copy transcript' })).toBeVisible();
   });
 }
 
