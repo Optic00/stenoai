@@ -51,20 +51,46 @@ const path = require('path');
 // Backend CLI seam (spawn wrapper, process-tree kill, bundled-backend paths,
 // runPythonScript), the debug-log sink, and the quit teardown registry are
 // carved out of this file (RFC #327, Phase 0); wired once below via factories.
-const { spawn, killProcessTree, createBackendCli } = require('./backend-cli');
+const { spawn, killProcessTree, createBackendCli, withoutOpenAiAsrKey } = require('./backend-cli');
+const {
+  isEncryptedKeyCleared,
+  legacyKeyMigrationAction,
+  loadEncryptedKeyForOrigin,
+  markEncryptedKeyClearedAtomically,
+  readOpenAiAsrConfigSnapshot,
+  readOpenAiAsrEndpointSnapshot,
+  saveEncryptedKeyAtomically,
+} = require('./openai-asr-key-store');
+// Keep an unreadable config distinct from a readable config without a legacy
+// key. Migration may treat only the latter as complete.
+const OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE = Symbol('openai-asr-config-snapshot-unreadable');
+const { registerOpenAiAsrIpc } = require('./openai-asr-ipc');
 const { createDebugLog } = require('./debug-log');
 const { createTeardownRegistry } = require('./teardown');
 const { registerFoldersIpc } = require('./folders-ipc');
 const { registerSettingsIpc } = require('./settings-ipc');
+const { registerMeetingTransferIpc, copyRegularFile } = require('./meeting-transfer-ipc');
+const { STORE_DOCUMENT_LIMIT } = require('./meeting-transfer-store');
+const { registerPersonSampleIpc } = require('./person-sample-ipc');
+const { registerSpeakerIpc } = require('./speaker-ipc');
+const { registerObsidianSync } = require('./obsidian-sync');
+const { registerObsidianIpc } = require('./obsidian-ipc');
 const { isSafeToAutoInstall } = require('./update-idle-gate');
-const { describeUpdateError, updateErrorPhase } = require('./update-error-copy');
+const { describeUpdateError, updateErrorPhase, isMissingUpdateFeedError } = require('./update-error-copy');
 const { isOSUpdateEligible, MIN_MACOS_FOR_AUTOUPDATE } = require('./update-os-gate');
 const processingLog = require('./processing-log');
 const { isMeetingApp, allowsDeviceLevelFallback, isMacos14Plus } = require('./meeting-detect');
+const { isLinuxLoopbackSupported, startLoopbackCapture, createFrameAligner, createSerialQueue } = require('./linux-loopback');
 const { sweepOrphanedLiveSnapshots } = require('./live-snapshot-sweep');
 const { shareTempDir, sweepShareTemp, SHARE_TEMP_MAX_AGE_MS } = require('./share-temp');
 const { userNotesFilePath } = require('./notes-file');
+const {
+  buildNoteReadyNotificationOptions,
+  buildTranscriptReadyBody,
+  buildCaptureErrorBody,
+} = require('./notification-copy');
 const { makeLineReader } = require('./backend-stream');
+const { classifyReprocessError } = require('./reprocess-error');
 // Pure deep-link (stenoai://) parsing/sanitizing lives in ./shortcut-url
 // (unit-tested). The stateful side — window creation, IPC dispatch,
 // notifications — stays here and calls parseShortcutUrl().
@@ -75,6 +101,8 @@ const {
   parseShortcutUrl,
 } = require('./shortcut-url');
 const { parseSetupCheckOutput } = require('./setup-check-parse');
+const { parseSpeakerModelStatusOutput } = require('./speaker-model-status');
+const { createSpeakerModelPreparer } = require('./speaker-model-prepare');
 const { isDiagnosticStdoutLine, sanitizeArgsForLog } = require('./diagnostics-filter');
 // Pure analytics bucketing/classification/sanitization lives in
 // ./analytics-helpers (unit-tested). trackEvent() itself and every IPC
@@ -102,6 +130,7 @@ const os = require('os');
 const { URL, URLSearchParams } = require('url');
 const crypto = require('crypto');
 const { EXPORT_CANCELED } = require('./ipc-sentinels');
+const { mayExposeMainWindow } = require('./e2e-window-visibility');
 const { PostHog } = require('posthog-node');
 const { initMain } = require('electron-audio-loopback');
 const { autoUpdater } = require('electron-updater');
@@ -110,6 +139,7 @@ const { autoUpdater } = require('electron-updater');
 //   STENOAI_USER_DATA_DIR — per-test temp userData dir (must be set before app.whenReady)
 //   STENOAI_E2E=1         — skip tray, auto-updater, PostHog telemetry
 //   STENOAI_E2E_MOCK_IPC=1 — install deterministic mock IPC handlers
+//   STENOAI_E2E_HEADLESS=1 - keep the main window rendered but never visible/focused
 if (process.env.STENOAI_USER_DATA_DIR) {
   app.setPath('userData', process.env.STENOAI_USER_DATA_DIR);
 }
@@ -133,6 +163,7 @@ const IS_E2E = process.env.STENOAI_E2E === '1';
 // be a far wider behavioural change than closing this hole.
 const ALLOW_E2E_PATH_SEAMS = IS_E2E && !app.isPackaged;
 const IS_E2E_MOCK_IPC = process.env.STENOAI_E2E_MOCK_IPC === '1';
+const IS_E2E_HEADLESS = IS_E2E && process.env.STENOAI_E2E_HEADLESS === '1';
 
 // Global (system-wide) accelerator to toggle recording. CommandOrControl
 // resolves to Cmd on macOS and Ctrl on Windows/Linux, so no manual
@@ -189,8 +220,7 @@ if (IS_E2E_MOCK_IPC) {
   require('./e2e-mock-ipc').install({ ipcMain, BrowserWindow });
 }
 
-// Distinguish dev runs from the packaged "Steno" app in the dock, About menu,
-// and Cmd+Tab. Production keeps the productName from package.json untouched.
+// Give development runs a distinct dock, About menu, and Cmd+Tab name.
 if (!app.isPackaged) {
   app.setName('Steno Dev');
 }
@@ -271,7 +301,11 @@ function isAutoDetectSupported() {
 // Whether system-audio (loopback) capture is available on this OS at all.
 // macOS: CoreAudio Process Tap (14.4+). Windows: electron-audio-loopback uses
 // Chromium's WASAPI loopback on Windows 10+ (both Win10 and Win11 report major
-// version 10). Linux: not wired. Drives the Settings/MainToolbar toggle.
+// version 10). Linux: a PipeWire monitor-port capture (see ./linux-loopback.js)
+// bypassing Chromium's getDisplayMedia path entirely — that path would route
+// through xdg-desktop-portal's ScreenCast picker on Wayland just to get a
+// throwaway video track, a real UX regression versus mac/Windows showing no
+// dialog at all. Drives the Settings/MainToolbar toggle.
 function isSystemAudioSupported() {
   if (process.platform === 'darwin') return isCoreAudioTapSupported();
   if (process.platform === 'win32') {
@@ -282,6 +316,7 @@ function isSystemAudioSupported() {
       return true; // assume a modern Windows if the version probe fails
     }
   }
+  if (process.platform === 'linux') return isLinuxLoopbackSupported();
   return false;
 }
 
@@ -388,6 +423,19 @@ class Notification extends EventEmitter {
       height: 70,
       x: x + width - 425,
       y: y + 1,
+      // Create HIDDEN and only ever show via showInactive() in ready-to-show
+      // below. Without this, `show` defaults to true, so the constructor shows
+      // the window with the *activating* show() — which brings the whole app to
+      // the foreground (firing app.on('activate') → mainWindow.show()/focus()),
+      // so a passive toast appearing wrongly refocuses Steno. focusable:false
+      // stops the toast taking key focus but does NOT stop app activation; only
+      // show:false + showInactive() keeps the app in the background.
+      show: false,
+      // Because the toast now stays in a backgrounded app, a click on its
+      // buttons would otherwise be swallowed as the app-activating click (so the
+      // user has to click twice — once to activate, once to act). acceptFirstMouse
+      // makes that first click register as a real click on the button.
+      acceptFirstMouse: true,
       frame: false,
       transparent: true,
       alwaysOnTop: true,
@@ -481,6 +529,20 @@ let launchedByShortcut = false;
 // suppress the first window show so Steno starts hidden in the tray/menu bar,
 // and we tag telemetry so background opens don't inflate DAU/funnels.
 let launchedHidden = false;
+
+/**
+ * The only route through which the main window may be exposed.
+ * Playwright can fully drive a hidden BrowserWindow, so E2E runs use the same
+ * renderer without repeatedly stealing focus from the host desktop.
+ */
+function exposeMainWindow({ focus = true } = {}) {
+  if (!mayExposeMainWindow({ isE2EHeadless: IS_E2E_HEADLESS })) return false;
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  if (!mainWindow.isVisible()) mainWindow.show();
+  if (focus) mainWindow.focus();
+  return true;
+}
 
 // SHORTCUT_PROTOCOL and the pure deep-link parsing/sanitizing helpers
 // (extractShortcutUrlFromArgv, sanitizeShortcutUrlForLogs, parseShortcutUrl,
@@ -753,7 +815,6 @@ const GOOGLE_CLIENT_SECRET = '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';
 // no extra userinfo API call needed.
 const GOOGLE_SCOPES = 'openid https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email';
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
-const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 
 // Outlook Calendar OAuth2 configuration (PKCE public client — no client secret)
 const OUTLOOK_CLIENT_ID = '53a8ba1f-3a2e-4fc9-afb1-b9b8ff13de19';
@@ -908,7 +969,7 @@ function trackEvent(eventName, properties = {}) {
         ...properties
       }
     });
-  } catch (error) {
+  } catch {
     // Silent fail -- telemetry must never break the app
   }
 }
@@ -951,7 +1012,7 @@ async function shutdownTelemetry() {
       posthogClient = null;
       console.log('Telemetry shut down');
     }
-  } catch (error) {
+  } catch {
     // Silent fail
   }
 }
@@ -1042,6 +1103,17 @@ function getAllowedBaseDirs() {
   }
   return dirs;
 }
+
+// Obsidian vault sync engine (#413). Closures capture the (hoisted) path
+// helpers; the mirror stays inert until initObsidianSync() loads the cached
+// config at startup. folders.json sits beside the output dir.
+const obsidianSync = registerObsidianSync({
+  getUserDataDir,
+  getAllowedBaseDirs,
+  validateSafeFilePath,
+  resolveFoldersJsonPath: () => path.join(path.dirname(getOutputDir()), 'folders.json'),
+  sendDebugLog,
+});
 
 // Sync resolver for the audio recordings folder. Mirrors the path order used
 // by the async `get-recordings-dir` handler (custom storage > packaged data
@@ -1231,7 +1303,7 @@ function validateSafeFilePath(filepath, allowedBaseDirs) {
 // Deleting a note HIDES only its summary file, by renaming it into a hidden
 // sibling dir (`output/.pending-delete/<id>/`). Every backend scan identifies a
 // note SOLELY by its summary glob (`list_meetings` / global chat glob
-// `output/*_summary.{json,md}`, non-recursive), so hiding the summary makes the
+// `output/<stem>_summary.{json,md}`, non-recursive), so hiding the summary makes the
 // note invisible to all of them via a SINGLE atomic same-filesystem rename — no
 // multi-file moves, no cross-volume copy, no manifest, no restore/purge/sweep.
 //
@@ -1360,6 +1432,20 @@ function isAllowedMeetingSource(src, allowedBaseDirs) {
   return leafDirs.includes(realParent);
 }
 
+// Transfer tracks belong only to the validated summary's immutable stem.
+// Neither a receipt nor the renderer can supply a different media directory.
+function transferMediaDirectory(outputDir, stem) {
+  if (!/^transfer_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(stem ?? '')) return null;
+  try {
+    const root = path.join(fs.realpathSync(outputDir), '.meeting-transfer');
+    const media = path.join(root, stem);
+    for (const directory of [root, media]) {
+      if (!fs.lstatSync(directory).isDirectory() || fs.realpathSync(directory) !== directory) return null;
+    }
+    return media;
+  } catch (_) { return null; }
+}
+
 // No-clobber occupancy test. Uses lstat (NOT existsSync) so a DANGLING symlink
 // at the path counts as occupied: existsSync follows the link and returns false
 // for a broken target, which would let a renameSync silently REPLACE the symlink
@@ -1433,13 +1519,29 @@ function commitPendingDelete(id) {
     );
     return;
   }
+  // The note is now permanently gone — mirror the deletion into the Obsidian
+  // vault (#413) if sync is on. Runs at the single commit choke point so the
+  // timer, explicit-dismiss and quit paths all mirror; preserves an
+  // externally-edited vault copy (skip + flag) rather than clobbering it.
+  try { obsidianSync.removeNoteBySummaryPath(entry.originalSummaryPath); } catch (_) {}
   // Ancillary files (transcript / recording(s) / reports sidecar) are hygiene,
   // not the note itself: a rare permanently-locked orphan is accepted (fail-safe
   // direction — never risk the note over a stray file). Log any that survived.
   for (const p of entry.ancillaryPaths) {
+    // Recheck the private media ancestors after the undo window as well.
+    if (entry.transferMediaDir && path.dirname(p) === entry.transferMediaDir
+      && transferMediaDirectory(path.dirname(entry.originalSummaryPath), path.basename(entry.transferMediaDir)) !== entry.transferMediaDir) {
+      console.warn('Commit: retained transfer media after storage revalidation failed:', path.basename(entry.transferMediaDir));
+      continue;
+    }
     if (!unlinkBestEffort(p)) {
       console.warn(`Commit: orphaned ancillary file (could not remove): ${p}`);
     }
+  }
+  if (entry.transferMediaDir
+    && transferMediaDirectory(path.dirname(entry.originalSummaryPath), path.basename(entry.transferMediaDir)) === entry.transferMediaDir) {
+    // Only an empty directory may go; a failed unlink preserves its contents.
+    try { fs.rmdirSync(entry.transferMediaDir); } catch (_) {}
   }
   removeHiddenScaffold(entry.hiddenDir);
   pendingDeletes.delete(id);
@@ -1632,9 +1734,7 @@ function createWindow(options = {}) {
     if (launchedHidden) {
       return;
     }
-    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
-      mainWindow.show();
-    }
+    exposeMainWindow({ focus: false });
   };
 
   mainWindow.once('ready-to-show', () => {
@@ -1693,7 +1793,7 @@ function createTray() {
   const icon = nativeImage.createFromPath(getTrayIconPath(false));
   icon.setTemplateImage(true);
   tray = new Tray(icon);
-  tray.setToolTip('Steno');
+  tray.setToolTip('StenoAI');
 
   updateTrayMenu();
 }
@@ -1703,15 +1803,12 @@ function updateTrayIcon(recording) {
   const icon = nativeImage.createFromPath(getTrayIconPath(recording));
   icon.setTemplateImage(true);
   tray.setImage(icon);
-  tray.setToolTip(recording ? 'Steno - Recording' : 'Steno');
+  tray.setToolTip(recording ? 'StenoAI - Recording' : 'StenoAI');
   updateTrayMenu();
 }
 
 function showAndFocusWindow() {
-  if (mainWindow) {
-    mainWindow.show();
-    mainWindow.focus();
-  }
+  exposeMainWindow();
 }
 
 function updateTrayMenu() {
@@ -1722,7 +1819,7 @@ function updateTrayMenu() {
 
   const contextMenu = Menu.buildFromTemplate([
     {
-      label: 'Open Steno',
+      label: 'Open StenoAI',
       click: showAndFocusWindow
     },
     {
@@ -1743,14 +1840,14 @@ function updateTrayMenu() {
       }
     },
     {
-      label: 'Hide Steno',
+      label: 'Hide StenoAI',
       click: () => {
         if (mainWindow) mainWindow.hide();
       }
     },
     { type: 'separator' },
     {
-      label: `Steno v${appVersion}`,
+      label: `StenoAI v${appVersion}`,
       enabled: false
     },
     {
@@ -1761,7 +1858,7 @@ function updateTrayMenu() {
     },
     { type: 'separator' },
     {
-      label: 'Quit Steno',
+      label: 'Quit StenoAI',
       click: () => {
         app.quit();
       }
@@ -1820,8 +1917,24 @@ function rewarmParakeet(reason) {
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
+  const meetingTransfer = registerMeetingTransferIpc({
+    app, ipcMain, dialog, getMainWindow: () => mainWindow, exposeMainWindow,
+    getOutputDir, getUserDataDir,
+    isBusy: () => currentRecordingProcess !== null || systemAudioRecordingActive || isProcessing || activeReprocessJobs.size > 0,
+    readMeeting: readMeetingForTransfer,
+    findAudioSource: findMeetingTransferAudio,
+    prepareAudio: prepareMeetingTransferAudio,
+    makeShareMenu: items => new (require('electron').ShareMenu)(items),
+  });
+  if (process.platform === 'darwin') {
+    for (const arg of process.argv.slice(1)) meetingTransfer.openFile(arg);
+  }
+
   ipcMain.on('warmup-parakeet-hint', () => rewarmParakeet('renderer-hint'));
   app.on('second-instance', (event, argv) => {
+    if (process.platform === 'darwin') {
+      for (const arg of argv.slice(1)) meetingTransfer.openFile(arg);
+    }
     const shortcutUrl = extractShortcutUrlFromArgv(argv);
     if (shortcutUrl) {
       if (app.isReady()) {
@@ -1834,11 +1947,7 @@ if (!gotSingleInstanceLock) {
       }
     }
 
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.show();
-      mainWindow.focus();
-    }
+    exposeMainWindow();
   });
 
   // Sends the custom in-app quit dialog to the renderer and waits for a response.
@@ -1847,8 +1956,7 @@ if (!gotSingleInstanceLock) {
   // preserve any active recording rather than killing it silently.
   async function showCustomQuitDialog(type, jobCount) {
     if (!mainWindow || mainWindow.isDestroyed()) return true;
-    mainWindow.show();
-    mainWindow.focus();
+    exposeMainWindow();
     mainWindow.webContents.send('show-quit-dialog', { type, jobCount });
     return new Promise((resolve) => {
       const handler = (_event, data) => {
@@ -1877,7 +1985,7 @@ if (!gotSingleInstanceLock) {
         if (mainWindow && !mainWindow.isDestroyed()) {
           try {
             await mainWindow.webContents.executeJavaScript('stopSystemAudioRecording("quit")');
-          } catch (e) {
+          } catch {
             // Best effort -- file is saved even if processing doesn't start
           }
         }
@@ -1968,6 +2076,12 @@ if (!gotSingleInstanceLock) {
     } catch (e) {
       console.warn('processing-log init failed (non-fatal):', e?.message);
     }
+
+    // Migrate the pre-safeStorage plaintext ASR credential on every launch,
+    // independent of the active engine or whether Settings is opened. The
+    // helper encrypts, verifies a decrypt/readback, then asks the backend to
+    // remove plaintext only after that succeeds.
+    void migrateLegacyOpenAiAsrApiKey();
 
     // Application menu. macOS uses the global menu bar with mac-only roles
     // (services/hide/unhide). Windows/Linux get a slimmer, platform-correct
@@ -2085,6 +2199,7 @@ if (!gotSingleInstanceLock) {
     if (!IS_E2E && loadShowMenuBarIconEnabled()) createTray();
     setupAutoUpdater();
     setupAutoMeetingDetector();
+    setupDevNotificationTriggers();
     // Pre-meeting heads-up scheduler (calendar-time based). Skipped under E2E —
     // tests drive the show-premeeting-notification IPC seam directly; this would
     // otherwise start a background calendar poll.
@@ -2230,7 +2345,7 @@ if (!gotSingleInstanceLock) {
           _cachedCustomStoragePath = spData.storage_path;
           console.log('Custom storage path loaded:', _cachedCustomStoragePath);
         }
-      } catch (e) {
+      } catch {
         // Non-fatal - custom path just won't be cached
       }
     }
@@ -2249,6 +2364,26 @@ if (!gotSingleInstanceLock) {
       recoverPendingDeletesOnLaunch();
     } catch (e) {
       console.warn('pending-delete recovery on launch failed (non-fatal):', e?.message);
+    }
+
+    // Load the Obsidian sync config into the engine's cache (so per-note hooks
+    // never shell Python) and reconcile any index drift from changes made while
+    // the app was closed (#413). After the storage-path + pending-delete steps
+    // so getAllowedBaseDirs() is complete. Best-effort — never blocks launch.
+    try {
+      const [osEnabled, osVault] = await Promise.all([
+        runPythonScript('simple_recorder.py', ['get-obsidian-sync'], true),
+        runPythonScript('simple_recorder.py', ['get-obsidian-vault-path'], true),
+      ]);
+      obsidianSync.setCachedConfig({
+        enabled: !!JSON.parse(osEnabled.trim()).obsidian_sync_enabled,
+        vaultPath: JSON.parse(osVault.trim()).obsidian_vault_path || '',
+      });
+      // Fire-and-forget: reconcile yields internally, so it must not block the
+      // awaited launch sequence.
+      obsidianSync.reconcileOnLaunch().catch(() => {});
+    } catch (e) {
+      console.warn('Obsidian sync init failed (non-fatal):', e?.message);
     }
 
     // Clear any .import reservation markers orphaned by a crash mid-import. No
@@ -2343,8 +2478,7 @@ if (!gotSingleInstanceLock) {
       // Only show if the window has finished its initial load.
       // On first launch, windowReadyToShow is false until React mounts.
       if (windowReadyToShow) {
-        mainWindow.show();
-        mainWindow.focus();
+        exposeMainWindow();
       }
       launchedByShortcut = false;
     } else {
@@ -2384,11 +2518,7 @@ if (!gotSingleInstanceLock) {
 
 // Focus window handler (used by notification click to bring app to foreground)
 ipcMain.on('focus-window', () => {
-    if (mainWindow) {
-        if (mainWindow.isMinimized()) mainWindow.restore();
-        mainWindow.show();
-        mainWindow.focus();
-    }
+    exposeMainWindow();
 });
 
 ipcMain.on('shortcut-renderer-ready', () => {
@@ -2461,6 +2591,22 @@ ipcMain.handle('get-system-audio-support', async () => {
 // Backend communication - always uses bundled stenoai executable
 // runPythonScript is provided by createBackendCli(...) wired near the top of
 // this file (verbatim body moved to ./backend-cli).
+
+// Recovers a graceful {"success": false, "error": ...} a CLI command printed
+// to stdout right before exiting non-zero (see runPythonScript's err.stdout
+// above) -- without this, a real "already exists"/"not found" message gets
+// discarded in favor of a generic "Python script failed with code 1: <stderr>"
+// wrapper that's useless to a human. Falls back to that generic message when
+// stdout wasn't valid JSON (an actual crash, not a graceful failure).
+function parsePythonFailureJson(error) {
+  try {
+    const parsed = JSON.parse(error.stdout || '');
+    if (parsed && typeof parsed === 'object' && parsed.success === false) return parsed;
+  } catch (_) {
+    // stdout wasn't JSON -- fall through to the generic error below.
+  }
+  return { success: false, error: error.message };
+}
 
 async function getBackendStatusInternal(silent = true) {
   const result = await runPythonScript('simple_recorder.py', ['status'], silent);
@@ -2855,6 +3001,54 @@ async function validateMeetingFilePath(summaryFile) {
   return { realPath, allowedOutputDirs };
 }
 
+// The transfer exporter reads a stable saved snapshot rather than trusting
+// renderer-supplied meeting content or an arbitrary audio path.
+async function readMeetingForTransfer(summaryFile) {
+  const validated = await validateMeetingFilePath(summaryFile);
+  if (validated.error) throw { code: 'unsafe_storage' };
+  const handle = await fs.promises.open(validated.realPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.size > BigInt(STORE_DOCUMENT_LIMIT)) throw { code: 'unsafe_storage' };
+    const bytes = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    if (before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) throw { code: 'source_changed' };
+    const content = bytes.toString('utf8');
+    const meeting = validated.realPath.endsWith('.md')
+      ? parseMeetingMarkdown(content, validated.realPath) : JSON.parse(content);
+    if (!meeting.session_info) throw { code: 'unsafe_storage' };
+    return { realPath: validated.realPath, meeting, fingerprint: require('crypto').createHash('sha256').update(bytes).digest('hex') };
+  } finally { await handle.close(); }
+}
+
+async function findMeetingTransferAudio(summaryFile) {
+  return require('./meeting-transfer-audio').findAudioSource(summaryFile, getAllowedBaseDirs(), IMPORT_AUDIO_EXTENSIONS);
+}
+
+async function prepareMeetingTransferAudio(source) {
+  const { sourcePath, identity } = source;
+  const { privateDirectory } = require('./meeting-transfer-store');
+  const root = await privateDirectory(getUserDataDir(), 'meeting-transfer');
+  const scratch = await fs.promises.mkdtemp(path.join(root, 'audio-'));
+  const cleanup = () => fs.promises.rm(scratch, { recursive: true, force: true });
+  try {
+    const input = path.join(scratch, 'source' + path.extname(sourcePath));
+    await copyRegularFile(sourcePath, input, identity);
+    const target = path.join(scratch, 'track.caf');
+    const backendDir = path.dirname(getBackendPath());
+    const candidates = name => [path.join(backendDir, '_internal', name), path.join(backendDir, name)];
+    const helperCandidates = candidates('steno-audio-encode');
+    if (!app.isPackaged) helperCandidates.push(path.join(__dirname, '..', 'bin', 'steno-audio-encode'));
+    const values = await require('./meeting-transfer-audio').convertTransferAudio(input, target, {
+      nativeHelper: helperCandidates.find(candidate => fs.existsSync(candidate)),
+      ffmpeg: candidates('ffmpeg').find(candidate => fs.existsSync(candidate)),
+    });
+    await fs.promises.chmod(target, 0o600);
+    const metadata = { ...values, logicalTrackID: 'track-1', kind: 'imported' };
+    return { audio: [{ metadata, sourcePath: target }], cleanup };
+  } catch (error) { await cleanup(); throw error; }
+}
+
 ipcMain.handle('get-meeting', async (_event, summaryFile) => {
   try {
     const validated = await validateMeetingFilePath(summaryFile);
@@ -2863,6 +3057,22 @@ ipcMain.handle('get-meeting', async (_event, summaryFile) => {
     }
     const { realPath: realResolved, allowedOutputDirs } = validated;
     const content = await fs.promises.readFile(realResolved, 'utf-8');
+    const summaryBase = path.basename(realResolved);
+    const summarySuffix = summaryBase.endsWith('_summary.md')
+      ? '_summary.md'
+      : summaryBase.endsWith('_summary.json')
+        ? '_summary.json'
+        : null;
+    let hasSpeakerSidecar = false;
+    if (summarySuffix) {
+      const meetingStem = summaryBase.slice(0, -summarySuffix.length);
+      const speakerSidecarPath = path.join(path.dirname(realResolved), `${meetingStem}_speakers.json`);
+      try {
+        hasSpeakerSidecar = (await fs.promises.lstat(speakerSidecarPath)).isFile();
+      } catch {
+        hasSpeakerSidecar = false;
+      }
+    }
     if (summaryFile.endsWith('.md')) {
       // Legacy .md meetings are still listed by list-meetings, so their detail
       // pages route through here. Unlike the list payload, the detail page
@@ -2870,11 +3080,11 @@ ipcMain.handle('get-meeting', async (_event, summaryFile) => {
       // TranscriptPanel), so we return everything parseMeetingMarkdown yields.
       const mdMeeting = parseMeetingMarkdown(content, realResolved);
       const mdSidecar = await readReportsSidecar(realResolved, allowedOutputDirs);
-      return { success: true, meeting: { ...mdMeeting, reports: mdSidecar.reports, active_report: mdSidecar.active_report } };
+      return { success: true, meeting: { ...mdMeeting, has_speaker_sidecar: hasSpeakerSidecar, reports: mdSidecar.reports, active_report: mdSidecar.active_report } };
     }
     const jsonMeeting = JSON.parse(content);
     const jsonSidecar = await readReportsSidecar(realResolved, allowedOutputDirs);
-    return { success: true, meeting: { ...jsonMeeting, reports: jsonSidecar.reports, active_report: jsonSidecar.active_report } };
+    return { success: true, meeting: { ...jsonMeeting, has_speaker_sidecar: hasSpeakerSidecar, reports: jsonSidecar.reports, active_report: jsonSidecar.active_report } };
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -2890,6 +3100,11 @@ ipcMain.handle('clear-state', async () => {
 });
 
 ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, sessionName, retranscribe) => {
+  let errorCode = 'generation_failed';
+  const rememberError = (error) => {
+    const classified = classifyReprocessError(error);
+    if (classified !== 'generation_failed') errorCode = classified;
+  };
   try {
     // Security: symlink-safe containment-check the renderer-supplied summary path
     // before it reaches the backend CLI, and pass the canonical realPath (not the
@@ -2897,7 +3112,8 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
     // summaryFile — that's UI correlation the renderer matches on, not file access.
     const validated = await validateMeetingFilePath(summaryFile);
     if (validated.error) {
-      return { success: false, error: validated.error };
+      sendDebugLog(`Reprocess path validation failed: ${validated.error}`);
+      return { success: false, error: 'Note generation failed', error_code: errorCode };
     }
     const { realPath } = validated;
 
@@ -2921,8 +3137,10 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
     // stuck.
     activeReprocessJobs.set(summaryFile, { summaryFile, sessionName: sessionName || null });
 
-    const aiEnv = getAiEnv();
-    const reprocessEnv = Object.keys(aiEnv).length > 0 ? { ...require('process').env, ...aiEnv } : undefined;
+    const reprocessSecrets = retranscribe
+      ? { ...getAiEnv(), ...getTranscriptionEnv() }
+      : getAiEnv();
+    const reprocessEnv = getBackendEnv(reprocessSecrets);
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), args, {
@@ -2937,6 +3155,7 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
       // assume. Threaded into processing-complete so the renderer fires
       // "Note ready" only when notes exist (#bug2).
       let summarizationCompleted = false;
+      let streamFailed = false;
 
       // Liveness watchdog — see makeInactivityWatchdog. Summary CHUNK:
       // lines (and HEARTBEAT: lines if a retranscribe is ever added here)
@@ -2976,10 +3195,15 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
             }
           } else if (line.startsWith('STREAM_ERROR:')) {
             const errMsg = line.slice('STREAM_ERROR:'.length);
+            streamFailed = true;
+            rememberError(errMsg);
             sendDebugLog(`❌ Reprocess stream error: ${errMsg}`);
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('summary-complete', { success: false, sessionName, summaryFile });
+              mainWindow.webContents.send('summary-complete', { success: false, sessionName, summaryFile, error_code: errorCode });
             }
+          } else if (line.startsWith('ERROR:')) {
+            rememberError(line.slice('ERROR:'.length));
+            forwardDiagnosticStdout(line, 'reprocess');
           } else {
             // Unclassified stdout: forward only diagnostic markers, drop content.
             forwardDiagnosticStdout(line, 'reprocess');
@@ -2998,25 +3222,61 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
 
       proc.on('close', (code) => {
         watchdog.clear();
-        if (code === 0) {
+        if (code === 0 && !streamFailed && !watchdog.timedOut) {
           console.log(`✅ Completed reprocessing: ${sessionName}`);
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('processing-complete', {
-              success: true,
-              sessionName,
-              summaryFile,
-              notesGenerated: summarizationCompleted,
-              message: 'Reprocessing completed successfully'
-            });
-          }
-          resolve();
+          // Reprocess / generate-notes / re-transcribe rewrote the note — mirror
+          // it into the vault (#413) if sync is on. Use the canonical realPath
+          // (not the renderer alias) so it indexes under the true summary stem.
+          try { if (realPath) obsidianSync.syncNoteBySummaryPath(realPath); } catch (_) {}
+          // Look up the saved meeting so the completion event carries meetingData
+          // with the note's CURRENT title — reprocess may have generated an LLM
+          // title, so `sessionName` here can still be the 'Note' placeholder. The
+          // renderer's note-ready notification reads meetingData.session_info.name
+          // for its body; without this it falls back to the generic string and
+          // the note title never shows. Mirrors the recording-complete path.
+          runPythonScript('simple_recorder.py', ['list-meetings'], true)
+            .then((meetingsResult) => {
+              const allMeetings = JSON.parse(meetingsResult);
+              const processedMeeting =
+                allMeetings.find((m) => m.session_info?.summary_file === summaryFile) || null;
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('processing-complete', {
+                  success: true,
+                  sessionName,
+                  summaryFile,
+                  meetingData: processedMeeting,
+                  notesGenerated: summarizationCompleted,
+                  message: 'Reprocessing completed successfully'
+                });
+              }
+            })
+            .catch((error) => {
+              console.error('Error fetching reprocessed meeting:', error);
+              // Fall back to firing without meetingData — the note-ready title
+              // may be generic, but the note is still in the list + sidebar.
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('processing-complete', {
+                  success: true,
+                  sessionName,
+                  summaryFile,
+                  notesGenerated: summarizationCompleted,
+                  message: 'Reprocessing completed successfully'
+                });
+              }
+            })
+            .finally(() => resolve());
         } else {
+          // A STREAM_ERROR is more specific than a generic exit or trailing
+          // diagnostic. Keep it through both terminal events and the result.
+          if (errorCode === 'generation_failed' && watchdog.timedOut) errorCode = 'generation_timeout';
+          if (errorCode === 'generation_failed') rememberError(stderrBuf);
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('processing-complete', {
               success: false,
               sessionName,
               summaryFile,
               message: `Reprocessing failed (exit ${code})`,
+              error_code: errorCode,
             });
           }
           reject(new Error(`reprocess exited with code ${code}: ${stderrBuf.slice(-500)}`));
@@ -3028,7 +3288,8 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
     return { success: true };
   } catch (error) {
     sendDebugLog(`❌ Reprocessing failed: ${error.message}`);
-    return { success: false, error: error.message };
+    if (errorCode === 'generation_failed') rememberError(error);
+    return { success: false, error: 'Note generation failed', error_code: errorCode };
   } finally {
     activeReprocessJobs.delete(summaryFile);
   }
@@ -3103,7 +3364,7 @@ ipcMain.handle('generate-report-meeting', async (event, summaryFile, templateId)
     activeReprocessJobs.set(summaryFile, { summaryFile, sessionName });
 
     const aiEnv = getAiEnv();
-    const reportEnv = Object.keys(aiEnv).length > 0 ? { ...require('process').env, ...aiEnv } : undefined;
+    const reportEnv = getBackendEnv(aiEnv);
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), args, {
@@ -3262,7 +3523,7 @@ ipcMain.handle('regen-meeting-title', async (event, summaryFile, sessionName) =>
     activeReprocessJobs.set(summaryFile, { summaryFile, sessionName: sessionName || null });
 
     const aiEnv = getAiEnv();
-    const regenEnv = Object.keys(aiEnv).length > 0 ? { ...require('process').env, ...aiEnv } : undefined;
+    const regenEnv = getBackendEnv(aiEnv);
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), ['regen-title', realPath], {
@@ -3365,6 +3626,70 @@ ipcMain.handle('query-transcript', async (event, summaryFile, question) => {
 });
 
 const activeQueryProcs = new Map();
+const contextQueries = new Map();
+const { validateRequest: validateChatRequest, liveSnapshot, runQuery: runChatQuery } = require('./chat-query');
+
+ipcMain.on('chat-context-stream', async (event, queryId, request) => {
+  const sender = event.sender;
+  let chunkCount = 0;
+  let tracked = false;
+  const send = (channel, data) => {
+    if (channel === 'query-chunk') chunkCount++;
+    if (channel === 'query-done' && !tracked && data.error !== 'Answer stopped.') {
+      tracked = true;
+      trackEvent('chat_message_sent', {
+        success: data.success,
+        scope: request?.scope === 'live' || request?.scope === 'meeting' ? 'single_meeting' : 'global',
+        query_length: textLengthBucket(typeof request?.question === 'string' ? request.question : ''),
+        has_response: chunkCount > 0,
+      });
+    }
+    if (!sender.isDestroyed()) sender.send(channel, { queryId, ...data });
+  };
+  if (!mainWindow || sender !== mainWindow.webContents || event.senderFrame !== sender.mainFrame) return;
+  if (typeof queryId !== 'string' || !queryId || queryId.length > 256 || contextQueries.has(queryId)) return;
+  if (contextQueries.size >= 4) {
+    send('query-done', { success: false, error: 'Wait for another answer to finish.' });
+    return;
+  }
+  let cancelled = false;
+  const entry = { sender, cancel: () => { cancelled = true; } };
+  contextQueries.set(queryId, entry);
+  const onDestroyed = () => entry.cancel();
+  sender.once('destroyed', onDestroyed);
+  const cleanup = () => {
+    contextQueries.delete(queryId);
+    if (!sender.isDestroyed()) sender.removeListener('destroyed', onDestroyed);
+  };
+  try {
+    const payload = validateChatRequest(request);
+    if (payload.scope === 'live') {
+      if (!systemAudioRecordingActive || request.recordingId !== String(recordingRuntimeState.startedAtMs)
+          || !recordingRuntimeState.startedAtMs) throw new Error('This recording is no longer active.');
+      payload.transcript = liveSnapshot(liveTranscriptState);
+      // A continued recording can start after a cold launch, with no in-memory
+      // prior segments. Read its saved transcript via the validated note path.
+      if (currentRecordingAppendTarget) {
+        payload.file = currentRecordingAppendTarget;
+        payload.transcript = liveSnapshot({ segments: liveTranscriptState.segments });
+      }
+    } else if (payload.scope === 'meeting') {
+      const validated = await validateMeetingFilePath(request.file);
+      if (validated.error) throw new Error('This meeting is unavailable.');
+      payload.file = validated.realPath;
+    }
+    if (cancelled || sender.isDestroyed()) { cleanup(); return; }
+    const query = runChatQuery({
+      spawn: require('child_process').spawn,
+      backend: getBackendPath(), env: getBackendEnv(getAiEnv()), cwd: getBackendCwd(),
+      payload, send, onFinish: cleanup,
+    });
+    entry.cancel = query.cancel;
+  } catch (error) {
+    if (!cancelled) send('query-done', { success: false, error: error.message });
+    cleanup();
+  }
+});
 
 // Cancellation intent for streaming queries that are still in their pre-spawn
 // async window. query-transcript-stream now `await`s validateMeetingFilePath
@@ -3377,6 +3702,11 @@ const activeQueryProcs = new Map();
 const pendingQueryCancels = new Map();
 
 ipcMain.on('query-cancel', (_event, queryId) => {
+  const contextQuery = contextQueries.get(queryId);
+  if (contextQuery) {
+    if (contextQuery.sender === _event.sender) contextQuery.cancel();
+    return;
+  }
   const proc = activeQueryProcs.get(queryId);
   if (proc) {
     console.log(`[QUERY] Cancelling queryId=${queryId}`);
@@ -3405,7 +3735,7 @@ ipcMain.on('query-cancel', (_event, queryId) => {
 ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, question) => {
   console.log(`[QUERY] IPC received: question="${question.substring(0, 50)}" file="${summaryFile}"`);
   sendDebugLog(`🤖 Streaming query (${String(question || '').length} chars)`);
-  const env = { ...process.env, ...getAiEnv() };
+  const env = getBackendEnv(getAiEnv());
 
   // chat_message_sent restores visibility into single-meeting chat (dormant
   // since the old bare-ping ai_query_used stopped being reachable once chat
@@ -3461,7 +3791,7 @@ ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, questi
   let validated;
   try {
     validated = await validateMeetingFilePath(summaryFile);
-  } catch (err) {
+  } catch {
     // Defense-in-depth: validateMeetingFilePath is fail-closed and shouldn't
     // throw, but if it ever does (e.g. a future refactor), don't let it become
     // an unhandled rejection that can take down the main process.
@@ -3594,7 +3924,7 @@ ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, questi
 // fewer recent notes instead of overflowing. No retrieval (RAG) yet.
 ipcMain.on('chat-global-stream', (event, queryId, question, folderId) => {
   sendDebugLog(`💬 Global chat query (${String(question || '').length} chars, folder: ${folderId || 'all'})`);
-  const env = { ...process.env, ...getAiEnv() };
+  const env = getBackendEnv(getAiEnv());
 
   const args = ['chat-global-streaming', '-q', question];
   if (folderId && typeof folderId === 'string' && folderId !== 'all') {
@@ -3659,7 +3989,7 @@ ipcMain.on('chat-global-stream', (event, queryId, question, folderId) => {
             proc.kill();
             activeQueryProcs.delete(queryId);
           }
-        } catch (e) { /* ignore decode errors */ }
+        } catch { /* ignore decode errors */ }
       } else if (line === 'CHAT_STREAM_COMPLETE') {
         if (!event.sender.isDestroyed()) {
           event.sender.send('query-done', { queryId, success: true });
@@ -4265,6 +4595,10 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
 
       fs.writeFileSync(realPath, updatedRaw, 'utf8');
 
+      // Title/notes edits fire no processing-complete, so mirror explicitly
+      // (#413). A title change here drives the vault-file rename via the index.
+      try { obsidianSync.syncNoteBySummaryPath(realPath); } catch (_) {}
+
       data = {
         session_info: {
           name: updates.name !== undefined ? updates.name : title,
@@ -4411,6 +4745,33 @@ ipcMain.handle('delete-meeting', async (event, meetingData) => {
       }
       ancillaryCandidates.push(path.join(outputDir, sidecarBase));
     }
+    // Speakers sidecar: <stem>_speakers.json. Same class of miss as the
+    // reports sidecar was -- a per-meeting file added later that the delete
+    // enumeration never learned about. Reproduced end to end: the note,
+    // transcript and audio went, and an 84 KB file of VOICE EMBEDDINGS
+    // stayed behind, which is the worst thing in the set to leave on disk
+    // after someone deletes a meeting. It is stem-bound like the others, so
+    // it inherits the same containment checks and the same undo window.
+    //
+    // Note this removes only the meeting's per-cluster embeddings. A person
+    // CONFIRMED from this meeting keeps their voice profile in config.json,
+    // deliberately: those are bound to the person, not the meeting, and are
+    // what makes recognition work across recordings (verified against a real
+    // library, where working prototypes came from meetings deleted long ago).
+    // Deleting a person is its own explicit action in the Speakers panel.
+    if (stem) {
+      ancillaryCandidates.push(path.join(outputDir, `${stem}_speakers.json`));
+    }
+    // Imported transfer audio is bound to the same immutable summary stem.
+    // Enumerate only canonical track files, never paths from meeting JSON.
+    const transferMediaDir = transferMediaDirectory(outputDir, stem);
+    if (transferMediaDir) {
+      try {
+        for (const name of fs.readdirSync(transferMediaDir)) {
+          if (/^track-[1-9][0-9]*\.caf$/.test(name)) ancillaryCandidates.push(path.join(transferMediaDir, name));
+        }
+      } catch (_) { /* text-only package */ }
+    }
     // Derive the transcript + recording from the summary stem (FACT A). A normal
     // .md note carries ONLY summary_file, so without this the transcript and the
     // RECORDING would be orphaned, defeating the whole point of #234 (protect the
@@ -4458,7 +4819,7 @@ ipcMain.handle('delete-meeting', async (event, meetingData) => {
     // --- Twin edge (ANOMALOUS, FAIL-SAFE): a note names EXACTLY ONE
     // summary_file, and we hide only that one. If a stem somehow has BOTH
     // <stem>_summary.json AND <stem>_summary.md, hiding the named one leaves the
-    // other, and the `output/*_summary.{json,md}` scan keeps the note VISIBLE —
+    // other, and the `output/<stem>_summary.{json,md}` scan keeps the note VISIBLE —
     // so the delete under-hides (note REAPPEARS), never over-deletes: nothing is
     // lost. This is accepted deliberately: the app's own writers only ever
     // produce <stem>_summary.md (JSON summaries are legacy, read-only; reprocess
@@ -4490,7 +4851,9 @@ ipcMain.handle('delete-meeting', async (event, meetingData) => {
         console.warn(`Skipping non-regular-file ancillary (not tracked): ${p}`);
         continue;
       }
-      if (!isAllowedMeetingSource(p, allowedBaseDirs)) {
+      const isTransferTrack = transferMediaDir && path.dirname(p) === transferMediaDir
+        && /^track-[1-9][0-9]*\.caf$/.test(path.basename(p));
+      if (!isTransferTrack && !isAllowedMeetingSource(p, allowedBaseDirs)) {
         console.warn(`Skipping ancillary outside allowed meeting folders (not tracked): ${p}`);
         continue;
       }
@@ -4562,6 +4925,7 @@ ipcMain.handle('delete-meeting', async (event, meetingData) => {
       hiddenSummaryPath,
       canonicalSummary,
       ancillaryPaths,
+      transferMediaDir,
       deadline,
       state: 'pending',
       timer: null,
@@ -4677,6 +5041,10 @@ ipcMain.handle('get-queue-status', async () => {
           ? Math.floor((Date.now() - currentProcessingStartedAtMs) / 1000)
           : 0),
     sessionName: currentRecordingSessionName,
+    recordingId: systemAudioRecordingActive && recordingRuntimeState.startedAtMs
+      ? String(recordingRuntimeState.startedAtMs) : null,
+    chatSummaryFile: systemAudioRecordingActive
+      ? (currentRecordingAppendTarget || activeSysAudioSummaryFile) : null,
     // The note (summary-file realpath) an active continue/resume is recording
     // INTO, so the renderer can tell "recording this note" from "recording a
     // different one" by identity rather than by the (collidable) display name.
@@ -4809,10 +5177,8 @@ function spawnLiveTranscribe(sessionName) {
     liveTranscribeSessionName = null;
     liveTranscribeStdoutBuf = '';
   }
-  const aiEnv = getAiEnv();
-  const env = Object.keys(aiEnv).length > 0
-    ? { ...require('process').env, ...aiEnv }
-    : undefined;
+  const aiEnv = { ...getAiEnv(), ...getTranscriptionEnv() };
+  const env = getBackendEnv(aiEnv);
   parakeetLoadStartedAt = Date.now();
   liveTranscribeProcess = spawn(getBackendPath(), ['transcribe-stream'], {
     cwd: getBackendCwd(),
@@ -5083,7 +5449,8 @@ function loadTranscriptionEngine() {
     if (!fs.existsSync(cfgPath)) return 'parakeet';
     const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
     const engine = cfg.transcription_engine;
-    return engine === 'whisper' ? 'whisper' : 'parakeet';
+    if (engine === 'whisper' || engine === 'openai-asr') return engine;
+    return 'parakeet';
   } catch (_) {
     return 'parakeet';
   }
@@ -5100,12 +5467,21 @@ function loadTranscriptionContext() {
       return { engine: 'parakeet', model: 'parakeet', language: 'auto' };
     }
     const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
-    const engine = cfg.transcription_engine === 'whisper' ? 'whisper' : 'parakeet';
-    return {
-      engine,
+    const rawEngine = cfg.transcription_engine;
+    const engine = (rawEngine === 'whisper' || rawEngine === 'openai-asr') ? rawEngine : 'parakeet';
+    let model;
+    if (engine === 'whisper') {
+      model = sanitizeModelForAnalytics(cfg.whisper_model);
+    } else if (engine === 'openai-asr') {
+      model = sanitizeModelForAnalytics(cfg.openai_asr_model) || 'whisper-1';
+    } else {
       // Parakeet has no separate user-selectable model today (single bundled
       // default) -- report the engine name rather than guess a variant id.
-      model: engine === 'whisper' ? sanitizeModelForAnalytics(cfg.whisper_model) : 'parakeet',
+      model = 'parakeet';
+    }
+    return {
+      engine,
+      model,
       language: cfg.language || 'auto',
     };
   } catch (_) {
@@ -5283,7 +5659,6 @@ let recordingRuntimeState = {
 };
 let ollamaProcess = null;  // Track spawned Ollama process for cleanup on quit
 let ollamaPid = null;      // Store PID separately since unref() disconnects the process
-let ollamaStartedByUs = false;
 
 // Content-free crash/force-quit detection (report Appendix: ~8% of macOS
 // recordings never fire recording_stopped at all -- a silent gap in the
@@ -5415,16 +5790,20 @@ let systemSuspendedForWatchdogs = false;
 
 function makeInactivityWatchdog(proc, ms, label) {
   let timer = null;
+  let timedOut = false;
   const arm = () => {
     timer = setTimeout(() => {
       timer = null;
+      timedOut = true;
       activeInactivityWatchdogs.delete(watchdog);
       console.error(`${label} produced no output for ${Math.round(ms / 60000)} minutes, killing`);
       sendDebugLog(`${label} inactive for ${Math.round(ms / 60000)} minutes — killing process`);
-      try { proc.kill(); } catch (e) { /* process already gone */ }
+      try { proc.kill(); } catch { /* process already gone */ }
     }, ms);
   };
   const watchdog = {
+    // Retain the cause after clear(): close handlers need it after cleanup.
+    get timedOut() { return timedOut; },
     // Any stdout/stderr activity proves liveness — push the deadline out.
     reset() {
       if (timer === null) return; // fired, cleared, or frozen — don't re-arm
@@ -5510,8 +5889,10 @@ async function processNextInQueue() {
   let summarizationCompleted = false;
 
   try {
-    const queueAiEnv = getAiEnv();
-    const queueEnv = Object.keys(queueAiEnv).length > 0 ? { ...require('process').env, ...queueAiEnv } : undefined;
+    // process-streaming does BOTH transcription (needs the ASR key) and
+    // summarization (needs the AI env), so merge both.
+    const queueAiEnv = { ...getAiEnv(), ...getTranscriptionEnv() };
+    const queueEnv = getBackendEnv(queueAiEnv);
     const processArgs = ['process-streaming', currentProcessingJob.audioFile, '--name', currentProcessingJob.sessionName];
     if (currentProcessingJob.notesFile && fs.existsSync(currentProcessingJob.notesFile)) {
       processArgs.push('--notes', currentProcessingJob.notesFile);
@@ -5673,6 +6054,13 @@ async function processNextInQueue() {
         if (code === 0) {
           console.log(`✅ Completed streaming processing: ${currentProcessingJob.sessionName}`);
           const sessionNameAtClose = currentProcessingJob.sessionName;
+          // Mirror the finished note into an Obsidian vault when sync is on
+          // (#413). Best-effort — a vault write must never affect processing.
+          try {
+            const finishedSummary = savedSummaryFile
+              || (currentProcessingJob && currentProcessingJob.summaryFile);
+            if (finishedSummary) obsidianSync.syncNoteBySummaryPath(finishedSummary);
+          } catch (_) {}
           // Notify frontend that streaming is done and meeting is saved
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('summary-complete', {
@@ -6107,6 +6495,7 @@ ipcMain.handle('start-recording-ui', async (_, sessionName, trigger, appendTo) =
     // retired, so there is no longer a mic-XOR-system fork here.
     sendDebugLog(`Starting renderer-driven recording (name ${String(actualSessionName || '').length} chars)`);
     currentRecordingSessionName = actualSessionName;
+    activeSysAudioSummaryFile = null;
     startRecordingRuntimeState();
     // Flip the active flag immediately so the queue handler reports
     // hasRecording=true on the very next poll, which is what cues the renderer
@@ -6421,6 +6810,56 @@ ipcMain.handle('startup-setup-check', async () => {
   }
 });
 
+async function runSpeakerModelCommand(command) {
+  if (process.platform !== 'darwin') {
+    return {
+      success: false,
+      ready: false,
+      error: 'Speaker diarization is unavailable on this system',
+    };
+  }
+  const output = await runPythonScript('simple_recorder.py', [command]);
+  return parseSpeakerModelStatusOutput(output);
+}
+
+ipcMain.handle('speaker-model-status', async () => {
+  try {
+    return await runSpeakerModelCommand('speaker-model-status');
+  } catch {
+    sendDebugLog('Speaker diarization model status check failed');
+    return {
+      success: false,
+      ready: false,
+      error: 'Could not check the speaker diarization models',
+    };
+  }
+});
+
+// One shared download for onboarding and Settings; progress goes to the
+// renderer as 'speaker-models-progress' ({ percent, phase }).
+const prepareSpeakerModels = createSpeakerModelPreparer({
+  spawn,
+  getBackendPath,
+  getBackendCwd,
+  makeLineReader,
+  onLog: sendDebugLog,
+  platform: process.platform,
+  onProgress: (progress) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('speaker-models-progress', progress);
+    }
+  },
+});
+
+ipcMain.handle('setup-speaker-models', async () => {
+  sendDebugLog('Preparing local speaker diarization models...');
+  const result = await prepareSpeakerModels();
+  sendDebugLog(result.success && result.ready
+    ? 'Speaker diarization models ready'
+    : 'Speaker diarization model setup failed');
+  return result;
+});
+
 // ── Auto-updater ──
 // Mirrors the autoUpdater event sequence (available -> progress* ->
 // downloaded) so AboutTab can recover its state on every mount instead of
@@ -6480,7 +6919,7 @@ function gatherIdleInstallState() {
     isProcessing,
     queueLength: processingQueue.length,
     liveActive: liveTranscribeProcess != null,
-    streaming: activeQueryProcs.size > 0,
+    streaming: activeQueryProcs.size > 0 || contextQueries.size > 0,
     otherJobsActive: activeReprocessJobs.size > 0,
     idleSeconds: powerMonitor.getSystemIdleTime(),
     idleThresholdSeconds: IDLE_AUTO_INSTALL_THRESHOLD_SECONDS,
@@ -6710,12 +7149,14 @@ function setupAutoUpdater() {
     // download is still running forever, and About would show a stuck
     // progress bar with no way to tell it failed.
     pendingDownloadPercent = null;
-    // Until a release carrying this platform's update feed (latest.yml on
-    // Windows) is published, the updater 404s on the feed file. That's an
-    // expected transitional state, not a real failure — log it quietly so it
-    // doesn't read as a scary stack trace for alpha testers, and don't
-    // surface it to the renderer as an error.
-    if (/latest(-mac)?\.yml/i.test(msg) && /(404|cannot find)/i.test(msg)) {
+    // Until a release carrying this platform's update feed is published
+    // (latest.yml on Windows, latest-linux*.yml on Linux — which ships none
+    // at all today), the updater 404s on the feed file. That's an expected
+    // state, not a real failure — log it quietly so it doesn't read as a
+    // scary stack trace for alpha testers, and don't surface it to the
+    // renderer as an error. See isMissingUpdateFeedError for why the match
+    // is not spelled out inline any more.
+    if (isMissingUpdateFeedError(msg)) {
       sendDebugLog('Auto-updater: no update feed published for this release yet — skipping.');
       return;
     }
@@ -6782,8 +7223,10 @@ const MIC_MONITOR_HEALTHY_RESET_MS = 30_000;
 // Browsers route media capture through helper sub-processes (Safari →
 // com.apple.WebKit.GPU, Chrome → com.google.Chrome.helper, etc.), so the raw
 // app_name reads as "Safari Graphics and Media" / "Google Chrome Helper".
-// Translate those back to the user-recognisable parent app name.
+// FaceTime, Phone.app and Continuity calls use the daemon "avconferenced".
+// Translate both back to the user-recognisable parent app name.
 const APP_NAME_OVERRIDES = [
+  { match: /^com\.apple\.avconferenced/, name: 'Call' },
   { match: /^com\.apple\.WebKit/, name: 'Safari' },
   { match: /^com\.google\.Chrome/, name: 'Google Chrome' },
   { match: /^org\.chromium\./, name: 'Chromium' },
@@ -6825,7 +7268,7 @@ const MEETING_END_DEBOUNCE_MS = 3_000;
 // brief device switch — since auto-resume cancels the auto-stop if the mic
 // returns within it. Because a released mic reliably means the call ended (not
 // mute), we finalize automatically after this rather than prompting the user.
-const MEETING_END_AUTOSTOP_GRACE_MS = 20_000;
+const MEETING_END_AUTOSTOP_GRACE_MS = 10_000;
 
 let micMonitorProc = null;
 let micMonitorRespawnTimer = null;
@@ -6942,6 +7385,8 @@ async function handleMicEvent(line) {
         clearTimeout(autoStartedSession.autoStopTimer);
         autoStartedSession.autoStopTimer = null;
       }
+      // Meeting came back before the grace window elapsed — cancel the auto-stop
+      // and keep capturing.
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('auto-resume-requested');
       }
@@ -6996,14 +7441,15 @@ function handleMicStop(evt) {
       mainWindow.webContents.send('auto-pause-requested');
     }
     sendDebugLog(`[auto-detect] meeting ended (paused): ${autoStartedSession.appName}`);
-    // Don't finalize immediately — the mic can briefly drop on a device switch.
-    // Hold paused for a short grace; if the mic comes back, handleMicEvent above
-    // cancels this timer and auto-resumes. Otherwise the meeting has genuinely
-    // ended (a released mic ≠ mute — Zoom/Meet/Teams keep the stream open while
-    // muted, see MEETING_END_DEBOUNCE_MS), so auto-stop and let the pipeline run.
-    // No "Wrap up" prompt: mic-release is a reliable end signal, so we finalize
-    // automatically and the user's only end-of-meeting prompt is the
-    // post-transcription "Summarise" / "Note ready".
+    // Meeting ended: auto-stop silently after a short grace, then let the shared
+    // post-stop pipeline run. The summarise decision happens AFTER transcription
+    // via the same transcript-ready → "Summarise?" → note-ready notifications as
+    // a manual stop — no separate meeting-end prompt (it was redundant and made
+    // summarise a two-step flow). If the mic comes back within the grace,
+    // handleMicEvent above cancels this timer and auto-resumes. Otherwise the
+    // meeting has genuinely ended (a released mic ≠ mute — Zoom/Meet/Teams keep
+    // the stream open while muted, see MEETING_END_DEBOUNCE_MS), so we auto-stop
+    // — a meeting is never left stranded paused.
     if (autoStartedSession.autoStopTimer) clearTimeout(autoStartedSession.autoStopTimer);
     autoStartedSession.autoStopTimer = setTimeout(() => {
       autoStartedSession.autoStopTimer = null;
@@ -7023,9 +7469,11 @@ function showMeetingDetectedNotification(appName, originatingEvt, calEvent) {
     body: calEvent?.title || appName,
     actions: [{ type: 'button', text: 'Take Notes' }],
   });
+  // Both the "Take Notes" button and the notification body start recording — one
+  // action, so a single tap anywhere works.
   const trigger = () => requestAutoRecord(appName, originatingEvt, calEvent);
   notif.on('action', (_evt, _index) => trigger()); // shown when banner style = Alerts
-  notif.on('click', trigger);                       // body tap (always available)
+  notif.on('click', () => trigger());              // body tap (always available)
   trackNotificationLifecycle(notif, 'meeting_detected');
   notif.show();
 }
@@ -7058,8 +7506,7 @@ function requestAutoRecord(appName, originatingEvt, calEvent) {
   // explicit tap does.) The renderer's auto-record handler then starts the
   // recording and opens the live-note editor.
   if (mainWindow && !mainWindow.isDestroyed()) {
-    if (!mainWindow.isVisible()) mainWindow.show();
-    mainWindow.focus();
+    exposeMainWindow();
     mainWindow.webContents.send('auto-record-requested', { sessionName, appName });
   }
 }
@@ -7068,12 +7515,12 @@ function requestAutoRecord(appName, originatingEvt, calEvent) {
 // through the grace window (see handleMicStop). STOPS the paused recording,
 // which drives the shared post-stop pipeline; the *summarise* decision then
 // happens after transcription (transcript-ready / note-ready notifications),
-// not here. Sent on the `auto-summarise-requested` channel (whose renderer
-// handler already just stops the recording); the channel name predates the
-// auto-stop rework and is kept to avoid 4-file churn.
+// not here — identical to a manual stop. Sent on the `auto-summarise-requested`
+// channel (whose renderer handler just stops the recording); the channel name
+// predates the auto-stop rework and is kept to avoid 4-file churn.
 function autoStopEndedMeeting() {
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('auto-summarise-requested');
+    mainWindow.webContents.send('auto-summarise-requested', {});
   }
   clearAutoStartedSession();
 }
@@ -7083,6 +7530,57 @@ function clearAutoStartedSession() {
   if (autoStartedSession.pauseTimer) clearTimeout(autoStartedSession.pauseTimer);
   if (autoStartedSession.autoStopTimer) clearTimeout(autoStartedSession.autoStopTimer);
   autoStartedSession = null;
+}
+
+// Opt-in dev tool: global shortcuts to fire each completion notification on
+// demand, so their native macOS click/action behavior is verifiable in
+// `npm start` without a real meeting or a DMG rebuild. Enabled only in a dev
+// build with STENOAI_DEV_NOTIF_TRIGGERS=1 (never packaged, never E2E) so it
+// doesn't grab shortcuts from other contributors by default. These fire the SAME
+// functions the real flow uses (showMeetingDetected/TranscriptReady/NoteReady),
+// so what you see here matches a real meeting.
+//   Ctrl+Alt+1 → "Meeting detected" (Take Notes)
+//   Ctrl+Alt+2 → "Transcript ready" (Summarise) for the most recent note
+//   Ctrl+Alt+3 → "Note ready" for the most recent note
+const DEV_NOTIF_TRIGGERS_ENV = 'STENOAI_DEV_NOTIF_TRIGGERS';
+function setupDevNotificationTriggers() {
+  if (IS_E2E || app.isPackaged || !process.env[DEV_NOTIF_TRIGGERS_ENV]) return;
+  const latestNote = async () => {
+    try {
+      const meetings = JSON.parse(await runPythonScript('simple_recorder.py', ['list-meetings'], true));
+      const withNotes = meetings.filter((m) => m.session_info?.summary_file);
+      const m = withNotes[0];
+      return m
+        ? { summaryFile: m.session_info.summary_file, title: m.session_info.name || 'Untitled note' }
+        : null;
+    } catch (e) {
+      sendDebugLog(`[dev-notify] list-meetings failed: ${e.message}`);
+      return null;
+    }
+  };
+  const register = (accel, label, fn) => {
+    try {
+      if (!globalShortcut.register(accel, fn)) {
+        console.warn(`[dev-notify] failed to register ${accel} (${label})`);
+      }
+    } catch (e) {
+      console.warn(`[dev-notify] register threw for ${accel}: ${e.message}`);
+    }
+  };
+  register('Control+Alt+1', 'meeting-detected', () => {
+    showMeetingDetectedNotification('DevMeeting', { pid: 0, app_id: 'dev.meeting' }, null);
+  });
+  register('Control+Alt+2', 'transcript-ready', async () => {
+    const note = await latestNote();
+    if (!note) { sendDebugLog('[dev-notify] no note for transcript-ready'); return; }
+    void showTranscriptReadyNotification({ title: note.title, summaryFile: note.summaryFile, name: note.title });
+  });
+  register('Control+Alt+3', 'note-ready', async () => {
+    const note = await latestNote();
+    if (!note) { sendDebugLog('[dev-notify] no note for note-ready'); return; }
+    void showNoteReadyNotification({ title: note.title, summaryFile: note.summaryFile });
+  });
+  sendDebugLog('[dev-notify] triggers registered (Ctrl+Alt+1/2/3)');
 }
 
 function setupAutoMeetingDetector() {
@@ -7154,6 +7652,7 @@ function attachProcessingStderr(proc, label) {
 // pipelines (e.g. a queued process-streaming run during a live record) don't
 // mask each other's heartbeats. Records are logged under the source label.
 const lastHeartbeatLoggedAt = new Map();
+const lastProgressLoggedAt = new Map();
 function logPipelineStdoutLine(line, source) {
   const l = line.trim();
   if (!l) return;
@@ -7161,6 +7660,22 @@ function logPipelineStdoutLine(line, source) {
     const now = Date.now();
     if (now - (lastHeartbeatLoggedAt.get(source) || 0) < 10_000) return;
     lastHeartbeatLoggedAt.set(source, now);
+    processingLog.logLine(source, l);
+    return;
+  }
+  if (l.startsWith('PROGRESS:')) {
+    // Stage-transition markers (diarize start/done, summarize
+    // step/reducing) are rare and always worth a line. Per-chunk
+    // sub-progress (transcribe chunks, diarize embedding chunks) can tick
+    // roughly once a second for many minutes on a long recording --
+    // throttle those the same way HEARTBEAT already is, or they'd flood
+    // the on-disk log.
+    const isHighFrequency = l.startsWith('PROGRESS:transcribe:') || l.includes(':embedding:');
+    if (isHighFrequency) {
+      const now = Date.now();
+      if (now - (lastProgressLoggedAt.get(source) || 0) < 10_000) return;
+      lastProgressLoggedAt.set(source, now);
+    }
     processingLog.logLine(source, l);
     return;
   }
@@ -7261,7 +7776,6 @@ ipcMain.handle('setup-ollama-and-model', async () => {
         }
       });
       ollamaProcess.unref();
-      ollamaStartedByUs = true;
     }
 
     // Wait for Ollama to be ready (poll with early exit detection).
@@ -7288,7 +7802,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
           sendDebugLog(`Ollama ready after ${i + 1} seconds`);
           break;
         }
-      } catch (e) {
+      } catch {
         // Continue polling
       }
     }
@@ -7459,7 +7973,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
             let json;
             try {
               json = JSON.parse(line);
-            } catch (e) {
+            } catch {
               // Non-JSON line, log as-is
               sendDebugLog(line);
               continue;
@@ -7492,7 +8006,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
             sendDebugLog('AI model download completed successfully');
             try {
               await runPythonScript('simple_recorder.py', ['set-model', DEFAULT_AI_MODEL], true);
-            } catch (e) {
+            } catch {
               // Non-fatal -- config reset is best-effort
             }
             trackEvent('setup_completed', { step: 'ollama_and_model' });
@@ -7526,28 +8040,29 @@ ipcMain.handle('setup-ollama-and-model', async () => {
 
 ipcMain.handle('setup-parakeet', async () => {
   try {
-    // Download Parakeet TDT v3 (~572 MB) via the bundled backend. Used by
-    // the Setup wizard's step 2 for fresh installs. Emits coarse stage
-    // lines (PARAKEET_PULL_STAGE:downloading / :loading) rather than
-    // byte-level progress — see src/parakeet_models.py for why.
+    // Download Parakeet TDT v3 via the bundled backend. Used by
+    // the Setup wizard. Structured progress distinguishes cache download
+    // from model initialisation.
     const backendPath = getBackendPath();
-    sendDebugLog('Downloading Parakeet TDT v3 (~572 MB)...');
+    sendDebugLog('Downloading Parakeet TDT v3...');
     sendDebugLog(`$ ${backendPath} download-parakeet-model`);
 
     return new Promise((resolve) => {
       const proc = spawn(backendPath, ['download-parakeet-model'], { stdio: 'pipe' });
       let lastStdoutLine = '';
+      const stdoutReader = makeLineReader();
 
       proc.stdout.on('data', (data) => {
         const text = data.toString();
-        for (const line of text.split('\n')) {
+        for (const line of stdoutReader.feed(text)) {
           const trimmed = line.trim();
           if (!trimmed) continue;
           sendDebugLog(trimmed);
-          if (trimmed.startsWith('PARAKEET_PULL_STAGE:')) {
-            const stage = trimmed.slice('PARAKEET_PULL_STAGE:'.length);
+          if (trimmed.startsWith('PARAKEET_PULL_PROGRESS:')) {
+            let progress;
+            try { progress = JSON.parse(trimmed.slice('PARAKEET_PULL_PROGRESS:'.length)); } catch (_) { continue; }
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('parakeet-pull-progress', { stage });
+              mainWindow.webContents.send('parakeet-pull-progress', progress);
             }
           } else {
             lastStdoutLine = trimmed;
@@ -7563,7 +8078,7 @@ ipcMain.handle('setup-parakeet', async () => {
       proc.on('close', (code) => {
         let parsed = null;
         try { parsed = JSON.parse(lastStdoutLine); } catch (_) { /* not JSON */ }
-        const ok = code === 0 && (!parsed || parsed.success !== false);
+        const ok = code === 0 && parsed?.success === true;
         if (ok) {
           sendDebugLog('Parakeet model ready');
           resolve({ success: true, message: 'Parakeet model ready' });
@@ -7660,6 +8175,21 @@ registerFoldersIpc({
   getUserDataDir,
   validateMeetingFilePath,
   setCachedCustomStoragePath: (v) => { _cachedCustomStoragePath = v; },
+  // A folder add/remove rewrites the note's `folders:` frontmatter but fires no
+  // processing-complete — mirror it so the vault subfolder tracks (#413).
+  onNoteFoldersChanged: (summaryPath) => {
+    try { obsidianSync.syncNoteBySummaryPath(summaryPath); } catch (_) {}
+  },
+});
+
+// Obsidian vault sync IPC (#413): config toggle + vault picker + conflicts read.
+registerObsidianIpc({
+  ipcMain,
+  runPythonScript,
+  dialog,
+  getMainWindow: () => mainWindow,
+  obsidianSync,
+  sendDebugLog,
 });
 
 ipcMain.handle('get-ai-prompts', async () => {
@@ -7690,56 +8220,6 @@ ipcMain.handle('get-ai-prompts', async () => {
   }
 });
 
-// Helper function to ensure Ollama service is running
-async function ensureOllamaRunning() {
-  try {
-    // Check if Ollama service is responding
-    const http = require('http');
-    const response = await new Promise((resolve) => {
-      const req = http.get('http://127.0.0.1:11434/api/version', { timeout: 3000 }, (res) => {
-        resolve(res.statusCode === 200);
-      });
-      req.on('error', () => resolve(false));
-      req.on('timeout', () => { req.destroy(); resolve(false); });
-    });
-
-    if (response) {
-      return true; // Service is running
-    }
-
-    // Service not running, try to start it.
-    // The macOS-14 gate only applies to mac (os.release() is the NT build on
-    // Windows, which would always trigger the < 23 check).
-    if (process.platform === 'darwin') {
-      const macRelease = os.release();
-      if (parseInt(macRelease.split('.')[0], 10) < 23) {
-        sendDebugLog('macOS version too old for bundled Ollama — requires macOS 14 (Sonoma) or later');
-        return false;
-      }
-    }
-
-    const ollamaPath = await findOllamaExecutable();
-    if (!ollamaPath) {
-      return false;
-    }
-
-    // Start Ollama service in background with proper env vars for dylibs
-    ollamaProcess = spawn(ollamaPath, ['serve'], { detached: true, stdio: 'ignore', env: getOllamaEnv() });
-    ollamaPid = ollamaProcess.pid;
-    try { require('fs').writeFileSync(path.join(getBackendCwd(), '_internal', 'ollama.pid'), String(ollamaPid)); } catch (_) {}
-    ollamaProcess.on('exit', () => { ollamaPid = null; });
-    ollamaProcess.unref();
-    ollamaStartedByUs = true;
-
-    // Wait for service to start
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    return true;
-  } catch (error) {
-    console.error('Error ensuring Ollama is running:', error);
-    return false;
-  }
-}
-
 // Check if Ollama is installed (for setup wizard)
 ipcMain.handle('check-ollama-installed', async () => {
   try {
@@ -7763,7 +8243,7 @@ ipcMain.handle('check-model-installed', async (event, modelName) => {
       try {
         const data = JSON.parse(lines[i]);
         return { success: true, installed: data.installed };
-      } catch (e) {
+      } catch {
         continue;
       }
     }
@@ -7925,6 +8405,53 @@ ipcMain.handle('set-transcription-engine', async (event, engine) => {
   } catch (e) { return { success: false, error: e.message }; }
 });
 
+// OpenAI-compatible ASR: the NON-SECRET config (url/model) shells to the CLI
+// like set-cloud-api-url does. api_key_set is always overridden with the
+// safeStorage truth (hasOpenAiAsrKey) - the CLI only sees the env-var key,
+// which isn't injected on these calls, so its own api_key_set is unreliable.
+ipcMain.handle('get-openai-asr-config', async () => {
+  try {
+    await migrateLegacyOpenAiAsrApiKey();
+    const result = await runPythonScript('simple_recorder.py', ['get-openai-asr-config'], true);
+    const jsonData = JSON.parse(result.trim());
+    jsonData.api_key_set = hasOpenAiAsrKey();
+    return jsonData;
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+registerOpenAiAsrIpc({
+  ipcMain,
+  runPythonScript,
+  migrateLegacyOpenAiAsrApiKey,
+  hasOpenAiAsrKey,
+});
+
+// The SECRET key: stored encrypted via safeStorage (never argv, never
+// config.json), mirroring set-cloud-api-key. Passing an empty string clears it
+// (deletes the file).
+ipcMain.handle('set-openai-asr-key', async (_event, key) => {
+  try {
+    if (typeof key !== 'string') {
+      return { success: false, error: 'OpenAI ASR API key must be a string' };
+    }
+    if (!key) {
+      markOpenAiAsrKeyCleared();
+      // The durable marker already makes every encrypted/legacy copy
+      // ineffective. Retry plaintext removal now, while retaining the marker
+      // if the locked config write is temporarily unavailable.
+      await migrateLegacyOpenAiAsrApiKey();
+      return { success: true, api_key_set: false };
+    }
+    const origin = getOpenAiAsrEndpointOrigin();
+    if (!origin) throw new Error('OpenAI ASR endpoint is invalid');
+    const saved = saveOpenAiAsrKey(key, origin);
+    return {
+      success: saved,
+      api_key_set: saved && Boolean(loadOpenAiAsrKey(origin)),
+    };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
 ipcMain.handle('list-parakeet-models', async () => {
   try {
     const result = await runPythonScript('simple_recorder.py', ['list-parakeet-models'], true);
@@ -8074,8 +8601,7 @@ ipcMain.handle('pull-whisper-model', async (event, modelName) => {
 ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
   // Mirrors pull-whisper-model: settle-gate + SIGTERM-then-SIGKILL escalation
   // so a stalled HF download can never leave the renderer spinner hanging.
-  // Progress is coarse — we relay PARAKEET_PULL_STAGE:<stage> lines from the
-  // Python child rather than byte counts. See src/parakeet_models.py for why.
+  // Relay structured progress from the Python downloader.
   try {
     sendDebugLog(`Pulling Parakeet model: ${modelId || '<default>'}`);
     return new Promise((resolve) => {
@@ -8083,6 +8609,7 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
       if (modelId) args.push(modelId);
       const proc = spawn(getBackendPath(), args, { cwd: getBackendCwd() });
       let lastStdoutLine = '';
+      const stdoutReader = makeLineReader();
       let timedOut = false;
       let settled = false;
       let sigkillTimer = null;
@@ -8116,14 +8643,15 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
       }, 30 * 60 * 1000);
       proc.stdout.on('data', (data) => {
         const text = data.toString();
-        for (const line of text.split('\n')) {
+        for (const line of stdoutReader.feed(text)) {
           const trimmed = line.trim();
           if (!trimmed) continue;
           sendDebugLog(trimmed);
-          if (trimmed.startsWith('PARAKEET_PULL_STAGE:')) {
-            const stage = trimmed.slice('PARAKEET_PULL_STAGE:'.length);
+          if (trimmed.startsWith('PARAKEET_PULL_PROGRESS:')) {
+            let progress;
+            try { progress = JSON.parse(trimmed.slice('PARAKEET_PULL_PROGRESS:'.length)); } catch (_) { continue; }
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('parakeet-pull-progress', { model: modelId, stage });
+              mainWindow.webContents.send('parakeet-pull-progress', { ...progress, model: modelId });
             }
           } else {
             lastStdoutLine = trimmed;
@@ -8137,7 +8665,7 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
       proc.on('close', (code) => {
         let pullResult = null;
         try { pullResult = JSON.parse(lastStdoutLine); } catch (_) { /* not JSON */ }
-        const succeeded = !timedOut && code === 0 && (!pullResult || pullResult.success !== false);
+        const succeeded = !timedOut && code === 0 && pullResult?.success === true;
         if (succeeded) {
           finishOnce(
             { success: true, model: modelId },
@@ -8173,6 +8701,8 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
 // handlers coupled to another domain (telemetry, models, mic-monitor, calendar,
 // tray) deliberately stay in main.js until that domain's own extraction.
 registerSettingsIpc({ ipcMain, runPythonScript, sendDebugLog });
+registerPersonSampleIpc({ ipcMain, runPythonScript });
+registerSpeakerIpc({ ipcMain, runPythonScript, parsePythonFailureJson });
 
 // Fired by the renderer's silence detector. The renderer has already
 // asked main to stop the recording via pause/stop; this just surfaces
@@ -8202,8 +8732,7 @@ ipcMain.handle('show-silence-auto-stop-notification', async (_event, payload) =>
     });
     notif.on('click', () => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        if (!mainWindow.isVisible()) mainWindow.show();
-        mainWindow.focus();
+        exposeMainWindow();
       }
     });
     trackNotificationLifecycle(notif, 'silence_auto_stop');
@@ -8216,22 +8745,25 @@ ipcMain.handle('show-silence-auto-stop-notification', async (_event, payload) =>
 });
 
 // Fired by useSystemAudioCapture.ts when an enabled loopback acquisition
-// genuinely fails (for example, System Audio Recording permission is denied).
-// It is not fired when the user turns system audio off or the OS is unsupported.
-// Clicking it opens Settings via the same tray-open-settings event the tray
-// menu uses.
+// genuinely fails (for example, System Audio Recording permission is denied),
+// or when a live Linux capture dies mid-recording. It is not fired when the
+// user turns system audio off or the OS is unsupported. Clicking it opens
+// Settings via the same tray-open-settings event the tray menu uses.
 ipcMain.handle('show-system-audio-mic-only-notification', async () => {
   try {
     if (!(await notificationsEnabled())) return { success: true, shown: false };
     const notif = new Notification({
       title: 'Recording mic-only',
-      body: 'System audio could not be captured. Check Steno’s Screen & System Audio Recording access in System Settings.',
+      // The permissions hint is macOS-only; elsewhere there is no such setting
+      // to send the user to.
+      body: process.platform === 'darwin'
+        ? 'System audio could not be captured. Check Steno’s Screen & System Audio Recording access in System Settings.'
+        : 'System audio could not be captured. Continuing with the microphone only.',
       iconType: 'alert',
     });
     notif.on('click', () => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        if (!mainWindow.isVisible()) mainWindow.show();
-        mainWindow.focus();
+        exposeMainWindow();
         mainWindow.webContents.send('tray-open-settings');
       }
     });
@@ -8252,44 +8784,26 @@ ipcMain.handle('show-system-audio-mic-only-notification', async () => {
 // navigate-to-meeting event — and only falls back to focus-only when
 // `summaryFile` is absent (the hardFailure case: nothing was ever written,
 // so there's nothing to open).
+async function showNoteReadyNotification(payload) {
+  // `shown` = passed the notifications_enabled gate (see show-silence-auto-stop).
+  if (!(await notificationsEnabled())) return { success: true, shown: false };
+  const { summaryFile } = payload || {};
+  const { title, body, iconType, outcome } = buildNoteReadyNotificationOptions(payload);
+  const notif = new Notification({ title, body, iconType });
+  notif.on('click', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      exposeMainWindow();
+      if (summaryFile) mainWindow.webContents.send('navigate-to-meeting', { summaryFile });
+    }
+  });
+  trackNotificationLifecycle(notif, 'note_ready', { outcome });
+  notif.show();
+  return { success: true, shown: true };
+}
+
 ipcMain.handle('show-note-ready-notification', async (_event, payload) => {
   try {
-    // `shown` = passed the notifications_enabled gate (see show-silence-auto-stop).
-    if (!(await notificationsEnabled())) return { success: true, shown: false };
-    const { title, failed, hardFailure, summaryFile } = payload || {};
-    // Three honest states:
-    //  - hardFailure: processing crashed (or an import never enqueued) so no
-    //    note was written — there's nothing to "open". Keep the message
-    //    neutral: it's shared by recording crashes, import crashes and import
-    //    enqueue failures, and over-promising ("audio kept") is either hollow
-    //    (no UI surfaces the orphaned audio) or wrong (enqueue failure).
-    //  - failed: a graceful transcription failure DID write a marked note —
-    //    the recording was preserved and the note explains it on open.
-    //  - otherwise: the note is genuinely ready.
-    const notif = new Notification({
-      title: hardFailure
-        ? 'Processing failed'
-        : failed
-          ? 'Transcription failed'
-          : 'Note ready',
-      body: hardFailure
-        ? `Steno couldn't process ${title ? `"${title}"` : 'your note'}.`
-        : failed
-          ? 'Your recording was preserved — open the note for details.'
-          : (title || 'Your note has finished processing'),
-      iconType: (hardFailure || failed) ? 'alert' : 'success',
-    });
-    notif.on('click', () => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        if (!mainWindow.isVisible()) mainWindow.show();
-        mainWindow.focus();
-        if (summaryFile) mainWindow.webContents.send('navigate-to-meeting', { summaryFile });
-      }
-    });
-    const outcome = hardFailure ? 'hard_failure' : failed ? 'failed' : 'success';
-    trackNotificationLifecycle(notif, 'note_ready', { outcome });
-    notif.show();
-    return { success: true, shown: true };
+    return await showNoteReadyNotification(payload);
   } catch (e) {
     sendDebugLog(`Failed to show note-ready notification: ${e.message}`);
     return { success: false, error: e.message };
@@ -8300,43 +8814,44 @@ ipcMain.handle('show-note-ready-notification', async (_event, payload) => {
 // transcription but NO notes were generated (auto_summarize off → transcript-
 // only note). Unlike note-ready, this prompts the user to summarise, and is the
 // correctly-timed replacement for the old premature meeting-end "Summarise?"
-// prompt (#bug2/#bug3). Tapping "Summarise" kicks off generation in the
-// BACKGROUND — no focus-steal — because when it finishes the note-ready
-// notification (click → opens the note) is the moment we bring the user in, so
-// there's no need to pull the window forward now. A body tap opens the note to
-// read the transcript.
+// prompt (#bug2/#bug3). One-click, matching "Take Notes": tapping "Summarise" —
+// the button OR the notification body — brings the window forward, opens the
+// note, and starts generation there, so the user watches it stream in-place;
+// "Note ready" still fires on completion.
+async function showTranscriptReadyNotification(payload) {
+  // `shown` = passed the notifications_enabled gate (see show-note-ready).
+  if (!(await notificationsEnabled())) return { success: true, shown: false };
+  const { title, summaryFile, name } = payload || {};
+  const notif = new Notification({
+    title: 'Transcript ready',
+    body: buildTranscriptReadyBody(title),
+    actions: [{ type: 'button', text: 'Summarise' }],
+    iconType: 'success',
+  });
+  // The whole notification means "yes, summarise": a body tap AND the "Summarise"
+  // button both open the note and start generation there, so the user watches it
+  // stream in-place ("Note ready" still fires on completion). Wiring both to the
+  // same action is what makes it one-click (like "Take Notes") — a body tap that
+  // only navigated was the source of the two-click ("first click opens, second
+  // click summarises"). Bring the window forward, navigate to the note, THEN
+  // kick off generation.
+  const startSummarise = () => {
+    if (mainWindow && !mainWindow.isDestroyed() && summaryFile) {
+      exposeMainWindow();
+      mainWindow.webContents.send('navigate-to-meeting', { summaryFile });
+      mainWindow.webContents.send('generate-notes-requested', { summaryFile, name });
+    }
+  };
+  notif.on('action', () => startSummarise());
+  notif.on('click', () => startSummarise());
+  trackNotificationLifecycle(notif, 'transcript_ready');
+  notif.show();
+  return { success: true, shown: true };
+}
+
 ipcMain.handle('show-transcript-ready-notification', async (_event, payload) => {
   try {
-    // `shown` = passed the notifications_enabled gate (see show-note-ready).
-    if (!(await notificationsEnabled())) return { success: true, shown: false };
-    const { title, summaryFile, name } = payload || {};
-    const notif = new Notification({
-      title: 'Transcript ready',
-      body: title ? `Summarise "${title}"?` : 'Summarise?',
-      actions: [{ type: 'button', text: 'Summarise' }],
-      iconType: 'success',
-    });
-    // Background: kick off generation without pulling the window forward. The
-    // note-ready notification that fires on completion is where we bring the
-    // user in (its click opens the note).
-    const startSummarise = () => {
-      if (mainWindow && !mainWindow.isDestroyed() && summaryFile) {
-        mainWindow.webContents.send('generate-notes-requested', { summaryFile, name });
-      }
-    };
-    notif.on('action', () => startSummarise());
-    // Body tap just opens the note to read the transcript (no generation) — the
-    // in-note GenerateNotesBar is there if they change their mind.
-    notif.on('click', () => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        if (!mainWindow.isVisible()) mainWindow.show();
-        mainWindow.focus();
-        if (summaryFile) mainWindow.webContents.send('navigate-to-meeting', { summaryFile });
-      }
-    });
-    trackNotificationLifecycle(notif, 'transcript_ready');
-    notif.show();
-    return { success: true, shown: true };
+    return await showTranscriptReadyNotification(payload);
   } catch (e) {
     sendDebugLog(`Failed to show transcript-ready notification: ${e.message}`);
     return { success: false, error: e.message };
@@ -8749,6 +9264,151 @@ function hasCloudApiKey() {
   return fs.existsSync(getCloudKeyPath());
 }
 
+// --- OpenAI-compatible ASR (transcription) API key -------------------------
+// Mirrors the cloud summariser key exactly: encrypted-at-rest via safeStorage,
+// stored under getUserDataDir() (honours STENOAI_USER_DATA_DIR test isolation),
+// never written to config.json, and injected into the TRANSCRIPTION subprocess
+// env as STENOAI_OAI_API_KEY. This is the security-critical difference from the
+// upstream PR, which persisted the key in plaintext config.json.
+function getOpenAiAsrKeyPath() {
+  return path.join(getUserDataDir(), '.openai-asr-api-key');
+}
+
+// Credentials belong to a network origin, not a configurable URL path. URL's
+// origin canonicalises scheme, hostname, and the effective port (including
+// default-port elision), so equivalent endpoints compare equal while a host,
+// scheme, or port change cannot reuse the old bearer token.
+function getOpenAiAsrEndpointOrigin() {
+  return readOpenAiAsrEndpointSnapshot({
+    fs,
+    configPath: path.join(getUserDataDir(), 'config.json'),
+  })?.origin || null;
+}
+
+function isOpenAiAsrKeyCleared() {
+  return isEncryptedKeyCleared({ fs, keyPath: getOpenAiAsrKeyPath() });
+}
+
+function markOpenAiAsrKeyCleared() {
+  return markEncryptedKeyClearedAtomically({
+    fs,
+    path,
+    processId: process.pid,
+    now: Date.now(),
+    keyPath: getOpenAiAsrKeyPath(),
+  });
+}
+
+function saveOpenAiAsrKey(key, origin) {
+  try {
+    if (!origin) throw new Error('OpenAI ASR endpoint is invalid');
+    return saveEncryptedKeyAtomically({
+      fs,
+      path,
+      processId: process.pid,
+      now: Date.now(),
+      keyPath: getOpenAiAsrKeyPath(),
+      key,
+      origin,
+      safeStorage: getSafeStorage(),
+    });
+  } catch (error) {
+    console.error(error.message);
+    throw error;
+  }
+}
+
+function loadOpenAiAsrCredential(origin) {
+  try {
+    if (isOpenAiAsrKeyCleared()) return null;
+    if (!origin) return null;
+    const keyPath = getOpenAiAsrKeyPath();
+    migrateLegacyCredentialFile(keyPath, '.openai-asr-api-key');
+    const key = loadEncryptedKeyForOrigin({ fs, keyPath, origin, safeStorage: getSafeStorage() });
+    return key ? { key, origin } : null;
+  } catch (error) {
+    console.error('Failed to load OpenAI ASR API key:', error.message);
+    return null;
+  }
+}
+
+function loadOpenAiAsrKey(origin) {
+  return loadOpenAiAsrCredential(origin)?.key || null;
+}
+
+function hasOpenAiAsrKey() {
+  const origin = getOpenAiAsrEndpointOrigin();
+  return Boolean(origin && loadOpenAiAsrKey(origin));
+}
+
+function readLegacyOpenAiAsrCredential() {
+  const snapshot = readOpenAiAsrConfigSnapshot({
+    fs,
+    configPath: path.join(getUserDataDir(), 'config.json'),
+  });
+  return snapshot === null ? OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE : snapshot.legacy;
+}
+
+function secureLegacyOpenAiAsrApiKey(legacy = readLegacyOpenAiAsrCredential()) {
+  if (legacy === OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE) return false;
+  if (!legacy || !legacy.key || !legacy.origin) return false;
+  const stored = loadOpenAiAsrKey(legacy.origin);
+  const action = legacyKeyMigrationAction({
+    cleared: isOpenAiAsrKeyCleared(),
+    legacyKey: legacy.key,
+    storedKey: stored,
+  });
+  if (action !== 'secure') return action === 'remove-legacy' && Boolean(stored);
+  try {
+    // Do not remove config.json's value unless encrypt + decrypt both work.
+    return saveOpenAiAsrKey(legacy.key, legacy.origin)
+      && Boolean(loadOpenAiAsrKey(legacy.origin));
+  } catch (_) {
+    return false;
+  }
+}
+
+async function migrateLegacyOpenAiAsrApiKey(legacy = readLegacyOpenAiAsrCredential()) {
+  if (legacy === OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE) return false;
+  if (!legacy) return true;
+  const removeLegacyKey = async () => {
+    try {
+      const raw = await runPythonScript(
+        'simple_recorder.py', ['remove-legacy-openai-asr-api-key'], true,
+        { STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST: legacy.snapshotDigest },
+      );
+      return JSON.parse(raw.trim()).success === true;
+    } catch (_) {
+      // A clear marker remains authoritative, or the encrypted copy is safe;
+      // either way the plaintext can be removed on a future retry.
+      return false;
+    }
+  };
+  // Invalid raw legacy values must never become encrypted credentials. They
+  // still have a raw-digest CAS snapshot, so remove only that exact stale
+  // plaintext instead of leaving it in config.json indefinitely.
+  if (!legacy.key || !legacy.origin) return removeLegacyKey();
+
+  let stored = loadOpenAiAsrKey(legacy.origin);
+  const action = legacyKeyMigrationAction({
+    cleared: isOpenAiAsrKeyCleared(),
+    legacyKey: legacy.key,
+    storedKey: stored,
+  });
+  if (action === 'none') return false;
+  if (action === 'remove-legacy') return removeLegacyKey();
+  if (action === 'secure') {
+    try {
+      if (!saveOpenAiAsrKey(legacy.key, legacy.origin)) return false;
+      stored = loadOpenAiAsrKey(legacy.origin);
+      if (stored !== legacy.key) return false;
+    } catch (_) {
+      return false;
+    }
+  }
+  return removeLegacyKey();
+}
+
 // Build the env additions a Python AI-driven subprocess needs. Merges
 // the encrypted-on-disk cloud key (decrypted only here, never written
 // to the env if absent) AND the org adapter URL+JWT when a session
@@ -8763,6 +9423,43 @@ function getAiEnv() {
   if (session && session.adapterUrl && session.token && !isJwtExpired(session.token)) {
     env.STENOAI_ADAPTER_URL = session.adapterUrl;
     env.STENOAI_ADAPTER_TOKEN = session.token;
+  }
+  return env;
+}
+
+function getBackendEnv(extra = {}) {
+  return { ...withoutOpenAiAsrKey(require('process').env), ...extra };
+}
+
+// Env additions a transcription subprocess needs. Only when openai-asr is the
+// configured engine, decrypt its key from safeStorage and surface its
+// endpoint-bound credential snapshot to Python atomically.
+function getTranscriptionEnv() {
+  const env = {};
+  if (loadTranscriptionEngine() !== 'openai-asr') return env;
+  // A legacy plaintext key must be secured before this first cloud job. The
+  // deletion itself is async (via the locked Python config writer), but this
+  // sync path can safely use the encrypted copy immediately.
+  const configSnapshot = readOpenAiAsrConfigSnapshot({
+    fs,
+    configPath: path.join(getUserDataDir(), 'config.json'),
+  });
+  // Endpoint, origin, and any legacy credential come from one direct config
+  // read. Do not let the asynchronous cleanup read a replacement endpoint.
+  const legacy = configSnapshot === null
+    ? OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE
+    : configSnapshot.legacy;
+  secureLegacyOpenAiAsrApiKey(legacy);
+  void migrateLegacyOpenAiAsrApiKey(legacy);
+  const endpoint = configSnapshot?.endpoint || null;
+  const credential = endpoint ? loadOpenAiAsrCredential(endpoint.origin) : null;
+  if (credential) {
+    env.STENOAI_OAI_API_KEY = credential.key;
+    env.STENOAI_OAI_API_ORIGIN = credential.origin;
+    // This WHATWG-canonical ASCII URL and the origin above come from one
+    // config snapshot. Python validates it again without re-reading a mutable
+    // endpoint while the bearer credential is in scope.
+    env.STENOAI_OAI_API_URL = endpoint.apiUrl;
   }
   return env;
 }
@@ -9371,6 +10068,66 @@ ipcMain.handle('close-system-audio-file', async () => {
   }
 });
 
+// Linux system-audio loopback — spawns pw-record and streams raw PCM to the
+// renderer instead of going through Chromium's capture path (see
+// ./linux-loopback.js for why). Module-level, like activeSysAudioWriteStream.
+let activeLinuxLoopback = null;
+
+// Serialises start/stop — see createSerialQueue in ./linux-loopback.js for why.
+const queueLinuxLoopback = createSerialQueue();
+
+ipcMain.handle('start-linux-loopback', () => queueLinuxLoopback(async () => {
+  try {
+    // Reclaim an unstopped prior capture, same as open-system-audio-file above
+    // — and not a rare race: a renderer reload remounts useSystemAudioCapture
+    // with a fresh activeRef, which restarts capture off main's still-
+    // 'recording' status. Leaving the old process running would feed the
+    // renderer's new subscription both streams interleaved, and stop-linux-
+    // loopback only knows the newer one.
+    if (activeLinuxLoopback) {
+      const prior = activeLinuxLoopback;
+      activeLinuxLoopback = null;
+      sendDebugLog('[linux-loopback] abandoning unstopped prior capture');
+      prior.stdout.removeAllListeners('data');
+      await prior.stop();
+    }
+    const capture = await startLoopbackCapture({
+      onError: (err) => sendDebugLog(`[linux-loopback] capture error: ${err.message}`),
+    });
+    const align = createFrameAligner(2 * capture.channels); // s16 = 2 bytes/sample
+    capture.stdout.on('data', (chunk) => {
+      const whole = align(chunk);
+      if (whole) mainWindow?.webContents.send('linux-loopback-chunk', whole);
+    });
+    capture.proc.on('exit', (code, signal) => {
+      // stop() clears the ref before killing, so reaching here still-referenced
+      // means pw-record died on its own. Tell the renderer — otherwise the
+      // recording continues with a dead system channel and no warning.
+      if (activeLinuxLoopback?.proc === capture.proc) {
+        sendDebugLog(`[linux-loopback] pw-record exited unexpectedly (code=${code}, signal=${signal})`);
+        activeLinuxLoopback = null;
+        mainWindow?.webContents.send('linux-loopback-ended', { code, signal });
+      }
+    });
+    activeLinuxLoopback = capture;
+    sendDebugLog(`[linux-loopback] capturing from ${capture.target}`);
+    return { success: true, sampleRate: capture.sampleRate, channels: capture.channels };
+  } catch (error) {
+    sendDebugLog(`[linux-loopback] start failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}));
+
+ipcMain.handle('stop-linux-loopback', () => queueLinuxLoopback(async () => {
+  const capture = activeLinuxLoopback;
+  activeLinuxLoopback = null;
+  if (!capture) return { success: true };
+  capture.stdout.removeAllListeners('data');
+  await capture.stop();
+  sendDebugLog('[linux-loopback] stopped');
+  return { success: true };
+}));
+
 // A failed renderer-side capture (mic permission denied, no audio device)
 // would otherwise be silent — the optimistic "recording" pill is dropped via
 // system-audio-recording-state, but the user gets no reason. Surface a native
@@ -9381,7 +10138,7 @@ function showRecordingFailedNotification(body) {
   try {
     if (!Notification.isSupported()) return;
     new Notification({
-      title: 'Steno',
+      title: 'StenoAI',
       body: body || "Recording couldn't start.",
       iconType: 'alert',
     }).show();
@@ -9390,11 +10147,13 @@ function showRecordingFailedNotification(body) {
   }
 }
 
-ipcMain.on('recording-capture-error', (_event, message) => {
-  sendDebugLog(`[sysaudio] capture error: ${message}`);
-  showRecordingFailedNotification(
-    message ? `Recording couldn't start: ${message}` : "Recording couldn't start.",
-  );
+ipcMain.on('recording-capture-error', (_event, message, name, phase) => {
+  // The raw text stays in the debug log, where it is what a diagnosis needs —
+  // and ONLY there. What reaches the notification is prose built from the
+  // error's name and the caller's phase; see buildCaptureErrorBody for why the
+  // message itself is never consulted.
+  sendDebugLog(`[sysaudio] capture error (${phase || 'start'}): ${name ? `${name}: ` : ''}${message}`);
+  showRecordingFailedNotification(buildCaptureErrorBody({ name, phase }));
 });
 
 ipcMain.handle('process-system-audio-recording', async (event, audioFilePath, sessionName) => {
@@ -9712,7 +10471,7 @@ function getOllamaEnv() {
   } else {
     ollamaDir = path.join(__dirname, '..', 'bin');
   }
-  const env = { ...process.env };
+  const env = getBackendEnv();
   if (process.platform === 'darwin') {
     const existing = env.DYLD_LIBRARY_PATH || '';
     env.DYLD_LIBRARY_PATH = existing ? `${ollamaDir}:${existing}` : ollamaDir;
@@ -9777,7 +10536,7 @@ async function checkForUpdates() {
       let url;
       try {
         url = new URL(urlStr);
-      } catch (e) {
+      } catch {
         resolve({ success: false, error: 'Invalid update URL' });
         return;
       }
@@ -9803,7 +10562,7 @@ async function checkForUpdates() {
           let next;
           try {
             next = new URL(res.headers.location, urlStr).toString();
-          } catch (e) {
+          } catch {
             resolve({ success: false, error: 'Invalid redirect URL' });
             return;
           }
@@ -10209,8 +10968,7 @@ function startGoogleAuth() {
         // Notify renderer and bring app to foreground
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('google-auth-changed');
-          mainWindow.show();
-          mainWindow.focus();
+          exposeMainWindow();
         }
 
         resolve({ success: true });
@@ -10310,7 +11068,7 @@ function exchangeCodeForTokens(code, codeVerifier, port) {
           // Store expiry as absolute timestamp
           parsed.expires_at = Date.now() + (parsed.expires_in * 1000);
           resolve(parsed);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse token response'));
         }
       });
@@ -10397,7 +11155,7 @@ function refreshAccessToken(refreshToken) {
             return;
           }
           resolve(parsed);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse refresh response'));
         }
       });
@@ -10437,7 +11195,7 @@ async function fetchGoogleCalendarList(accessToken, signal) {
             return;
           }
           resolve(parsed.items || []);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse calendar list response'));
         }
       });
@@ -10448,7 +11206,7 @@ async function fetchGoogleCalendarList(accessToken, signal) {
 }
 
 function fetchGoogleEventsForCalendar(accessToken, calendarId, params, signal) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const options = {
       hostname: 'www.googleapis.com',
       path: `/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${params.toString()}`,
@@ -10491,38 +11249,34 @@ async function fetchCalendarEvents(accessToken, maxResults = 50, signal) {
     fields: 'items(id,status,summary,description,start,end,attendees,htmlLink,conferenceData,colorId)'
   });
 
-  try {
-    const calendars = await fetchGoogleCalendarList(accessToken, signal);
-    const selectedCalendars = calendars.filter(c => c.selected);
-    if (selectedCalendars.length === 0) return [];
+  const calendars = await fetchGoogleCalendarList(accessToken, signal);
+  const selectedCalendars = calendars.filter(c => c.selected);
+  if (selectedCalendars.length === 0) return [];
 
-    const results = [];
-    const concurrency = 3;
-    for (let i = 0; i < selectedCalendars.length; i += concurrency) {
-      const chunk = selectedCalendars.slice(i, i + concurrency);
-      const chunkPromises = chunk.map(async (cal) => {
-        const items = await fetchGoogleEventsForCalendar(accessToken, cal.id, params, signal);
-        items.forEach(item => { 
-          item.calendarBackgroundColor = cal.backgroundColor; 
-          item._sourceCalendarId = cal.id;
-        });
-        return items;
+  const results = [];
+  const concurrency = 3;
+  for (let i = 0; i < selectedCalendars.length; i += concurrency) {
+    const chunk = selectedCalendars.slice(i, i + concurrency);
+    const chunkPromises = chunk.map(async (cal) => {
+      const items = await fetchGoogleEventsForCalendar(accessToken, cal.id, params, signal);
+      items.forEach(item => {
+        item.calendarBackgroundColor = cal.backgroundColor;
+        item._sourceCalendarId = cal.id;
       });
-      const chunkResults = await Promise.all(chunkPromises);
-      results.push(...chunkResults);
-    }
-    let allEvents = results.flat();
-    
-    allEvents.sort((a, b) => {
-      const startA = new Date(a.start?.dateTime || a.start?.date || 0);
-      const startB = new Date(b.start?.dateTime || b.start?.date || 0);
-      return startA.getTime() - startB.getTime();
+      return items;
     });
-
-    return allEvents.slice(0, maxResults);
-  } catch (err) {
-    throw err;
+    const chunkResults = await Promise.all(chunkPromises);
+    results.push(...chunkResults);
   }
+  const allEvents = results.flat();
+
+  allEvents.sort((a, b) => {
+    const startA = new Date(a.start?.dateTime || a.start?.date || 0);
+    const startB = new Date(b.start?.dateTime || b.start?.date || 0);
+    return startA.getTime() - startB.getTime();
+  });
+
+  return allEvents.slice(0, maxResults);
 }
 
 // ── Outlook Calendar: OAuth2 Flow with PKCE ─────────────────────────────
@@ -10624,8 +11378,7 @@ function startOutlookAuth() {
 
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('outlook-auth-changed');
-          mainWindow.show();
-          mainWindow.focus();
+          exposeMainWindow();
         }
 
         resolve({ success: true });
@@ -10717,7 +11470,7 @@ function exchangeOutlookCodeForTokens(code, codeVerifier, port) {
           }
           parsed.expires_at = Date.now() + (parsed.expires_in * 1000);
           resolve(parsed);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse token response'));
         }
       });
@@ -10809,7 +11562,7 @@ function refreshOutlookAccessToken(refreshToken) {
             return;
           }
           resolve(parsed);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse refresh response'));
         }
       });
@@ -10843,7 +11596,7 @@ async function fetchOutlookCalendarList(accessToken, signal) {
             return;
           }
           resolve(parsed.value || []);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse Outlook calendar list response'));
         }
       });
@@ -10854,7 +11607,7 @@ async function fetchOutlookCalendarList(accessToken, signal) {
 }
 
 function fetchOutlookEventsForCalendar(accessToken, calendarId, params, signal) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const options = {
       hostname: 'graph.microsoft.com',
       path: `/v1.0/me/calendars/${encodeURIComponent(calendarId)}/calendarView?${params.toString()}`,
@@ -10901,52 +11654,48 @@ async function fetchOutlookCalendarEvents(accessToken, maxResults = 50, signal) 
     $select: 'id,subject,body,start,end,attendees,webLink,onlineMeeting,isOnlineMeeting,isAllDay,isCancelled,responseStatus,categories'
   });
 
-  try {
-    const calendars = await fetchOutlookCalendarList(accessToken, signal);
-    if (calendars.length === 0) return [];
+  const calendars = await fetchOutlookCalendarList(accessToken, signal);
+  if (calendars.length === 0) return [];
 
-    const results = [];
-    const concurrency = 3;
-    for (let i = 0; i < calendars.length; i += concurrency) {
-      const chunk = calendars.slice(i, i + concurrency);
-      const chunkPromises = chunk.map(async (cal) => {
-        const items = await fetchOutlookEventsForCalendar(accessToken, cal.id, params, signal);
-        
-        let hexColor = undefined;
-        switch (cal.color) {
-          case 'lightBlue': hexColor = '#3B82F6'; break;
-          case 'lightGreen': hexColor = '#10B981'; break;
-          case 'lightOrange': hexColor = '#F97316'; break;
-          case 'lightGray': hexColor = '#6B7280'; break;
-          case 'lightYellow': hexColor = '#EAB308'; break;
-          case 'lightTeal': hexColor = '#14B8A6'; break;
-          case 'lightPink': hexColor = '#EC4899'; break;
-          case 'lightBrown': hexColor = '#92400E'; break;
-          case 'lightRed': hexColor = '#EF4444'; break;
-          default: hexColor = '#3B82F6';
-        }
-        
-        items.forEach(item => { 
-          item.calendarBackgroundColor = hexColor; 
-          item.id = `${cal.id}_${item.id}`;
-        });
-        return items;
+  const results = [];
+  const concurrency = 3;
+  for (let i = 0; i < calendars.length; i += concurrency) {
+    const chunk = calendars.slice(i, i + concurrency);
+    const chunkPromises = chunk.map(async (cal) => {
+      const items = await fetchOutlookEventsForCalendar(accessToken, cal.id, params, signal);
+
+      let hexColor;
+      switch (cal.color) {
+        case 'lightBlue': hexColor = '#3B82F6'; break;
+        case 'lightGreen': hexColor = '#10B981'; break;
+        case 'lightOrange': hexColor = '#F97316'; break;
+        case 'lightGray': hexColor = '#6B7280'; break;
+        case 'lightYellow': hexColor = '#EAB308'; break;
+        case 'lightTeal': hexColor = '#14B8A6'; break;
+        case 'lightPink': hexColor = '#EC4899'; break;
+        case 'lightBrown': hexColor = '#92400E'; break;
+        case 'lightRed': hexColor = '#EF4444'; break;
+        default: hexColor = '#3B82F6';
+      }
+
+      items.forEach(item => {
+        item.calendarBackgroundColor = hexColor;
+        item.id = `${cal.id}_${item.id}`;
       });
-      const chunkResults = await Promise.all(chunkPromises);
-      results.push(...chunkResults);
-    }
-    let allEvents = results.flat();
-    
-    allEvents.sort((a, b) => {
-      const startA = new Date(a.start?.dateTime || a.start?.date || 0);
-      const startB = new Date(b.start?.dateTime || b.start?.date || 0);
-      return startA.getTime() - startB.getTime();
+      return items;
     });
-
-    return allEvents.slice(0, maxResults);
-  } catch (err) {
-    throw err;
+    const chunkResults = await Promise.all(chunkPromises);
+    results.push(...chunkResults);
   }
+  const allEvents = results.flat();
+
+  allEvents.sort((a, b) => {
+    const startA = new Date(a.start?.dateTime || a.start?.date || 0);
+    const startB = new Date(b.start?.dateTime || b.start?.date || 0);
+    return startA.getTime() - startB.getTime();
+  });
+
+  return allEvents.slice(0, maxResults);
 }
 
 function normalizeOutlookEvent(event) {
@@ -11037,7 +11786,7 @@ ipcMain.handle('google-auth-status', async () => {
   try {
     const tokens = loadGoogleTokens();
     return { success: true, connected: !!tokens, email: tokens?.email ?? null };
-  } catch (error) {
+  } catch {
     return { success: false, connected: false };
   }
 });
@@ -11064,7 +11813,7 @@ ipcMain.handle('google-auth-disconnect', async () => {
           req.on('error', () => resolve()); // Best-effort
           req.end();
         });
-      } catch (e) {
+      } catch {
         // Best-effort revocation -- ignore errors
       }
     }
@@ -11663,7 +12412,7 @@ ipcMain.handle('outlook-auth-status', async () => {
   try {
     const tokens = loadOutlookTokens();
     return { success: true, connected: !!tokens, email: tokens?.email ?? null };
-  } catch (error) {
+  } catch {
     return { success: false, connected: false };
   }
 });
@@ -11785,7 +12534,7 @@ function clearOrgSession() {
     if (fs.existsSync(p)) fs.unlinkSync(p);
     orgSessionGeneration++;
     return true;
-  } catch (e) {
+  } catch {
     return false;
   }
 }

@@ -84,11 +84,43 @@ test('name / path / folder / URL setters redact their value arg(s)', () => {
   assert.strictEqual(sanitizeArgsForLog(['set-cloud-api-url', 'https://api.example.com/v1']), 'set-cloud-api-url <redacted>');
 });
 
+test('OpenAI ASR config argv logging redacts the entire value-bearing tail', () => {
+  assert.strictEqual(
+    sanitizeArgsForLog([
+      'set-openai-asr-config',
+      '--api-url',
+      'https://provider.example/v1?subscription-key=secret-value',
+      '--model',
+      'private-provider-model',
+    ]),
+    'set-openai-asr-config <redacted>',
+  );
+});
+
 test('set-microphone redacts the device id + user-assigned label', () => {
   assert.strictEqual(
-    sanitizeArgsForLog(['set-microphone', 'abc123deviceid', "Valentin's AirPods"]),
+    sanitizeArgsForLog(['set-microphone', 'abc123deviceid', 'Conference AirPods']),
     'set-microphone <redacted>',
   );
+});
+
+test('speaker commands redact meeting identifiers and person names', () => {
+  const cases = [
+    ['confirm-speaker', 'private-meeting', 'mic', 'SPEAKER_0', '--new-person', 'Alice'],
+    ['create-person-profile', 'Alice'],
+    ['rename-person-profile', 'person-id', 'Alice'],
+    ['delete-person-profile', 'person-id'],
+    ['get-speaker-sample-audio', 'private-meeting', 'mic', 'SPEAKER_0'],
+    ['mark-speaker-cluster', 'private-meeting', 'mic', 'SPEAKER_0', '--multiple'],
+    ['set-cluster-review-state', 'private-meeting', 'mic', 'SPEAKER_0', '--generic'],
+    ['speaker-naming-status', 'private-meeting'],
+    ['suggest-speakers', 'private-meeting'],
+    ['speaker-timestamps', 'private-meeting', 'mic', 'SPEAKER_0'],
+    ['get-person-sample-audio', 'person-id'],
+  ];
+  for (const args of cases) {
+    assert.strictEqual(sanitizeArgsForLog(args), `${args[0]} <redacted>`);
+  }
 });
 
 test('set-storage-path with no value (reset) echoes just the command', () => {
