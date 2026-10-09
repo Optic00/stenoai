@@ -403,9 +403,9 @@ Releases are automated via `.github/workflows/build-release.yml`. Never create r
    ```
    (If using `-m` instead of `-F`, pass `--cleanup=whitespace` anyway — the comment-stripping default applies to both.)
 9. The tag push triggers the workflow which:
-   - Builds signed + notarized DMGs for both arm64 and x64
+   - Builds the signed + notarized macOS arm64 DMG and ZIP; the release workflow is Apple-Silicon-only
    - Creates a GitHub Release with the tag message as the body
-   - Uploads both DMGs as release assets
+   - Uploads the DMG, ZIP, stable download alias, and `latest-mac.yml` update manifest as release assets
    - Posts a release announcement to Discord (summary + a few headline features + the contributor thank-you), via the `Announce release on Discord` step (`scripts/discord-release-announce.mjs`). This is automatic and requires no manual Discord post. It no-ops unless the `DISCORD_WEBHOOK_URL` repo secret is set (an incoming webhook for the announcements channel), and is `continue-on-error` so a Discord hiccup never fails the release.
 10. Do NOT build DMGs locally for releases, do NOT use `gh release create` manually. Do NOT post the Discord release announcement by hand — the workflow does it.
 
