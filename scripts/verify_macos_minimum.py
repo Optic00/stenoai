@@ -120,8 +120,15 @@ def find_violations(roots, limit, read_minimum=minimum_os, errors=None):
     checked = 0
     seen_files: set[str] = set()
     seen_dirs: set[str] = set()
+
+    def record_walk_error(exc: OSError) -> None:
+        # os.walk skips an unreadable directory silently; its binaries would
+        # then go unchecked, so the scan must count as failed.
+        if errors is not None:
+            errors.append((exc.filename or '?', f'cannot list directory: {exc.strerror or exc}'))
+
     for root in roots:
-        for dirpath, dirs, files in os.walk(root, followlinks=True):
+        for dirpath, dirs, files in os.walk(root, followlinks=True, onerror=record_walk_error):
             real_dir = os.path.realpath(dirpath)
             if real_dir in seen_dirs:
                 dirs[:] = []  # symlink cycle or a tree already walked

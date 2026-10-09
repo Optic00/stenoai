@@ -1,10 +1,14 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.verify_macos_minimum import (
+# chmod(0) only makes a path unreadable on POSIX and not for root.
+POSIX_PERMISSIONS = sys.platform != 'win32' and getattr(os, 'geteuid', lambda: 0)() != 0
+
+from scripts.verify_macos_minimum import (  # noqa: E402
     InspectionError,
     app_minimum,
     find_violations,
@@ -124,6 +128,7 @@ class FindViolationsTests(unittest.TestCase):
         self.assertEqual(checked, 1)
         self.assertEqual(len(violations), 1)
 
+    @unittest.skipUnless(POSIX_PERMISSIONS, 'needs POSIX permissions and a non-root user')
     def test_an_unreadable_file_is_reported_not_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:
             locked = Path(tmp) / 'locked.dylib'
@@ -139,6 +144,22 @@ class FindViolationsTests(unittest.TestCase):
 
         self.assertEqual((checked, violations), (0, []))
         self.assertEqual([path for path, _ in errors], [str(locked)])
+
+    @unittest.skipUnless(POSIX_PERMISSIONS, 'needs POSIX permissions and a non-root user')
+    def test_an_unreadable_directory_is_reported_not_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            locked = Path(tmp) / 'locked'
+            locked.mkdir()
+            (locked / 'libhidden.dylib').write_bytes(b'\xcf\xfa\xed\xfe' + b'\0' * 28)
+            locked.chmod(0)
+            try:
+                errors = []
+                find_violations([tmp], (14, 4), read_minimum=lambda _path: (14,), errors=errors)
+            finally:
+                locked.chmod(0o755)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn('cannot list directory', errors[0][1])
 
     def test_recognises_fat64_magic(self):
         with tempfile.TemporaryDirectory() as tmp:
