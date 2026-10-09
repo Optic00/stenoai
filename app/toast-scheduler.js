@@ -45,9 +45,10 @@ function createToastScheduler({ present, dismissWindow, onDropped = () => {}, ma
     onDropped(toast);
   }
 
-  function trimQueue() {
+  // `keep` is the toast that just arrived; it must not be the one evicted.
+  function trimQueue(keep = null) {
     while (queue.length > maxQueued) {
-      const oldest = queue.find((t) => !t.persistent);
+      const oldest = queue.find((t) => !t.persistent && t !== keep);
       if (!oldest) return;
       drop(oldest);
     }
@@ -86,7 +87,7 @@ function createToastScheduler({ present, dismissWindow, onDropped = () => {}, ma
     } else {
       queue.push(toast);
     }
-    trimQueue();
+    trimQueue(toast);
   }
 
   /**

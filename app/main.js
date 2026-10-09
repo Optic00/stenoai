@@ -492,11 +492,13 @@ class Notification extends EventEmitter {
     win._analyticsInteracted = false;
 
     let autoCloseTimer;
+    let readyTimer;
     // Registered immediately (not inside ready-to-show) so a toast closed
     // BEFORE it finishes loading still reaches the scheduler and clears the
     // module-level ref; the auto-close timer simply hasn't been armed yet.
     win.on('closed', () => {
       if (autoCloseTimer) clearTimeout(autoCloseTimer);
+      if (readyTimer) clearTimeout(readyTimer);
       if (notificationWindow === win) notificationWindow = null;
       // False when the window only closed to let another toast through; this
       // toast is queued again and has not been dismissed.
@@ -504,16 +506,20 @@ class Notification extends EventEmitter {
       if (closedForGood) this.emit('close');
     });
 
-    // A window that never loads never fires ready-to-show. Close it, or every
-    // later toast would wait behind it.
+    // A window that never loads, or whose renderer dies before first paint,
+    // never fires ready-to-show. Close it, or every later toast would wait
+    // behind it.
     const closeUnloaded = () => {
       if (!win.isDestroyed()) win.close();
     };
     win.webContents.once('did-fail-load', closeUnloaded);
+    win.webContents.once('render-process-gone', closeUnloaded);
+    readyTimer = setTimeout(closeUnloaded, 10000);
     const rendererDist = path.join(__dirname, 'renderer', 'dist', 'index.html');
     win.loadFile(rendererDist, { hash: '/notification' }).catch(closeUnloaded);
 
     win.once('ready-to-show', () => {
+      clearTimeout(readyTimer);
       win.showInactive();
       win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
       win.setAlwaysOnTop(true, 'screen-saver', 1);
@@ -7780,7 +7786,9 @@ function requestAutoRecord(appName, originatingEvt, calEvent) {
   const sessionName = calEvent?.title || 'Note';
   // A tap on a detection toast that is still on screen after a recording has
   // started must not re-point auto-stop at another app's meeting.
-  if (currentRecordingProcess || systemAudioRecordingActive) {
+  // currentRecordingSessionName also covers a brief capture flap, during which
+  // systemAudioRecordingActive reads false while the recording is still live.
+  if (currentRecordingProcess || systemAudioRecordingActive || currentRecordingSessionName) {
     sendDebugLog('[auto-detect] record request ignored: a recording is already running');
     exposeMainWindow();
     return;

@@ -133,6 +133,17 @@ test('the queue is bounded and drops the oldest non-persistent toast', () => {
   assert.deepStrictEqual(scheduler.queued.map((t) => t.name), ['two', 'three']);
 });
 
+test('a tagged replacement survives a full queue', () => {
+  const { scheduler, dropped, flushCloses } = harness({ maxQueued: 2 });
+  scheduler.show(toast('detected-zoom', { tag: 'meeting-detected' }));
+  scheduler.show(toast('one'));
+  scheduler.show(toast('two'));
+  scheduler.show(toast('detected-teams', { tag: 'meeting-detected' }));
+  assert.deepStrictEqual(dropped, ['one']);
+  flushCloses();
+  assert.strictEqual(scheduler.active.name, 'detected-teams');
+});
+
 test('the bound also holds while a persistent toast is making room', () => {
   const { scheduler, dropped, flushCloses } = harness({ maxQueued: 2 });
   scheduler.show(persistent('recording-paused'));
