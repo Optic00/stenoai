@@ -44,6 +44,8 @@ fi
 # Install project dependencies
 echo "Installing project dependencies..."
 pip install -r requirements.txt
+# Ship the macOS 14 MLX builds, as the release does (#531).
+PYTHON=python3 "$SCRIPT_DIR/install-mlx-macos14.sh"
 echo ""
 
 # Clean previous builds
