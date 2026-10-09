@@ -254,6 +254,11 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      # Same macOS 14 MLX wheels as the release build (#531), so this gate tests
+      # what ships.
+      - name: Install macOS 14 builds of MLX
+        run: PYTHON=python scripts/install-mlx-macos14.sh
+
       - name: Download bundled binaries (Ollama + ffmpeg)
         run: |
           chmod +x scripts/download-ollama.sh
@@ -279,6 +284,9 @@ jobs:
       # macos-latest arm64 runners resolve symbols fine without a Metal GPU.
       - name: Verify MLX bundle (libmlx ABI-collision guard)
         run: python scripts/verify_mlx_bundle.py
+
+      - name: Verify bundled binaries run on the minimum macOS
+        run: python scripts/verify_macos_minimum.py
 
       - name: Upload backend bundle
         uses: actions/upload-artifact@v4
