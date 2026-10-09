@@ -70,6 +70,12 @@ fi
 
 python3 -m PyInstaller stenoai.spec --noconfirm
 
+# Same guard as the release and e2e workflows (#531): no bundled binary may need
+# a newer macOS than the app's minimum.
+if [ "$(uname -s)" = "Darwin" ]; then
+    python3 "$SCRIPT_DIR/verify_macos_minimum.py"
+fi
+
 # Check if build succeeded
 if [ -d "dist/stenoai" ]; then
     echo ""

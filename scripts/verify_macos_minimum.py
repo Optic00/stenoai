@@ -17,6 +17,8 @@ darwin-only; on any other platform it exits 0. Exit code 1 lists every
 offending file.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess
@@ -40,7 +42,7 @@ class InspectionError(Exception):
 
 
 def parse_version(text: str) -> tuple[int, ...]:
-    """'14.4.0' -> (14, 4, 0); trailing zeros are kept but compare equal."""
+    """'14.4.0' -> (14, 4): trailing zeros are dropped so 14.4.0 equals 14.4."""
     parts = [int(p) for p in text.strip().split('.') if p != '']
     while len(parts) > 1 and parts[-1] == 0:
         parts.pop()
@@ -54,11 +56,16 @@ def app_minimum(package_json: str = _PACKAGE_JSON) -> tuple[int, ...]:
 
 
 def is_macho(path: str) -> bool:
+    """Whether path starts with a Mach-O magic.
+
+    Raises InspectionError if the file cannot be read: an unreadable binary must
+    fail the guard, not be skipped as "not Mach-O".
+    """
     try:
         with open(path, 'rb') as fh:
             return fh.read(4) in _MACHO_MAGICS
-    except OSError:
-        return False
+    except OSError as exc:
+        raise InspectionError(f'cannot read: {exc}') from exc
 
 
 def minimum_os_from_otool(output: str) -> tuple[int, ...] | None:
@@ -105,19 +112,32 @@ def minimum_os(path: str) -> tuple[int, ...] | None:
 def find_violations(roots, limit, read_minimum=minimum_os, errors=None):
     """(path, version) for every Mach-O under roots that needs more than limit.
 
-    Files otool cannot read are appended to `errors` as (path, message).
+    Symlinked files and directories are followed and each real file is checked
+    once, so a Mach-O shipped behind a link is not skipped. Files that cannot be
+    read or inspected are appended to `errors` as (path, message).
     """
     violations = []
     checked = 0
+    seen_files: set[str] = set()
+    seen_dirs: set[str] = set()
     for root in roots:
-        for dirpath, _dirs, files in os.walk(root):
+        for dirpath, dirs, files in os.walk(root, followlinks=True):
+            real_dir = os.path.realpath(dirpath)
+            if real_dir in seen_dirs:
+                dirs[:] = []  # symlink cycle or a tree already walked
+                continue
+            seen_dirs.add(real_dir)
             for name in files:
                 path = os.path.join(dirpath, name)
-                if os.path.islink(path) or not is_macho(path):
+                real = os.path.realpath(path)
+                if real in seen_files or not os.path.isfile(real):
                     continue
-                checked += 1
+                seen_files.add(real)
                 try:
-                    version = read_minimum(path)
+                    if not is_macho(real):
+                        continue
+                    checked += 1
+                    version = read_minimum(real)
                 except InspectionError as exc:
                     if errors is not None:
                         errors.append((path, str(exc)))

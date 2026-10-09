@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -57,7 +58,10 @@ class OtoolParsingTests(unittest.TestCase):
         self.assertEqual(minimum_os_from_otool(OTOOL_VERSION_MIN), (12,))
 
     def test_source_version_is_not_mistaken_for_a_minimum(self):
-        self.assertEqual(minimum_os_from_otool(OTOOL_BUILD_VERSION.replace('minos 15.0', 'minos 14.0')), (14,))
+        output = OTOOL_BUILD_VERSION.replace('minos 15.0', 'minos 14.0').replace(
+            'version 0.0', 'version 26.0'
+        )
+        self.assertEqual(minimum_os_from_otool(output), (14,))
 
     def test_fat_binary_uses_the_highest_slice(self):
         self.assertEqual(minimum_os_from_otool(OTOOL_VERSION_MIN + OTOOL_BUILD_VERSION), (15,))
@@ -77,7 +81,8 @@ class FindViolationsTests(unittest.TestCase):
             new.write_bytes(b'\xcf\xfa\xed\xfe' + b'\0' * 28)
             old.write_bytes(b'\xcf\xfa\xed\xfe' + b'\0' * 28)
             text.write_bytes(b'MTLB' + b'\0' * 28)
-            minimums = {str(new): (15, 0), str(old): (14,)}
+            # The guard reads the resolved path (/var is /private/var on macOS).
+            minimums = {os.path.realpath(new): (15, 0), os.path.realpath(old): (14,)}
 
             checked, violations = find_violations(
                 [str(root)], (14, 4), read_minimum=lambda path: minimums[path]
@@ -99,6 +104,41 @@ class FindViolationsTests(unittest.TestCase):
 
         self.assertEqual((checked, violations), (1, []))
         self.assertEqual(errors, [(str(broken), 'truncated or malformed object')])
+
+    def test_follows_symlinks_and_checks_each_file_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'bundle'
+            real_dir = Path(tmp) / 'outside'
+            real_dir.mkdir()
+            root.mkdir()
+            target = real_dir / 'libnew.dylib'
+            target.write_bytes(b'\xcf\xfa\xed\xfe' + b'\0' * 28)
+            (root / 'libnew.dylib').symlink_to(target)
+            (root / 'linked').symlink_to(real_dir, target_is_directory=True)
+            (root / 'loop').symlink_to(root, target_is_directory=True)
+
+            checked, violations = find_violations(
+                [str(root)], (14, 4), read_minimum=lambda _path: (15,)
+            )
+
+        self.assertEqual(checked, 1)
+        self.assertEqual(len(violations), 1)
+
+    def test_an_unreadable_file_is_reported_not_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            locked = Path(tmp) / 'locked.dylib'
+            locked.write_bytes(b'\xcf\xfa\xed\xfe' + b'\0' * 28)
+            locked.chmod(0)
+            try:
+                errors = []
+                checked, violations = find_violations(
+                    [tmp], (14, 4), read_minimum=lambda _path: (14,), errors=errors
+                )
+            finally:
+                locked.chmod(0o644)
+
+        self.assertEqual((checked, violations), (0, []))
+        self.assertEqual([path for path, _ in errors], [str(locked)])
 
     def test_recognises_fat64_magic(self):
         with tempfile.TemporaryDirectory() as tmp:
