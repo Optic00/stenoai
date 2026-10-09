@@ -90,7 +90,7 @@ import { buildNotesMarkdown } from '@/lib/notesMarkdown';
 import { buildNotesHtml, hasNotesContent } from '@/lib/notesPdf';
 import { unwrap } from '@/lib/result';
 import { cn } from '@/lib/utils';
-import { navigate } from '@/lib/router';
+import { navigate, setNavigationGuard } from '@/lib/router';
 import { stripReasoning } from '@/lib/markdown';
 import { asStringArray } from '@/lib/completionNotification';
 import { pendingTitleRegens, streamCache, type StreamPhase } from '@/lib/meetingDetailState';
@@ -369,10 +369,16 @@ function DetailContent({
   // it; they're registered once per meeting, so they read it through a ref
   // rather than re-subscribing on every keystroke's re-render.
   const [editing, setEditing] = React.useState(false);
-  // Lifted out of the editor so the paths that would unmount it can ask whether
-  // there is anything to lose before they do.
-  const [noteDirty, setNoteDirty] = React.useState(false);
-  const [confirmLeaveEdit, setConfirmLeaveEdit] = React.useState(false);
+  // Lifted out of the editor so the navigation guard can ask whether there is
+  // anything to lose. A ref, not state: the guard reads it at the moment of
+  // navigation, so a route change right after a keystroke is still caught.
+  const noteDirtyRef = React.useRef(false);
+  const handleNoteDirtyChange = React.useCallback((dirty: boolean) => {
+    noteDirtyRef.current = dirty;
+  }, []);
+  // Where the user tried to go while the editor held unsaved changes. Non-null
+  // opens the discard confirmation; confirming continues to this route.
+  const [pendingRoute, setPendingRoute] = React.useState<string | null>(null);
   const updateMeeting = useUpdateMeeting();
   const editingRef = React.useRef(editing);
   // Layout effect, not a render-time assignment: it still lands before the
@@ -936,7 +942,7 @@ function DetailContent({
   };
   const closeEditor = () => {
     setEditing(false);
-    setNoteDirty(false);
+    handleNoteDirtyChange(false);
   };
   // A rejected mutation (main refuses a forged heading, or the write fails)
   // propagates to the editor, which keeps edit mode and the typing.
@@ -944,16 +950,18 @@ function DetailContent({
     await updateMeeting.mutateAsync({ summaryFile, patch });
     closeEditor();
   };
-  // The in-view back button is the one exit from an open editor this view owns.
-  // The sidebar and the command palette still unmount it without asking; that
-  // needs a router-level unsaved-changes hook, tracked separately.
-  const leaveDetail = () => {
-    if (editing && noteDirty) {
-      setConfirmLeaveEdit(true);
-      return;
-    }
-    navigate('/');
-  };
+  // Every way out of this view (back button, sidebar, command palette, a deep
+  // link to another note) goes through navigate(), so while the editor holds
+  // unsaved changes one router guard stops all of them and asks first (#447).
+  React.useEffect(() => {
+    if (!editing) return undefined;
+    return setNavigationGuard((target) => {
+      if (!noteDirtyRef.current) return true;
+      setPendingRoute(target);
+      return false;
+    });
+  }, [editing]);
+  const leaveDetail = () => navigate('/');
   const participants = asStringArray(meeting.participants);
   const keyPoints = meeting.key_points ?? [];
   const actionItems = asStringArray(meeting.action_items);
@@ -1407,7 +1415,9 @@ function DetailContent({
                   type="button"
                   className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-[color:var(--surface-hover)] disabled:opacity-50"
                   style={{ color: 'var(--danger)' }}
-                  disabled={deleteMeeting.isPending}
+                  // Not while editing: delete is immediate, and the open
+                  // draft would either be lost or left on a deleted note.
+                  disabled={deleteMeeting.isPending || editing}
                   onClick={async () => {
                     setDeleteError(null);
                     try {
@@ -1418,7 +1428,9 @@ function DetailContent({
                       );
                       return;
                     }
-                    navigate('/');
+                    // The note is gone; leaving is the only sensible next step,
+                    // so it must not wait on the unsaved-edit guard.
+                    navigate('/', { force: true });
                   }}
                 >
                   <Trash2 className="size-[13px] shrink-0" />
@@ -1612,7 +1624,7 @@ function DetailContent({
               value={noteDraft}
               onSave={saveNoteEdits}
               onCancel={closeEditor}
-              onDirtyChange={setNoteDirty}
+              onDirtyChange={handleNoteDirtyChange}
             />
           ) : streamPhase !== 'idle' ? (
             <StreamingView text={streamText} phase={streamPhase} chunkProgress={chunkProgress} />
@@ -1880,17 +1892,20 @@ function DetailContent({
       />
 
       <ConfirmDialog
-        open={confirmLeaveEdit}
-        onOpenChange={setConfirmLeaveEdit}
+        open={pendingRoute !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingRoute(null);
+        }}
         title={t('noteEditor.discardTitle')}
         description={t('noteEditor.discardDescription')}
         confirmLabel={t('noteEditor.discardAction')}
         cancelLabel={t('noteEditor.keepEditing')}
         destructive
         onConfirm={() => {
-          setConfirmLeaveEdit(false);
+          const target = pendingRoute ?? '/';
+          setPendingRoute(null);
           closeEditor();
-          navigate('/');
+          navigate(target, { force: true });
         }}
       />
     </article>
