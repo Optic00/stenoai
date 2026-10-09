@@ -648,6 +648,18 @@ test('the copy partition holds the contract, uncertain holds the safety net', as
     assert.ok(!definitelyNotCopy(unit), `storage unit must remain inventoried: ${unit}`);
     assert.ok(!readsAsCopy(unit), `storage unit must stay in the uncertain partition: ${unit}`);
   }
+  for (const css of [
+    'calc(var(--note-measure) + var(--note-gutter))',
+    'calc(-1 * var(--note-gutter))',
+    'minmax(0, 1fr) var(--note-gutter)',
+    '1px solid {{…}}',
+  ]) {
+    assert.ok(!definitelyNotCopy(css), `composed CSS value must remain inventoried: ${css}`);
+    assert.ok(!readsAsCopy(css), `composed CSS value must stay in the uncertain partition: ${css}`);
+  }
+  for (const prose of ['Uses 1px of space', 'Save (draft)', 'Auto mode is none of your business']) {
+    assert.ok(readsAsCopy(prose), `prose next to CSS-like words stays copy: ${prose}`);
+  }
 });
 
 // --- fixes from the cubic review on PR #497 -------------------------------------------
