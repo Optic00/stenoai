@@ -317,6 +317,7 @@ function install({ ipcMain }) {
   // handlers persist to disk. Mutated by the org-login / org-logout / set-ai
   // mocks so a test can assert the UI reacts to its own actions.
   const state = {
+    language: 'auto',
     provider: 'local', // 'local' | 'remote' | 'cloud' | 'adapter'
     orgSession: null, // { adapterUrl, email, name, orgId, exp } when signed in
     everSignedIn: false,
@@ -674,6 +675,12 @@ function install({ ipcMain }) {
       ready: true,
       error: null,
     }),
+
+    'get-language': async () => ({ success: true, language: state.language }),
+    'set-language': async (_event, language) => {
+      state.language = language;
+      return { success: true, language };
+    },
 
     'get-transcription-engine': async () => ({
       success: true,
@@ -1545,7 +1552,7 @@ function install({ ipcMain }) {
     // Transcribe tab reads this on first paint. (The engine itself moved to
     // MOCKS so STENOAI_E2E_MOCK_ENGINE can override it; default parakeet keeps
     // the language picker enabled — parakeet-language-picker.t1.)
-    'get-language': { success: true, language: 'auto' },
+    // get/set-language live in MOCKS so selections survive query refetches.
     // Real production catalog (src/whisper_models.py / src/parakeet_models.py)
     // rather than empty — so the Settings UI's model list actually renders
     // cards to look at (manual/dev use) instead of always erroring "Could not
