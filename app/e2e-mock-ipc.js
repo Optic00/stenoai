@@ -309,6 +309,10 @@ const AUDIO_SEED_MEETINGS = [
 ];
 
 function install({ ipcMain }) {
+  // Renderer tests can save and reopen chat turns without a backend or disk.
+  let chatSessions = { sessions: [] };
+  let privacyNoticeSeen = true;
+  let delayPrivacyNotice = process.env.STENOAI_E2E_DELAY_PRIVACY_NOTICE === '1';
   // In-memory stand-in for the org session + provider config that the real
   // handlers persist to disk. Mutated by the org-login / org-logout / set-ai
   // mocks so a test can assert the UI reacts to its own actions.
@@ -323,6 +327,13 @@ function install({ ipcMain }) {
     remoteUrl: '', // remote Ollama URL (empty = not configured)
     autoInstallWhenIdle: true, // idle auto-install toggle (config default on)
     transcriptionEngine: process.env.STENOAI_E2E_MOCK_ENGINE || 'parakeet',
+    diarizationEngine: 'sortformer',
+    // STENOAI_E2E_SPEAKER_MODELS_MISSING=1 simulates an upgraded install whose
+    // speaker models predate the current cache layout: every engine reports
+    // its models missing until setup-speaker-models prepares THAT engine.
+    speakerModelsMissing: new Set(
+      process.env.STENOAI_E2E_SPEAKER_MODELS_MISSING === '1' ? ['sortformer', 'nemotron3'] : [],
+    ),
     openAiAsrUrl: 'https://api.openai.com/v1',
     openAiAsrModel: 'whisper-1',
     openAiAsrKeySet: process.env.STENOAI_E2E_OAI_ASR_KEY_SET === '1',
@@ -347,6 +358,7 @@ function install({ ipcMain }) {
     // "recording this note" by identity (not display name).
     appendTo: null,
     startedAt: 0,
+    recordingId: null,
     pausedAt: 0,
   };
 
@@ -508,6 +520,28 @@ function install({ ipcMain }) {
   // real ipcMain.handle callback. Mirror the real handlers' return shapes from
   // app/main.js (get-ai-provider ~5950, org-* ~7990).
   const MOCKS = {
+    'get-privacy-notice-seen': async () => {
+      if (delayPrivacyNotice) {
+        delayPrivacyNotice = false;
+        return new Promise(resolve => {
+          // Let the modal-stacking spec resolve the initial query explicitly.
+          global.__resolvePrivacyNotice = seen => {
+            privacyNoticeSeen = seen;
+            resolve({ success: true, privacy_notice_seen: seen });
+          };
+        });
+      }
+      return { success: true, privacy_notice_seen: privacyNoticeSeen };
+    },
+    'set-privacy-notice-seen': async () => {
+      privacyNoticeSeen = true;
+      return { success: true, privacy_notice_seen: true };
+    },
+    'load-chat-sessions': async () => ({ success: true, data: chatSessions }),
+    'save-chat-sessions': async (_event, data) => {
+      chatSessions = data;
+      return { success: true };
+    },
     'reprocess-meeting': async () => {
       if (process.env.STENOAI_E2E_REPROCESS_PENDING !== '1') return { success: true };
       const state = global.__reprocessTest || (global.__reprocessTest = { calls: 0 });
@@ -525,6 +559,7 @@ function install({ ipcMain }) {
       rec.sessionName = name && String(name).trim() ? String(name).trim() : 'Note';
       rec.appendTo = appendTo && String(appendTo).trim() ? String(appendTo).trim() : null;
       rec.startedAt = Date.now();
+      rec.recordingId = String(rec.startedAt);
       return { success: true, sessionName: rec.sessionName };
     },
     'stop-recording-ui': async () => {
@@ -618,6 +653,8 @@ function install({ ipcMain }) {
             ? rec.sessionName
             : null,
         recordingSummaryFile: rec.active ? rec.appendTo : null,
+        recordingId: rec.active ? rec.recordingId : null,
+        chatSummaryFile: rec.active ? rec.appendTo || `/mock/output/live-${rec.recordingId}_summary.md` : null,
       };
     },
 
@@ -651,6 +688,20 @@ function install({ ipcMain }) {
     }),
     'set-transcription-engine': async (_event, engine) => {
       state.transcriptionEngine = engine;
+      return { success: true, engine };
+    },
+
+    'get-diarization-engine': async () => (
+      process.env.STENOAI_E2E_DIARIZATION_ENGINE_READ_FAILURE === '1'
+        ? { success: false, error: 'synthetic speaker detection setting read failure' }
+        : {
+            success: true,
+            engine: state.diarizationEngine,
+            valid_engines: ['sortformer', 'nemotron3'],
+          }
+    ),
+    'set-diarization-engine': async (_event, engine) => {
+      state.diarizationEngine = engine;
       return { success: true, engine };
     },
 
@@ -1001,34 +1052,55 @@ function install({ ipcMain }) {
       }
       return { success: true, message: 'Parakeet model ready' };
     },
-    'speaker-model-status': async () => (
-      process.env.STENOAI_E2E_SPEAKER_MODEL_FAILURE === '1'
-        ? {
-            success: true,
-            ready: false,
-            cache_directory: '/tmp/e2e/models/speaker-diarization',
-            required_models: ['model'],
-            missing_models: ['model'],
-          }
-        : {
-            success: true,
-            ready: true,
-            cache_directory: '/tmp/e2e/models/speaker-diarization',
-            required_models: [],
-            missing_models: [],
-          }
-    ),
-    'setup-speaker-models': async () => (
-      process.env.STENOAI_E2E_SPEAKER_MODEL_FAILURE === '1'
-        ? { success: false, error: 'synthetic model setup failure' }
-        : {
-            success: true,
-            ready: true,
-            cache_directory: '/tmp/e2e/models/speaker-diarization',
-            required_models: [],
-            missing_models: [],
-          }
-    ),
+    // Speaker models, per engine (state.speakerModelsMissing). Like the real
+    // CLI, no engine argument means the saved engine.
+    // STENOAI_E2E_SPEAKER_MODEL_FAILURE: the status check and the download
+    // both fail. STENOAI_E2E_SPEAKER_MODELS_MISSING: every engine starts
+    // missing, and a download emits a progress event then waits until the
+    // spec resolves it through global.__speakerModels.finish() (calls counts
+    // downloads, so a spec can assert that onboarding did not start one).
+    'speaker-model-status': async (_event, engine) => {
+      if (process.env.STENOAI_E2E_SPEAKER_MODEL_FAILURE === '1') {
+        return { success: false, ready: false, error: 'synthetic model status failure' };
+      }
+      const missing = state.speakerModelsMissing.has(engine || state.diarizationEngine);
+      return {
+        success: true,
+        ready: !missing,
+        cache_directory: '/tmp/e2e/models/speaker-diarization',
+        required_models: missing ? ['model'] : [],
+        missing_models: missing ? ['model'] : [],
+      };
+    },
+    'setup-speaker-models': async (event, engine) => {
+      const downloads = global.__speakerModels ||= { calls: 0, finish: null, inFlight: new Map() };
+      downloads.calls++;
+      if (process.env.STENOAI_E2E_SPEAKER_MODEL_FAILURE === '1') {
+        return { success: false, ready: false, error: 'synthetic model setup failure' };
+      }
+      const target = engine || state.diarizationEngine;
+      const ready = {
+        success: true,
+        ready: true,
+        cache_directory: '/tmp/e2e/models/speaker-diarization',
+        required_models: [],
+        missing_models: [],
+      };
+      if (!state.speakerModelsMissing.has(target)) return ready;
+      const wc = event && event.sender;
+      if (wc && !wc.isDestroyed()) wc.send('speaker-models-progress', { percent: 37, phase: 'downloading' });
+      // Like main.js, concurrent callers for one engine share its download.
+      if (!downloads.inFlight.has(target)) {
+        downloads.inFlight.set(target, new Promise((resolve) => {
+          downloads.finish = () => {
+            state.speakerModelsMissing.delete(target);
+            downloads.inFlight.delete(target);
+            resolve(ready);
+          };
+        }));
+      }
+      return downloads.inFlight.get(target);
+    },
     'setup-ollama-and-model': async (event) => {
       if (process.env.STENOAI_E2E_SETUP_PROGRESS === '1') {
         const wc = event && event.sender;
@@ -1379,7 +1451,7 @@ function install({ ipcMain }) {
   let slowUpdateStatusCallsLeft = process.env.STENOAI_E2E_SLOW_UPDATE_STATUS === '1' ? 1 : 0;
 
   const DEFAULTS = {
-    'get-app-version': { success: true, version: '0.0.0-e2e', name: 'Steno' },
+    'get-app-version': { success: true, version: process.env.STENOAI_E2E_APP_VERSION || '0.0.0-e2e', name: 'Steno' },
     // Read-only display poll for the About tab's "Check for Updates" button
     // (settings-about.t1). Fully hermetic — no real GitHub call under mock
     // IPC, so this is the only source of truth for that flow in T1.
@@ -1630,10 +1702,44 @@ function install({ ipcMain }) {
   // this is the observable seam for "which IPC did the renderer actually call".
   global.__mockIpcCalls = [];
 
+  let chatData = null;
+  MOCKS['load-chat-sessions'] = async () => ({ success: true, data: chatData });
+  MOCKS['save-chat-sessions'] = async (_event, data) => {
+    if (global.__holdNextChatSave) {
+      global.__holdNextChatSave = false;
+      return new Promise((resolve) => { global.__failChatSave = () => resolve({ success: false, error: 'Save failed' }); });
+    }
+    chatData = data;
+    return { success: true };
+  };
+  const originalOn = ipcMain.on.bind(ipcMain);
+  ipcMain.on = (channel, handler) => {
+    if (channel === 'chat-context-stream') {
+      return originalOn(channel, (event, queryId, request) => {
+        global.__mockIpcCalls.push({ channel, args: [queryId, request] });
+        const reply = process.env.STENOAI_E2E_CHAT_REPLY || '1. First point\n\n2. Second point\n\n3. Third point';
+        // Tests release held answers explicitly to exercise recording transitions.
+        const finish = () => {
+          if (event.sender.isDestroyed()) return;
+          event.sender.send('query-chunk', { queryId, chunk: reply });
+          event.sender.send('query-done', { queryId, success: true });
+        };
+        if (process.env.STENOAI_E2E_HOLD_CHAT === '1') global.__finishChat = finish;
+        else setTimeout(finish, 20);
+      });
+    }
+    return originalOn(channel, handler);
+  };
+
   const originalHandle = ipcMain.handle.bind(ipcMain);
   ipcMain.handle = (channel, realFn) => {
     let fn;
-    if (MOCKS[channel]) {
+    if (channel === 'open-external' && process.env.STENOAI_E2E_OPEN_EXTERNAL === '1') {
+      // Interactive previews can open docs in the user's browser. Tests that
+      // opt in replace shell.openExternal with a spy before clicking a link.
+      // Retain the production URL validation; all other T1 runs stay inert.
+      fn = realFn;
+    } else if (MOCKS[channel]) {
       fn = MOCKS[channel];
     } else if (Object.prototype.hasOwnProperty.call(DEFAULTS, channel)) {
       const value = DEFAULTS[channel];

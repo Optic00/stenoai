@@ -101,6 +101,8 @@ const {
 } = require('./shortcut-url');
 const { parseSetupCheckOutput } = require('./setup-check-parse');
 const { parseSpeakerModelStatusOutput } = require('./speaker-model-status');
+const { createSpeakerModelPreparer } = require('./speaker-model-prepare');
+const { reprepareSpeakerModelsAfterUpgrade } = require('./speaker-model-upgrade');
 const { isDiagnosticStdoutLine, sanitizeArgsForLog } = require('./diagnostics-filter');
 // Pure analytics bucketing/classification/sanitization lives in
 // ./analytics-helpers (unit-tested). trackEvent() itself and every IPC
@@ -135,7 +137,9 @@ const { autoUpdater } = require('electron-updater');
 
 // E2E test-harness hooks. Set via env vars; production sees none of these.
 //   STENOAI_USER_DATA_DIR — per-test temp userData dir (must be set before app.whenReady)
-//   STENOAI_E2E=1         — skip tray, auto-updater, PostHog telemetry
+//   STENOAI_E2E=1         — skip tray, auto-updater, PostHog telemetry, and
+//                           the post-upgrade speaker-model re-download unless
+//                           STENOAI_E2E_SPEAKER_UPGRADE=1 opts a spec into it
 //   STENOAI_E2E_MOCK_IPC=1 — install deterministic mock IPC handlers
 //   STENOAI_E2E_HEADLESS=1 - keep the main window rendered but never visible/focused
 if (process.env.STENOAI_USER_DATA_DIR) {
@@ -2063,6 +2067,23 @@ if (!gotSingleInstanceLock) {
     // remove plaintext only after that succeeds.
     void migrateLegacyOpenAiAsrApiKey();
 
+    // Speaker models cached before the FluidAudio 0.17 upgrade no longer
+    // load, and meeting processing never downloads; fetch them again in the
+    // background for users who had opted in (see speaker-model-upgrade.js).
+    // The shared preparer reports progress to Settings like any download.
+    // Off in e2e like the other network-bound startup work: a spec that seeds
+    // an old cache against the real sidecar must not start a real download.
+    if (!IS_E2E_MOCK_IPC && (!IS_E2E || process.env.STENOAI_E2E_SPEAKER_UPGRADE === '1')) {
+      void reprepareSpeakerModelsAfterUpgrade({
+        platform: process.platform,
+        userDataDir: getUserDataDir(),
+        env: process.env,
+        checkStatus: () => runSpeakerModelCommand('speaker-model-status'),
+        prepare: () => prepareSpeakerModels(),
+        onLog: sendDebugLog,
+      });
+    }
+
     // Application menu. macOS uses the global menu bar with mac-only roles
     // (services/hide/unhide). Windows/Linux get a slimmer, platform-correct
     // menu — kept (editing accelerators, Settings, Help) but hidden by default
@@ -3587,6 +3608,70 @@ ipcMain.handle('query-transcript', async (event, summaryFile, question) => {
 });
 
 const activeQueryProcs = new Map();
+const contextQueries = new Map();
+const { validateRequest: validateChatRequest, liveSnapshot, runQuery: runChatQuery } = require('./chat-query');
+
+ipcMain.on('chat-context-stream', async (event, queryId, request) => {
+  const sender = event.sender;
+  let chunkCount = 0;
+  let tracked = false;
+  const send = (channel, data) => {
+    if (channel === 'query-chunk') chunkCount++;
+    if (channel === 'query-done' && !tracked && data.error !== 'Answer stopped.') {
+      tracked = true;
+      trackEvent('chat_message_sent', {
+        success: data.success,
+        scope: request?.scope === 'live' || request?.scope === 'meeting' ? 'single_meeting' : 'global',
+        query_length: textLengthBucket(typeof request?.question === 'string' ? request.question : ''),
+        has_response: chunkCount > 0,
+      });
+    }
+    if (!sender.isDestroyed()) sender.send(channel, { queryId, ...data });
+  };
+  if (!mainWindow || sender !== mainWindow.webContents || event.senderFrame !== sender.mainFrame) return;
+  if (typeof queryId !== 'string' || !queryId || queryId.length > 256 || contextQueries.has(queryId)) return;
+  if (contextQueries.size >= 4) {
+    send('query-done', { success: false, error: 'Wait for another answer to finish.' });
+    return;
+  }
+  let cancelled = false;
+  const entry = { sender, cancel: () => { cancelled = true; } };
+  contextQueries.set(queryId, entry);
+  const onDestroyed = () => entry.cancel();
+  sender.once('destroyed', onDestroyed);
+  const cleanup = () => {
+    contextQueries.delete(queryId);
+    if (!sender.isDestroyed()) sender.removeListener('destroyed', onDestroyed);
+  };
+  try {
+    const payload = validateChatRequest(request);
+    if (payload.scope === 'live') {
+      if (!systemAudioRecordingActive || request.recordingId !== String(recordingRuntimeState.startedAtMs)
+          || !recordingRuntimeState.startedAtMs) throw new Error('This recording is no longer active.');
+      payload.transcript = liveSnapshot(liveTranscriptState);
+      // A continued recording can start after a cold launch, with no in-memory
+      // prior segments. Read its saved transcript via the validated note path.
+      if (currentRecordingAppendTarget) {
+        payload.file = currentRecordingAppendTarget;
+        payload.transcript = liveSnapshot({ segments: liveTranscriptState.segments });
+      }
+    } else if (payload.scope === 'meeting') {
+      const validated = await validateMeetingFilePath(request.file);
+      if (validated.error) throw new Error('This meeting is unavailable.');
+      payload.file = validated.realPath;
+    }
+    if (cancelled || sender.isDestroyed()) { cleanup(); return; }
+    const query = runChatQuery({
+      spawn: require('child_process').spawn,
+      backend: getBackendPath(), env: getBackendEnv(getAiEnv()), cwd: getBackendCwd(),
+      payload, send, onFinish: cleanup,
+    });
+    entry.cancel = query.cancel;
+  } catch (error) {
+    if (!cancelled) send('query-done', { success: false, error: error.message });
+    cleanup();
+  }
+});
 
 // Cancellation intent for streaming queries that are still in their pre-spawn
 // async window. query-transcript-stream now `await`s validateMeetingFilePath
@@ -3599,6 +3684,11 @@ const activeQueryProcs = new Map();
 const pendingQueryCancels = new Map();
 
 ipcMain.on('query-cancel', (_event, queryId) => {
+  const contextQuery = contextQueries.get(queryId);
+  if (contextQuery) {
+    if (contextQuery.sender === _event.sender) contextQuery.cancel();
+    return;
+  }
   const proc = activeQueryProcs.get(queryId);
   if (proc) {
     console.log(`[QUERY] Cancelling queryId=${queryId}`);
@@ -4807,6 +4897,10 @@ ipcMain.handle('get-queue-status', async () => {
           ? Math.floor((Date.now() - currentProcessingStartedAtMs) / 1000)
           : 0),
     sessionName: currentRecordingSessionName,
+    recordingId: systemAudioRecordingActive && recordingRuntimeState.startedAtMs
+      ? String(recordingRuntimeState.startedAtMs) : null,
+    chatSummaryFile: systemAudioRecordingActive
+      ? (currentRecordingAppendTarget || activeSysAudioSummaryFile) : null,
     // The note (summary-file realpath) an active continue/resume is recording
     // INTO, so the renderer can tell "recording this note" from "recording a
     // different one" by identity rather than by the (collidable) display name.
@@ -6257,6 +6351,7 @@ ipcMain.handle('start-recording-ui', async (_, sessionName, trigger, appendTo) =
     // retired, so there is no longer a mic-XOR-system fork here.
     sendDebugLog(`Starting renderer-driven recording (name ${String(actualSessionName || '').length} chars)`);
     currentRecordingSessionName = actualSessionName;
+    activeSysAudioSummaryFile = null;
     startRecordingRuntimeState();
     // Flip the active flag immediately so the queue handler reports
     // hasRecording=true on the very next poll, which is what cues the renderer
@@ -6571,7 +6666,18 @@ ipcMain.handle('startup-setup-check', async () => {
   }
 });
 
-async function runSpeakerModelCommand(command) {
+// Speaker-diarization engines the steno-diarize sidecar accepts. Mirrors
+// Config.VALID_DIARIZATION_ENGINES; checked here so a renderer-supplied value
+// can never reach the CLI argv as anything but a known engine name.
+const DIARIZATION_ENGINES = ['sortformer', 'nemotron3'];
+
+function isDiarizationEngine(value) {
+  return typeof value === 'string' && DIARIZATION_ENGINES.includes(value);
+}
+
+// `engine` (optional) targets that engine's models instead of the saved
+// setting -- Settings prepares a choice before persisting it.
+async function runSpeakerModelCommand(command, engine) {
   if (process.platform !== 'darwin') {
     return {
       success: false,
@@ -6579,13 +6685,20 @@ async function runSpeakerModelCommand(command) {
       error: 'Speaker diarization is unavailable on this system',
     };
   }
-  const output = await runPythonScript('simple_recorder.py', [command]);
+  const args = [command];
+  if (engine !== undefined && engine !== null) {
+    if (!isDiarizationEngine(engine)) {
+      return { success: false, ready: false, error: 'Unknown speaker detection engine' };
+    }
+    args.push('--engine', engine);
+  }
+  const output = await runPythonScript('simple_recorder.py', args);
   return parseSpeakerModelStatusOutput(output);
 }
 
-ipcMain.handle('speaker-model-status', async () => {
+ipcMain.handle('speaker-model-status', async (event, engine) => {
   try {
-    return await runSpeakerModelCommand('speaker-model-status');
+    return await runSpeakerModelCommand('speaker-model-status', engine);
   } catch {
     sendDebugLog('Speaker diarization model status check failed');
     return {
@@ -6596,22 +6709,34 @@ ipcMain.handle('speaker-model-status', async () => {
   }
 });
 
-ipcMain.handle('setup-speaker-models', async () => {
-  try {
-    sendDebugLog('Preparing local speaker diarization models...');
-    const result = await runSpeakerModelCommand('prepare-speaker-models');
-    if (result.success && result.ready) {
-      sendDebugLog('Speaker diarization models ready');
+// One shared download for onboarding and Settings; progress goes to the
+// renderer as 'speaker-models-progress' ({ percent, phase }).
+const prepareSpeakerModels = createSpeakerModelPreparer({
+  spawn,
+  getBackendPath,
+  getBackendCwd,
+  makeLineReader,
+  onLog: sendDebugLog,
+  platform: process.platform,
+  onProgress: (progress) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('speaker-models-progress', progress);
     }
-    return result;
-  } catch {
-    sendDebugLog('Speaker diarization model setup failed');
-    return {
-      success: false,
-      ready: false,
-      error: 'Speaker diarization model setup failed',
-    };
+  },
+});
+
+// `engine` (optional) downloads that engine's models instead of the saved
+// setting's -- Settings prepares a choice before persisting it.
+ipcMain.handle('setup-speaker-models', async (event, engine) => {
+  if (engine !== undefined && engine !== null && !isDiarizationEngine(engine)) {
+    return { success: false, ready: false, error: 'Unknown speaker detection engine' };
   }
+  sendDebugLog('Preparing local speaker diarization models...');
+  const result = await prepareSpeakerModels(engine ?? undefined);
+  sendDebugLog(result.success && result.ready
+    ? 'Speaker diarization models ready'
+    : 'Speaker diarization model setup failed');
+  return result;
 });
 
 // ── Auto-updater ──
@@ -6673,7 +6798,7 @@ function gatherIdleInstallState() {
     isProcessing,
     queueLength: processingQueue.length,
     liveActive: liveTranscribeProcess != null,
-    streaming: activeQueryProcs.size > 0,
+    streaming: activeQueryProcs.size > 0 || contextQueries.size > 0,
     otherJobsActive: activeReprocessJobs.size > 0,
     idleSeconds: powerMonitor.getSystemIdleTime(),
     idleThresholdSeconds: IDLE_AUTO_INSTALL_THRESHOLD_SECONDS,
@@ -8155,6 +8280,31 @@ ipcMain.handle('set-transcription-engine', async (event, engine) => {
     const result = await runPythonScript('simple_recorder.py', ['set-transcription-engine', engine]);
     const jsonData = JSON.parse(result.trim());
     trackEvent('model_changed', { model: engine, kind: 'transcription_engine' });
+    return { success: true, ...jsonData };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('get-diarization-engine', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-diarization-engine'], true);
+    const jsonData = JSON.parse(result.trim());
+    return { success: true, ...jsonData };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+// The CLI refuses to save a non-default engine whose models are not ready
+// (success: false, models_ready: false); the renderer prepares them first
+// via setup-speaker-models.
+ipcMain.handle('set-diarization-engine', async (event, engine) => {
+  if (!isDiarizationEngine(engine)) {
+    return { success: false, error: 'Unknown speaker detection engine' };
+  }
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['set-diarization-engine', engine]);
+    const jsonData = JSON.parse(result.trim());
+    if (jsonData.success) {
+      trackEvent('model_changed', { model: engine, kind: 'diarization_engine' });
+    }
     return { success: true, ...jsonData };
   } catch (e) { return { success: false, error: e.message }; }
 });

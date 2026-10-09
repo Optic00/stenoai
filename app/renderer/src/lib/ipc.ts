@@ -134,12 +134,22 @@ export interface UpdateMeetingPatch {
   user_notes?: string;
 }
 
+export interface ChatRequest {
+  scope: 'live' | 'meeting' | 'notes' | 'general';
+  question: string;
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  recordingId?: string;
+  file?: string;
+  folder?: string | null;
+}
+
 export interface ChatSessionsBlob {
   sessions: Array<{
     id: string;
     name: string;
     summaryFile?: string;
-    messages: Array<{ role: 'user' | 'assistant'; content: string; ts: number }>;
+    scopeFolderId?: string | null;
+    messages: Array<{ role: 'user' | 'assistant'; content: string; ts: number; context?: string }>;
     createdAt: number;
     updatedAt: number;
   }>;
@@ -367,6 +377,8 @@ export type PauseRecordingResponse = Result<{ message: string }>;
 export type ResumeRecordingResponse = Result<{ message: string }>;
 
 export interface QueueStatus {
+  recordingId?: string | null;
+  chatSummaryFile?: string | null;
   success: true;
   isProcessing: boolean;
   queueSize: number;
@@ -709,6 +721,20 @@ export type GetTranscriptionEngineResponse = Result<{
   valid_engines: TranscriptionEngine[];
 }>;
 
+/** macOS speaker-diarization engine (Config.VALID_DIARIZATION_ENGINES). */
+export type DiarizationEngine = 'sortformer' | 'nemotron3';
+
+export type GetDiarizationEngineResponse = Result<{
+  engine: DiarizationEngine;
+  valid_engines: DiarizationEngine[];
+}>;
+
+/** A non-default engine is only saved once its models are ready; otherwise
+ *  the backend answers success: false with models_ready: false. */
+export type SetDiarizationEngineResponse =
+  | { success: true; engine: DiarizationEngine }
+  | { success: false; error: string; error_code?: string; models_ready?: false };
+
 export type GetOpenAiAsrConfigResponse = Result<{
   api_url: string;
   api_key_set: boolean;
@@ -927,6 +953,17 @@ export interface ParakeetPullProgressEvent {
   completed_files?: number;
   total_files?: number;
   file_bytes?: number;
+  /** Exact bytes from the Hub's file metadata; absent when that lookup failed. */
+  downloaded_bytes?: number;
+  total_bytes?: number;
+}
+/** Speaker-diarization model download ('setup-speaker-models'). While
+ *  `downloading`, percent is the measured share of the model download; once
+ *  `compiling` (CoreML optimising for this Mac, then the small embedding
+ *  models) there is nothing to measure. Phase only ever moves forward. */
+export interface SpeakerModelsProgressEvent {
+  percent: number;
+  phase: 'listing' | 'downloading' | 'compiling';
 }
 export interface ParakeetPullCompleteEvent {
   model?: string | null;
@@ -1049,8 +1086,9 @@ export interface StenoaiBridge {
     check: RequestFn<[], SetupCheckResponse>;
     ollamaAndModel: RequestFn<[], Result<Record<string, unknown>>>;
     parakeet: RequestFn<[], Result<Record<string, unknown>>>;
-    speakerModelsStatus: RequestFn<[], SpeakerModelStatusResponse>;
-    speakerModels: RequestFn<[], SpeakerModelStatusResponse>;
+    /** Without an engine, reports/prepares the saved diarization engine's models. */
+    speakerModelsStatus: RequestFn<[engine?: DiarizationEngine], SpeakerModelStatusResponse>;
+    speakerModels: RequestFn<[engine?: DiarizationEngine], SpeakerModelStatusResponse>;
     test: RequestFn<[], Result<Record<string, unknown>>>;
     triggerWizard: RequestFn<[], Result<Record<string, unknown>>>;
   };
@@ -1174,6 +1212,7 @@ export interface StenoaiBridge {
 
   query: {
     ask: RequestFn<[file: string, q: string], QueryResponse>;
+    chatContext: SendFn<[id: string, request: ChatRequest]>;
     askStream: SendFn<[id: string, file: string, q: string]>;
     chatGlobalStream: SendFn<[id: string, q: string, folderId?: string | null]>;
     cancel: SendFn<[id: string]>;
@@ -1261,6 +1300,11 @@ export interface StenoaiBridge {
   transcriptionEngine: {
     get: RequestFn<[], GetTranscriptionEngineResponse>;
     set: RequestFn<[engine: TranscriptionEngine], Result<{ engine: TranscriptionEngine }>>;
+  };
+
+  diarizationEngine: {
+    get: RequestFn<[], GetDiarizationEngineResponse>;
+    set: RequestFn<[engine: DiarizationEngine], SetDiarizationEngineResponse>;
   };
 
   openaiAsr: {
@@ -1426,6 +1470,7 @@ export interface StenoaiBridge {
     parakeetPullProgress: Subscribe<ParakeetPullProgressEvent>;
     parakeetPullComplete: Subscribe<ParakeetPullCompleteEvent>;
     setupOllamaProgress: Subscribe<SetupOllamaProgressEvent>;
+    speakerModelsProgress: Subscribe<SpeakerModelsProgressEvent>;
     liveTranscriptReady: Subscribe<LiveTranscriptReadyEvent>;
     liveTranscriptChunk: Subscribe<LiveTranscriptChunkEvent>;
     liveTranscriptError: Subscribe<LiveTranscriptErrorEvent>;
