@@ -1365,6 +1365,7 @@ export interface StenoaiBridge {
           failed?: boolean;
           hardFailure?: boolean;
           summaryFile?: string | null;
+          actionItemCount?: number;
         },
       ],
       Result<Record<string, never>>

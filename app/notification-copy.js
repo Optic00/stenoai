@@ -15,7 +15,7 @@
  *  - otherwise: the note is genuinely ready — the body IS the note title.
  */
 function buildNoteReadyNotificationOptions(payload) {
-  const { title, failed, hardFailure } = payload || {};
+  const { title, failed, hardFailure, actionItemCount } = payload || {};
   return {
     title: hardFailure ? 'Processing failed' : failed ? 'Transcription failed' : 'Note ready',
     body: hardFailure
@@ -23,6 +23,9 @@ function buildNoteReadyNotificationOptions(payload) {
       : failed
         ? 'Your recording was preserved — open the note for details.'
         : (title || 'Your note has finished processing'),
+    detail: !hardFailure && !failed && Number.isInteger(actionItemCount) && actionItemCount > 0
+      ? `${actionItemCount} action item${actionItemCount === 1 ? '' : 's'}`
+      : undefined,
     iconType: (hardFailure || failed) ? 'alert' : 'success',
     outcome: hardFailure ? 'hard_failure' : failed ? 'failed' : 'success',
   };

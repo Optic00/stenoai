@@ -146,3 +146,28 @@ test('no developer text survives any branch', () => {
     assert.ok(body.length > 0);
   }
 });
+
+test('note-ready carries the action-item count as a detail', () => {
+  const o = (actionItemCount) => buildNoteReadyNotificationOptions({ title: 'Standup', actionItemCount });
+  assert.strictEqual(o(3).title, 'Note ready');
+  assert.strictEqual(o(3).detail, '3 action items');
+  assert.strictEqual(o(1).detail, '1 action item');
+  assert.strictEqual(o(3).body, 'Standup');
+});
+
+test('note-ready ignores a missing or invalid action-item count', () => {
+  for (const actionItemCount of [undefined, 0, -2, 1.5, '3', NaN, null]) {
+    const o = buildNoteReadyNotificationOptions({ title: 'Standup', actionItemCount });
+    assert.strictEqual(o.title, 'Note ready');
+    assert.strictEqual(o.detail, undefined);
+  }
+});
+
+test('failure states ignore the action-item count', () => {
+  const failed = buildNoteReadyNotificationOptions({ title: 'T', failed: true, actionItemCount: 3 });
+  const hard = buildNoteReadyNotificationOptions({ title: 'T', hardFailure: true, actionItemCount: 3 });
+  assert.strictEqual(failed.title, 'Transcription failed');
+  assert.strictEqual(hard.title, 'Processing failed');
+  assert.strictEqual(failed.detail, undefined);
+  assert.strictEqual(hard.detail, undefined);
+});

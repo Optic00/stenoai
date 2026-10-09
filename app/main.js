@@ -402,6 +402,7 @@ class Notification extends EventEmitter {
       })),
     };
     if (options.iconType) this.payload.iconType = options.iconType;
+    if (options.detail) this.payload.detail = options.detail;
   }
 
   show() {
@@ -6112,6 +6113,7 @@ async function processNextInQueue() {
                 mainWindow.webContents.send('processing-complete', {
                   success: true,
                   sessionName: sessionNameAtClose,
+                  summaryFile: savedSummaryFile || undefined,
                   message: transcriptionFailedMsg
                     ? 'Transcription failed; recording preserved (not deleted)'
                     : 'Processing completed successfully',
@@ -6130,6 +6132,7 @@ async function processNextInQueue() {
                 mainWindow.webContents.send('processing-complete', {
                   success: true,
                   sessionName: sessionNameAtClose,
+                  summaryFile: savedSummaryFile || undefined,
                   message: transcriptionFailedMsg
                     ? 'Transcription failed; recording preserved (not deleted)'
                     : 'Processing completed successfully',
@@ -8861,8 +8864,8 @@ async function showNoteReadyNotification(payload) {
   // `shown` = passed the notifications_enabled gate (see show-silence-auto-stop).
   if (!(await notificationsEnabled())) return { success: true, shown: false };
   const { summaryFile } = payload || {};
-  const { title, body, iconType, outcome } = buildNoteReadyNotificationOptions(payload);
-  const notif = new Notification({ title, body, iconType });
+  const { title, detail, body, iconType, outcome } = buildNoteReadyNotificationOptions(payload);
+  const notif = new Notification({ title, detail, body, iconType });
   notif.on('click', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       exposeMainWindow();

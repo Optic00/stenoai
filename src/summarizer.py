@@ -468,7 +468,8 @@ class OllamaSummarizer:
             "## Action Items\n"
             "- [Action item 1]\n"
             "- [Action item 2]\n\n"
-            f"Only include information explicitly discussed. Do not infer or assume.{language_instruction}\n\n"
+            "Only include information explicitly discussed. Do not infer or assume. "
+            f"If there are no action items, leave that section empty with no bullets.{language_instruction}\n\n"
             f"EXTRACTS:\n{combined}"
         )
 
@@ -1410,7 +1411,7 @@ Brief analysis of what was discussed about this topic.
 - [Action item 1]
 - [Action item 2]
 
-Only include information explicitly discussed. Do not infer or assume.{language_instruction}
+Only include information explicitly discussed. Do not infer or assume. If there are no action items, leave that section empty with no bullets.{language_instruction}
 
 TRANSCRIPT:
 {transcript}"""

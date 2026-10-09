@@ -91,6 +91,7 @@ import { cn } from '@/lib/utils';
 import { t } from '@/i18n';
 import { navigate } from '@/lib/router';
 import { stripReasoning } from '@/lib/markdown';
+import { asStringArray } from '@/lib/completionNotification';
 import { pendingTitleRegens, streamCache, type StreamPhase } from '@/lib/meetingDetailState';
 import { useReprocessBridge } from '@/hooks/reprocessBridgeStore';
 import { useRecording } from '@/hooks/useRecording';
@@ -2419,23 +2420,6 @@ function formatDuration(seconds?: number): string | undefined {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m`;
   return `${s}s`;
-}
-
-function asStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value
-    .map((v) => {
-      if (typeof v === 'string') return v;
-      if (typeof v !== 'object' || v === null) return '';
-      const obj = v as Record<string, unknown>;
-      const desc = typeof obj.description === 'string' ? obj.description : '';
-      const owner = typeof obj.owner === 'string' ? obj.owner : '';
-      if (desc) return owner ? `${owner}: ${desc}` : desc;
-      if (typeof obj.text === 'string') return obj.text;
-      if (typeof obj.name === 'string') return obj.name;
-      return '';
-    })
-    .filter(Boolean);
 }
 
 interface DiscussionArea {

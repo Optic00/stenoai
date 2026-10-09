@@ -15,6 +15,7 @@ interface NotificationAction {
 interface NotificationData {
   id?: string;
   title: string;
+  detail?: string;
   body?: string;
   time?: string;
   meeting_url?: string;
@@ -159,7 +160,7 @@ export function NotificationToast() {
             ></div>
             <div className="flex flex-col justify-center ml-3 min-w-0">
               <span className="text-[14px] font-medium text-gray-900 tracking-tight leading-tight truncate max-w-[220px] dark:text-gray-100">
-                {data.title}
+                {[data.title, data.detail].filter(Boolean).join(' · ')}
               </span>
               {(data.body || data.time) && (
                 <span className="text-[12px] font-normal text-gray-500 leading-tight mt-0.5 truncate max-w-[220px] dark:text-gray-400">
