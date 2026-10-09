@@ -700,18 +700,28 @@ function install({ ipcMain }) {
 
     // OpenAI-compatible ASR config. Shape-only for first paint; the real
     // set/get round-trip + key storage is covered by cloud-asr-config.t2.
-    'get-openai-asr-config': async () => ({
-      success: true,
-      api_url: state.openAiAsrUrl,
-      api_key_set: state.openAiAsrKeySet,
-      model: state.openAiAsrModel,
-    }),
+    'get-openai-asr-config': async () => {
+      if (global.__cloudAsrConfigRace) global.__cloudAsrConfigRace.reads += 1;
+      return {
+        success: true,
+        api_url: state.openAiAsrUrl,
+        api_key_set: state.openAiAsrKeySet,
+        model: state.openAiAsrModel,
+      };
+    },
     'set-openai-asr-config': async (_event, cfg) => {
+      const race = global.__cloudAsrConfigRace;
+      if (race) {
+        race.writes += 1;
+        await new Promise((resolve) => race.pending.push(resolve));
+      }
       if (process.env.STENOAI_E2E_OAI_ASR_SAVE_FAIL === '1') {
         return { success: false, error: 'mock save rejected' };
       }
       if (cfg?.api_url !== undefined) state.openAiAsrUrl = cfg.api_url;
       if (cfg?.model !== undefined) state.openAiAsrModel = cfg.model;
+      // A visible saved-key hint proves React consumed the subsequent refetch.
+      if (race) state.openAiAsrKeySet = true;
       return {
         success: true,
         api_url: state.openAiAsrUrl,
@@ -724,7 +734,7 @@ function install({ ipcMain }) {
         return { success: false, error: 'mock save rejected' };
       }
       if (process.env.STENOAI_E2E_OAI_ASR_KEY_RACE === '1' && key) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await new Promise((resolve) => setTimeout(resolve, 500));
       }
       state.openAiAsrKeySet = Boolean(key);
       return { success: true, api_key_set: state.openAiAsrKeySet };

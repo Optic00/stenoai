@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createTranslator } from './index';
 
 describe('createTranslator', () => {
@@ -14,7 +14,14 @@ describe('createTranslator', () => {
   });
 
   it('leaves an omitted parameter visible instead of deleting copy', () => {
-    expect(translate('greeting')).toBe('Hello, {{name}}.');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(translate('greeting', { typo: 'private-value' })).toBe('Hello, {{name}}.');
+      expect(warn).toHaveBeenCalledWith('Missing translation parameter "name" for "greeting"');
+      expect(warn.mock.calls.flat().join(' ')).not.toContain('private-value');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('leaves malformed interpolation tokens visible', () => {
