@@ -1,5 +1,6 @@
 import { test, expect } from '../fixtures/electron';
 import { openShareMenu } from '../fixtures/share-menu';
+import { emitMainEvent } from '../fixtures/notifications';
 import type { ElectronApplication, Page } from '@playwright/test';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import path from 'path';
@@ -433,4 +434,57 @@ test("the floating bar's published start does nothing while the editor is open",
   await page.evaluate(() => { window.location.hash = '#/meetings/epsilon_summary.json'; });
   await expect(page.getByTestId('tab-summary-content')).toContainText(ORIGINAL_SUMMARY);
   await expect(page.getByRole('button', { name: 'Edit note' })).toHaveCount(0);
+});
+
+test('leaving an edited note through the sidebar asks first (#447)', async ({ launchApp }) => {
+  const { app, page } = await launchApp({
+    mockIpc: true,
+    env: { STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1' },
+  });
+  await openNote(page);
+  await page.getByRole('button', { name: 'Edit note' }).click();
+  const summary = page.getByRole('textbox', { name: 'Summary', exact: true });
+  await summary.fill('A draft worth keeping.');
+
+  // Keep editing: the editor and the typing survive, the route does not change.
+  await page.getByRole('button', { name: 'Chat', exact: true }).click();
+  await expect(page.getByRole('dialog')).toContainText('Discard your note edits?');
+  await page.getByRole('button', { name: 'Keep editing' }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(summary).toHaveValue('A draft worth keeping.');
+  await expect(page).toHaveURL(new RegExp(`#/meetings/${SUMMARY_FILE}`));
+
+  // Discard: the sidebar target is reached and nothing was written.
+  await page.getByRole('button', { name: 'Chat', exact: true }).click();
+  await page.getByRole('button', { name: 'Discard and leave' }).click();
+  await expect(page).toHaveURL(/#\/chat$/);
+  expect(await updateCalls(app)).toHaveLength(0);
+});
+
+test('a deep link to another note asks before discarding the draft (#447)', async ({ launchApp }) => {
+  const { page, app } = await launchApp({
+    mockIpc: true,
+    env: { STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1' },
+  });
+  await openNote(page);
+  await page.getByRole('button', { name: 'Edit note' }).click();
+  await page.getByRole('textbox', { name: 'Summary', exact: true }).fill('A draft worth keeping.');
+
+  const other = 'other_summary.md';
+  await emitMainEvent(app, 'navigate-to-meeting', { summaryFile: other });
+  await expect(page.getByRole('dialog')).toContainText('Discard your note edits?');
+  await page.getByRole('button', { name: 'Discard and leave' }).click();
+  await expect(page).toHaveURL(new RegExp(`#/meetings/${other}`));
+});
+
+test('an unchanged editor leaves through the sidebar without asking', async ({ launchApp }) => {
+  const { page } = await launchApp({
+    mockIpc: true,
+    env: { STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1' },
+  });
+  await openNote(page);
+  await page.getByRole('button', { name: 'Edit note' }).click();
+  await page.getByRole('button', { name: 'Chat', exact: true }).click();
+  await expect(page).toHaveURL(/#\/chat$/);
+  await expect(page.getByRole('dialog')).toHaveCount(0);
 });

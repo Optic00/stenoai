@@ -355,7 +355,9 @@ export function NoteEditor({ value, onSave, onCancel, onDirtyChange }: NoteEdito
   const patch = React.useMemo(() => buildPatch(baseline, normalize(draft)), [baseline, draft]);
   const dirty = Object.keys(patch).length > 0;
 
-  React.useEffect(() => {
+  // Layout effect: the parent's navigation guard must see the new state before
+  // anything else runs, including a deep link that arrives right after a keystroke.
+  React.useLayoutEffect(() => {
     onDirtyChange?.(dirty);
   }, [dirty, onDirtyChange]);
 
