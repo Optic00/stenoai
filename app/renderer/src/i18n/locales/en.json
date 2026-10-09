@@ -45,5 +45,11 @@
   "settings.ai.speakers.retry": "Try again",
   "settings.ai.speakers.failed": "Download failed. Check your connection and try again.",
   "settings.ai.speakers.unavailable": "Not available on this Mac.",
-  "downloads.ollama.ariaLabel": "Summarization model download progress"
+  "downloads.ollama.ariaLabel": "Summarization model download progress",
+  "noteShare.menuLabel": "Share",
+  "noteShare.preparing": "Preparing…",
+  "noteShare.notesPdf": "Share notes as PDF…",
+  "noteShare.notesMarkdown": "Share notes as .md…",
+  "noteShare.transcript": "Share transcript…",
+  "noteShare.saveNotesMarkdown": "Save notes as .md…"
 }
