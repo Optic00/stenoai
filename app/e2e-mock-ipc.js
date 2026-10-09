@@ -317,6 +317,7 @@ function install({ ipcMain }) {
   // handlers persist to disk. Mutated by the org-login / org-logout / set-ai
   // mocks so a test can assert the UI reacts to its own actions.
   const state = {
+    language: 'auto',
     provider: 'local', // 'local' | 'remote' | 'cloud' | 'adapter'
     orgSession: null, // { adapterUrl, email, name, orgId, exp } when signed in
     everSignedIn: false,
@@ -675,6 +676,12 @@ function install({ ipcMain }) {
       error: null,
     }),
 
+    'get-language': async () => ({ success: true, language: state.language }),
+    'set-language': async (_event, language) => {
+      state.language = language;
+      return { success: true, language };
+    },
+
     'get-transcription-engine': async () => ({
       success: true,
       engine: state.transcriptionEngine,
@@ -700,18 +707,28 @@ function install({ ipcMain }) {
 
     // OpenAI-compatible ASR config. Shape-only for first paint; the real
     // set/get round-trip + key storage is covered by cloud-asr-config.t2.
-    'get-openai-asr-config': async () => ({
-      success: true,
-      api_url: state.openAiAsrUrl,
-      api_key_set: state.openAiAsrKeySet,
-      model: state.openAiAsrModel,
-    }),
+    'get-openai-asr-config': async () => {
+      if (global.__cloudAsrConfigRace) global.__cloudAsrConfigRace.reads += 1;
+      return {
+        success: true,
+        api_url: state.openAiAsrUrl,
+        api_key_set: state.openAiAsrKeySet,
+        model: state.openAiAsrModel,
+      };
+    },
     'set-openai-asr-config': async (_event, cfg) => {
+      const race = global.__cloudAsrConfigRace;
+      if (race) {
+        race.writes += 1;
+        await new Promise((resolve) => race.pending.push(resolve));
+      }
       if (process.env.STENOAI_E2E_OAI_ASR_SAVE_FAIL === '1') {
         return { success: false, error: 'mock save rejected' };
       }
       if (cfg?.api_url !== undefined) state.openAiAsrUrl = cfg.api_url;
       if (cfg?.model !== undefined) state.openAiAsrModel = cfg.model;
+      // A visible saved-key hint proves React consumed the subsequent refetch.
+      if (race) state.openAiAsrKeySet = true;
       return {
         success: true,
         api_url: state.openAiAsrUrl,
@@ -724,7 +741,7 @@ function install({ ipcMain }) {
         return { success: false, error: 'mock save rejected' };
       }
       if (process.env.STENOAI_E2E_OAI_ASR_KEY_RACE === '1' && key) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await new Promise((resolve) => setTimeout(resolve, 500));
       }
       state.openAiAsrKeySet = Boolean(key);
       return { success: true, api_key_set: state.openAiAsrKeySet };
@@ -1577,7 +1594,7 @@ function install({ ipcMain }) {
     // Transcribe tab reads this on first paint. (The engine itself moved to
     // MOCKS so STENOAI_E2E_MOCK_ENGINE can override it; default parakeet keeps
     // the language picker enabled — parakeet-language-picker.t1.)
-    'get-language': { success: true, language: 'auto' },
+    // get/set-language live in MOCKS so selections survive query refetches.
     // Real production catalog (src/whisper_models.py / src/parakeet_models.py)
     // rather than empty — so the Settings UI's model list actually renders
     // cards to look at (manual/dev use) instead of always erroring "Could not

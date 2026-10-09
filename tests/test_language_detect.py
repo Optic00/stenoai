@@ -158,10 +158,12 @@ class DetectTranscriptLanguageTests(unittest.TestCase):
 class ResolveOutputLanguagePriorityTests(unittest.TestCase):
     def test_pinned_config_wins_over_everything(self):
         # A concrete pin beats both an engine language and the transcript body.
-        self.assertEqual(
-            resolve_output_language("fr", detected_language="de", transcript_text=EN_TEXT),
-            "fr",
-        )
+        for language in ("fr", "it"):
+            with self.subTest(language=language):
+                self.assertEqual(
+                    resolve_output_language(language, detected_language="de", transcript_text=EN_TEXT),
+                    language,
+                )
 
     def test_engine_detected_wins_over_text_detection(self):
         # In auto mode a real engine language (Whisper) takes precedence over

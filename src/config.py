@@ -414,6 +414,7 @@ class Config:
         "es": "Spanish",
         "fr": "French",
         "de": "German",
+        "it": "Italian",
         "nl": "Dutch",
         "pt": "Portuguese",
         "ru": "Russian",

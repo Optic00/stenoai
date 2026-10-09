@@ -8510,6 +8510,11 @@ ipcMain.handle('set-openai-asr-key', async (_event, key) => {
       await migrateLegacyOpenAiAsrApiKey();
       return { success: true, api_key_set: false };
     }
+    // Finish compare-and-delete cleanup before rotation, so a failed cleanup
+    // cannot report success with plaintext left behind or overwrite the new key.
+    if (!await migrateLegacyOpenAiAsrApiKey()) {
+      return { success: false, error: 'OpenAI ASR credential migration is incomplete' };
+    }
     const origin = getOpenAiAsrEndpointOrigin();
     if (!origin) throw new Error('OpenAI ASR endpoint is invalid');
     const saved = saveOpenAiAsrKey(key, origin);
