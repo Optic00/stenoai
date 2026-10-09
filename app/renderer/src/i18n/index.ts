@@ -12,9 +12,13 @@ export function createTranslator<const Catalogue extends Record<string, string>>
     key: Key,
     params: TranslationParams = {},
   ): string {
-    return catalogue[key].replace(INTERPOLATION, (token, parameter: string) =>
-      Object.hasOwn(params, parameter) ? String(params[parameter]) : token,
-    );
+    return catalogue[key].replace(INTERPOLATION, (token, parameter: string) => {
+      if (Object.hasOwn(params, parameter)) return String(params[parameter]);
+      // JSON imports widen values to string, so TypeScript cannot infer their
+      // placeholders. Diagnose omissions without logging supplied values.
+      console.warn(`Missing translation parameter "${parameter}" for "${key}"`);
+      return token;
+    });
   };
 }
 

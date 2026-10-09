@@ -1,8 +1,9 @@
 import { test, expect } from '../fixtures/electron';
 import { realUserDataDir, fileSig } from '../fixtures/real-user-data';
 import { readUserConfig } from '../fixtures/user-config';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import path from 'path';
+import type { ElectronApplication } from '@playwright/test';
 
 /**
  * T2 - OpenAI-compatible cloud ASR config. Drives the real backend's
@@ -38,6 +39,13 @@ type StenoWindow = Window & {
 
 const getConfig = (page: import('@playwright/test').Page) =>
   page.evaluate(() => (window as StenoWindow).stenoai.openaiAsr.getConfig());
+
+async function expectEncryptedKey(app: ElectronApplication, userDataDir: string, expectedKey: string) {
+  const encrypted = readFileSync(path.join(userDataDir, '.openai-asr-api-key')).toString('base64');
+  const envelope = await app.evaluate(({ safeStorage }, bytes) =>
+    JSON.parse(safeStorage.decryptString(Buffer.from(bytes, 'base64'))), encrypted);
+  expect(envelope).toEqual({ version: 1, origin: 'https://api.openai.com', key: expectedKey });
+}
 
 test('non-secret openai-asr config (url/model) round-trips and persists to config.json', async ({
   launchApp,
@@ -126,6 +134,20 @@ test('openai-asr API key is stored encrypted (safeStorage), not in config.json',
   // ...and the plaintext key never appears in config.json.
   expect(JSON.stringify(readUserConfig(userDataDir))).not.toContain(SECRET);
 
+  // Introduce a legacy value after startup migration has completed, then
+  // rotate directly: success must not depend on a later settings refresh.
+  writeFileSync(path.join(userDataDir, 'config.json'), JSON.stringify({
+    ...readUserConfig(userDataDir),
+    openai_asr_api_key: 'legacy-synthetic-key',
+  }));
+  const rotation = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.openaiAsr.setKey('replacement-synthetic-key'),
+  );
+  expect(rotation.success).toBe(true);
+  expect(readUserConfig(userDataDir)).not.toHaveProperty('openai_asr_api_key');
+  await expectEncryptedKey(app, userDataDir, 'replacement-synthetic-key');
+  expect((await getConfig(page)).api_key_set).toBe(true);
+
   // A bearer token is scoped to the canonical endpoint origin. Changing the
   // provider must leave the encrypted blob inert until the user saves a key
   // for that new origin, never reusing Authorization across providers.
@@ -146,4 +168,22 @@ test('openai-asr API key is stored encrypted (safeStorage), not in config.json',
     .poll(() => existsSync(path.join(userDataDir, '.openai-asr-api-key')))
     .toBe(false);
   await expect.poll(async () => (await getConfig(page)).api_key_set).toBe(false);
+});
+
+test('legacy-only openai-asr API key rotates to a usable encrypted replacement', async ({ launchApp, userDataDir }) => {
+  const { app, page } = await launchApp();
+  test.skip(!await app.evaluate(({ safeStorage }) => safeStorage.isEncryptionAvailable()), 'safeStorage unavailable on this runner');
+  await getConfig(page);
+  expect(existsSync(path.join(userDataDir, '.openai-asr-api-key'))).toBe(false);
+  writeFileSync(path.join(userDataDir, 'config.json'), JSON.stringify({
+    ...readUserConfig(userDataDir),
+    openai_asr_api_key: 'legacy-only-synthetic-key',
+  }));
+  const result = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.openaiAsr.setKey('legacy-only-replacement-key'),
+  );
+  expect(result.success).toBe(true);
+  expect(readUserConfig(userDataDir)).not.toHaveProperty('openai_asr_api_key');
+  await expectEncryptedKey(app, userDataDir, 'legacy-only-replacement-key');
+  expect((await getConfig(page)).api_key_set).toBe(true);
 });
