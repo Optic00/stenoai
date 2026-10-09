@@ -66,6 +66,8 @@ async function releaseNoteSave(app: ElectronApplication, success: boolean) {
   }, success);
 }
 
+const routeHash = (page: Page): Promise<string> => page.evaluate(() => window.location.hash);
+
 async function openNote(page: Page) {
   await page.evaluate((f) => {
     window.location.hash = `#/meetings/${encodeURIComponent(f)}`;
@@ -452,12 +454,12 @@ test('leaving an edited note through the sidebar asks first (#447)', async ({ la
   await page.getByRole('button', { name: 'Keep editing' }).click();
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await expect(summary).toHaveValue('A draft worth keeping.');
-  await expect(page).toHaveURL(new RegExp(`#/meetings/${SUMMARY_FILE}`));
+  await expect.poll(() => routeHash(page)).toBe(`#/meetings/${encodeURIComponent(SUMMARY_FILE)}`);
 
   // Discard: the sidebar target is reached and nothing was written.
   await page.getByRole('button', { name: 'Chat', exact: true }).click();
   await page.getByRole('button', { name: 'Discard and leave' }).click();
-  await expect(page).toHaveURL(/#\/chat$/);
+  await expect.poll(() => routeHash(page)).toBe('#/chat');
   expect(await updateCalls(app)).toHaveLength(0);
 });
 
@@ -474,7 +476,7 @@ test('a deep link to another note asks before discarding the draft (#447)', asyn
   await emitMainEvent(app, 'navigate-to-meeting', { summaryFile: other });
   await expect(page.getByRole('dialog')).toContainText('Discard your note edits?');
   await page.getByRole('button', { name: 'Discard and leave' }).click();
-  await expect(page).toHaveURL(new RegExp(`#/meetings/${other}`));
+  await expect.poll(() => routeHash(page)).toBe(`#/meetings/${encodeURIComponent(other)}`);
 });
 
 test('an unchanged editor leaves through the sidebar without asking', async ({ launchApp }) => {
@@ -485,6 +487,18 @@ test('an unchanged editor leaves through the sidebar without asking', async ({ l
   await openNote(page);
   await page.getByRole('button', { name: 'Edit note' }).click();
   await page.getByRole('button', { name: 'Chat', exact: true }).click();
-  await expect(page).toHaveURL(/#\/chat$/);
+  await expect.poll(() => routeHash(page)).toBe('#/chat');
   await expect(page.getByRole('dialog')).toHaveCount(0);
+});
+
+test('Delete note is unavailable while the editor is open (#447)', async ({ launchApp }) => {
+  const { page } = await launchApp({
+    mockIpc: true,
+    env: { STENOAI_E2E_SEED_MEETING: '1', STENOAI_E2E_EDIT_MARKDOWN: '1' },
+  });
+  await openNote(page);
+  await page.getByRole('button', { name: 'Edit note' }).click();
+  await page.getByRole('textbox', { name: 'Summary', exact: true }).fill('A draft worth keeping.');
+  await page.getByRole('button', { name: 'More options' }).click();
+  await expect(page.getByRole('button', { name: 'Delete note' })).toBeDisabled();
 });

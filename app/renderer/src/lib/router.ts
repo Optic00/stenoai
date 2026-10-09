@@ -27,6 +27,11 @@ export function useRoute(): string {
 // surface having to know about the draft. The guard receives the target route
 // and returns false to stay; it is then responsible for asking the user and
 // calling navigate(target, { force: true }) if they choose to leave.
+//
+// A hash change that bypasses navigate() is not guarded. Today there is none:
+// nothing writes location.hash directly, and the app wires no history
+// back/forward (no menu role, shortcut, app-command or swipe). Adding such a
+// path must go through navigate() or extend this guard.
 type NavigationGuard = (target: string) => boolean;
 let navigationGuard: NavigationGuard | null = null;
 

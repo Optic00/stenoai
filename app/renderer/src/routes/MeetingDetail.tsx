@@ -1415,7 +1415,9 @@ function DetailContent({
                   type="button"
                   className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-[color:var(--surface-hover)] disabled:opacity-50"
                   style={{ color: 'var(--danger)' }}
-                  disabled={deleteMeeting.isPending}
+                  // Not while editing: delete is immediate, and the open
+                  // draft would either be lost or left on a deleted note.
+                  disabled={deleteMeeting.isPending || editing}
                   onClick={async () => {
                     setDeleteError(null);
                     try {
@@ -1426,7 +1428,9 @@ function DetailContent({
                       );
                       return;
                     }
-                    navigate('/');
+                    // The note is gone; leaving is the only sensible next step,
+                    // so it must not wait on the unsaved-edit guard.
+                    navigate('/', { force: true });
                   }}
                 >
                   <Trash2 className="size-[13px] shrink-0" />
