@@ -16,6 +16,9 @@ test('real org sign-in persists session + config into the temp dir, real dir unt
   launchApp,
   userDataDir,
 }) => {
+  // Above the 30 s default: the sign-in and the provider switch below each get
+  // up to 30 s, and a slow runner can need most of both (#570).
+  test.setTimeout(90_000);
   const realOrgSession = path.join(realUserDataDir(), '.org-session');
   const realConfig = path.join(realUserDataDir(), 'config.json');
   const realOrgSessionBefore = fileSig(realOrgSession);
