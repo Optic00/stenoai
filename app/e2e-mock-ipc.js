@@ -569,6 +569,15 @@ function install({ ipcMain }) {
     // undefined, making the renderer's bytesPerFrame NaN. Mirror the real
     // handler's shape (main.js start-linux-loopback) instead.
     'start-linux-loopback': async () => ({ success: true, sampleRate: 48000, channels: 2 }),
+    // A spec sets global.__holdNextOpenSystemAudioFile (via app.evaluate) to
+    // park a capture start mid-way, then calls global.__releaseOpenSystemAudioFile.
+    'open-system-audio-file': async () => {
+      if (!global.__holdNextOpenSystemAudioFile) return { success: true };
+      global.__holdNextOpenSystemAudioFile = false;
+      return new Promise((resolve) => {
+        global.__releaseOpenSystemAudioFile = () => resolve({ success: true });
+      });
+    },
     'start-recording-ui': async (_event, name, _trigger, appendTo) => {
       rec.active = true;
       rec.paused = false;
@@ -1552,6 +1561,14 @@ function install({ ipcMain }) {
   let slowUpdateStatusCallsLeft = process.env.STENOAI_E2E_SLOW_UPDATE_STATUS === '1' ? 1 : 0;
 
   const DEFAULTS = {
+    // STENOAI_E2E_PINNED_MIC_ID seeds a pinned microphone (Settings >
+    // Microphone) so a spec can drive useSystemAudioCapture's pinned-device
+    // fallback. Unset, it is "system default", as the permissive default was.
+    'get-microphone': () => ({
+      success: true,
+      device_id: process.env.STENOAI_E2E_PINNED_MIC_ID || null,
+      label: null,
+    }),
     'get-app-version': { success: true, version: process.env.STENOAI_E2E_APP_VERSION || '0.0.0-e2e', name: 'Steno' },
     // Read-only display poll for the About tab's "Check for Updates" button
     // (settings-about.t1). Fully hermetic — no real GitHub call under mock
@@ -1813,8 +1830,24 @@ function install({ ipcMain }) {
     chatData = data;
     return { success: true };
   };
+  // Send-channel log for the few fire-and-forget channels a spec needs to see
+  // with their arguments (__mockIpcCalls only records invoke()). Deliberately
+  // an allowlist: live-transcribe-chunk fires several times a second and has
+  // no business accumulating here. The real handler still runs.
+  const LOGGED_SENDS = new Set([
+    'live-transcribe-stop',
+    'recording-capture-error',
+    'system-audio-recording-state',
+  ]);
+  global.__mockIpcSends = [];
   const originalOn = ipcMain.on.bind(ipcMain);
   ipcMain.on = (channel, handler) => {
+    if (LOGGED_SENDS.has(channel)) {
+      return originalOn(channel, (event, ...args) => {
+        global.__mockIpcSends.push({ channel, args });
+        return handler(event, ...args);
+      });
+    }
     if (channel === 'chat-context-stream') {
       return originalOn(channel, (event, queryId, request) => {
         global.__mockIpcCalls.push({ channel, args: [queryId, request] });
