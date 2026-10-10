@@ -93,6 +93,7 @@ const {
   normalizeMarkdownForParsing,
 } = require('./note-sections');
 const { writeFileAtomicSync } = require('./atomic-write');
+const { createToastScheduler } = require('./toast-scheduler');
 const { readSnapshot, captureSnapshot, markEdited, editedFieldNames } = require('./note-snapshot');
 const {
   buildNoteReadyNotificationOptions,
@@ -413,14 +414,20 @@ class Notification extends EventEmitter {
     };
     if (options.iconType) this.payload.iconType = options.iconType;
     if (options.detail) this.payload.detail = options.detail;
+    // A persistent toast has no auto-close; it stays until acted on or closed
+    // from code, and comes back after a toast that interrupted it (#412).
+    this.persistent = Boolean(options.persistent);
+    // Toasts sharing a tag replace each other instead of queueing (#412).
+    this.tag = options.tag || null;
   }
 
   show() {
-    // Supersede any current toast (single-toast semantics).
-    if (notificationWindow && !notificationWindow.isDestroyed()) {
-      notificationWindow.close();
-    }
+    // One toast on screen at a time; later ones wait their turn (#412).
+    toastScheduler.show(this);
+  }
 
+  // Called by toastScheduler when it is this toast's turn.
+  _present() {
     const { screen } = require('electron');
     const primaryDisplay = screen.getPrimaryDisplay();
     const { width } = primaryDisplay.workAreaSize;
@@ -484,49 +491,72 @@ class Notification extends EventEmitter {
     // trackNotificationLifecycle's own click/dismiss bookkeeping.
     win._analyticsInteracted = false;
 
-    const rendererDist = path.join(__dirname, 'renderer', 'dist', 'index.html');
-    win.loadFile(rendererDist, { hash: '/notification' });
-
     let autoCloseTimer;
-    // Registered immediately (not inside ready-to-show) so a toast superseded
-    // BEFORE it finishes loading still emits 'close' and clears the module-level
-    // ref — the auto-close timer simply hasn't been armed yet in that case.
+    let readyTimer;
+    // Registered immediately (not inside ready-to-show) so a toast closed
+    // BEFORE it finishes loading still reaches the scheduler and clears the
+    // module-level ref; the auto-close timer simply hasn't been armed yet.
     win.on('closed', () => {
       if (autoCloseTimer) clearTimeout(autoCloseTimer);
-      this.emit('close');
+      if (readyTimer) clearTimeout(readyTimer);
       if (notificationWindow === win) notificationWindow = null;
+      // False when the window only closed to let another toast through; this
+      // toast is queued again and has not been dismissed.
+      const closedForGood = toastScheduler.windowClosed(this);
+      if (closedForGood) this.emit('close');
     });
 
+    // A window that never loads, or whose renderer dies before first paint,
+    // never fires ready-to-show. Close it, or every later toast would wait
+    // behind it.
+    const closeUnloaded = () => {
+      if (!win.isDestroyed()) win.close();
+    };
+    win.webContents.once('did-fail-load', closeUnloaded);
+    win.webContents.once('render-process-gone', closeUnloaded);
+    readyTimer = setTimeout(closeUnloaded, 10000);
+    const rendererDist = path.join(__dirname, 'renderer', 'dist', 'index.html');
+    win.loadFile(rendererDist, { hash: '/notification' }).catch(closeUnloaded);
+
     win.once('ready-to-show', () => {
+      clearTimeout(readyTimer);
       win.showInactive();
       win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
       win.setAlwaysOnTop(true, 'screen-saver', 1);
 
-      // Keep the 15s auto-close (matches the pre-existing pre-meeting toast).
-      autoCloseTimer = setTimeout(() => {
-        if (!win.isDestroyed()) win.close();
-      }, 15000);
+      // Keep the 15s auto-close (matches the pre-existing pre-meeting toast),
+      // except for a persistent toast.
+      if (!this.persistent) {
+        autoCloseTimer = setTimeout(() => {
+          if (!win.isDestroyed()) win.close();
+        }, 15000);
+      }
 
       win.webContents.send('show-notification', this.payload);
+      // Only now is the toast actually on screen; analytics count it here.
+      this.emit('show');
     });
   }
 
   close() {
-    // Only act if we're still the active toast — a superseded toast's window is
-    // already gone, so this is a harmless no-op in that case.
-    if (
-      notificationWindow &&
-      notificationWindow._activeCustomNotification === this &&
-      !notificationWindow.isDestroyed()
-    ) {
-      notificationWindow.close();
-    }
+    // A toast still waiting its turn is dropped without ever showing; the one
+    // on screen has its window closed, which emits 'close' via 'closed'.
+    if (toastScheduler.cancel(this) === 'removed') this.emit('close');
   }
 
   static isSupported() {
     return true;
   }
 }
+
+const toastScheduler = createToastScheduler({
+  present: (notif) => notif._present(),
+  dismissWindow: (notif) => {
+    if (notif._window && !notif._window.isDestroyed()) notif._window.close();
+  },
+  // Pushed out of a full queue without ever showing.
+  onDropped: (notif) => notif.emit('close'),
+});
 
 let pythonProcess;
 let tray = null;
@@ -1007,12 +1037,19 @@ ipcMain.on('track', (_event, eventName, properties) => {
 // click/action from an unclicked auto-dismiss/timeout.
 function trackNotificationLifecycle(notif, type, extraProps = {}) {
   let clicked = false;
+  let shown = false;
   const props = { type, ...extraProps };
-  trackEvent('notification_shown', props);
+  // Counted when the toast is actually on screen, once even if an interrupted
+  // persistent toast is presented again; a toast dropped from the queue was
+  // never shown and is neither shown nor dismissed (#412).
+  notif.once('show', () => {
+    shown = true;
+    trackEvent('notification_shown', props);
+  });
   notif.on('click', () => { clicked = true; trackEvent('notification_clicked', props); });
   notif.on('action', () => { clicked = true; trackEvent('notification_clicked', props); });
   notif.on('close', () => {
-    if (!clicked) trackEvent('notification_dismissed', props);
+    if (shown && !clicked) trackEvent('notification_dismissed', props);
   });
 }
 
@@ -6876,6 +6913,9 @@ function showSleepPausedNotification() {
     // The Resume action button is always rendered by the custom toast (both
     // platforms); the click handler below covers a body tap as well.
     actions: [{ type: 'button', text: 'Resume' }],
+    // The user is usually away when this fires, so it must still be there when
+    // they come back; closeSleepPausedNotification() removes it (#412).
+    persistent: true,
   });
   const resume = () => {
     sleepPausedNotif = null;
@@ -7722,6 +7762,9 @@ function showMeetingDetectedNotification(appName, originatingEvt, calEvent) {
     title: 'Meeting detected',
     body: calEvent?.title || appName,
     actions: [{ type: 'button', text: 'Take Notes' }],
+    // Only the latest detection is worth a tap; an older one waiting in the
+    // toast queue would offer to record a meeting that is already over.
+    tag: 'meeting-detected',
   });
   // Both the "Take Notes" button and the notification body start recording — one
   // action, so a single tap anywhere works.
@@ -7741,6 +7784,15 @@ function requestAutoRecord(appName, originatingEvt, calEvent) {
   // app-detection string (e.g. "an app — 2026-06-01 17:00") to the user
   // whenever title regeneration produced nothing.
   const sessionName = calEvent?.title || 'Note';
+  // A tap on a detection toast that is still on screen after a recording has
+  // started must not re-point auto-stop at another app's meeting.
+  // currentRecordingSessionName also covers a brief capture flap, during which
+  // systemAudioRecordingActive reads false while the recording is still live.
+  if (currentRecordingProcess || systemAudioRecordingActive || currentRecordingSessionName) {
+    sendDebugLog('[auto-detect] record request ignored: a recording is already running');
+    exposeMainWindow();
+    return;
+  }
   sendDebugLog(`[auto-detect] user requested record (calendar-titled: ${calEvent?.title ? 'yes' : 'no'})`);
 
   // Track the originating app so we can pair its mic-stop with this recording
@@ -12552,13 +12604,17 @@ async function firePreMeetingNotification(event) {
   // this 'close' fires, so reading the module-level var would attribute this
   // toast's dismissal to the NEXT toast's interaction flag — dropping or
   // duplicating the dismiss. The per-instance window keeps the flag correct.
+  let premeetingShown = false;
+  notif.once('show', () => {
+    premeetingShown = true;
+    trackEvent('notification_shown', { type: 'premeeting' });
+  });
   notif.on('close', () => {
-    if (!notif._window || !notif._window._analyticsInteracted) {
+    if (premeetingShown && (!notif._window || !notif._window._analyticsInteracted)) {
       trackEvent('notification_dismissed', { type: 'premeeting' });
     }
   });
   notif.show();
-  trackEvent('notification_shown', { type: 'premeeting' });
 
   // Mark fired only after we've actually shown it, so an unshowable notif
   // (no OS support) isn't permanently skipped by the scheduler's dedupe.
@@ -12570,8 +12626,14 @@ async function firePreMeetingNotification(event) {
 // Join/body tap, an action button, or the X). Flags _analyticsInteracted so the
 // pre-meeting path doesn't ALSO count a passive dismiss for the same toast, then
 // closes the window (which fires the notification's 'close' event).
-ipcMain.handle('close-notification-window', () => {
-  if (notificationWindow && !notificationWindow.isDestroyed()) {
+// Only the toast window itself may drive these; the sender check keeps another
+// renderer (the main window, a future one) from closing or clicking a toast.
+const fromToastWindow = (event) =>
+  notificationWindow && !notificationWindow.isDestroyed() &&
+  event.sender === notificationWindow.webContents;
+
+ipcMain.handle('close-notification-window', (event) => {
+  if (fromToastWindow(event)) {
     notificationWindow._analyticsInteracted = true;
     notificationWindow.close();
   }
@@ -12581,12 +12643,13 @@ ipcMain.handle('close-notification-window', () => {
 // toast. Re-emit as the notification's 'action' event (with the button index,
 // matching Electron's Notification 'action' signature) so the call site's
 // existing `.on('action', ...)` handler + trackNotificationLifecycle both fire.
-ipcMain.on('notification-action-clicked', (_event, { actionId, notifId } = {}) => {
-  if (notificationWindow && !notificationWindow.isDestroyed()) {
+ipcMain.on('notification-action-clicked', (event, { actionId, notifId } = {}) => {
+  if (fromToastWindow(event)) {
     const notif = notificationWindow._activeCustomNotification;
     if (notif && notif.payload.id === notifId) {
-      notificationWindow._analyticsInteracted = true;
       const index = notif.payload.actions.findIndex((a) => a.id === actionId);
+      if (index === -1) return;
+      notificationWindow._analyticsInteracted = true;
       notif.emit('action', {}, index);
     }
   }
@@ -12595,8 +12658,8 @@ ipcMain.on('notification-action-clicked', (_event, { actionId, notifId } = {}) =
 // Renderer → main: the body of the generic toast was tapped. Re-emit as the
 // notification's 'click' event so the call site's `.on('click', ...)` handler +
 // trackNotificationLifecycle both fire.
-ipcMain.on('notification-body-clicked', (_event, { notifId } = {}) => {
-  if (notificationWindow && !notificationWindow.isDestroyed()) {
+ipcMain.on('notification-body-clicked', (event, { notifId } = {}) => {
+  if (fromToastWindow(event)) {
     const notif = notificationWindow._activeCustomNotification;
     if (notif && notif.payload.id === notifId) {
       notificationWindow._analyticsInteracted = true;
