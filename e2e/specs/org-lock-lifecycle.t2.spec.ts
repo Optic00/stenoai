@@ -72,6 +72,14 @@ test('real org sign-in persists session + config into the temp dir, real dir unt
     // which wrote config.json into the same temp dir. Asserting the provider is
     // 'adapter' ties the write to the keystone path — it's the backend honoring
     // STENOAI_USER_DATA_DIR that produced this file, not a coincidental temp.
+    //
+    // The two waits are NOT sequential stages of one write. config.json is
+    // usually created first by an unrelated backend call (any CLI invocation's
+    // migrations lay down defaults, ai_provider 'local'), while the switch to
+    // 'adapter' is fire-and-forget and queued behind its own chain of backend
+    // cold starts (read provider, then set-ai-provider). On a slow CI runner
+    // (~2 s per PyInstaller cold start) it lands several seconds after the
+    // file appears, so it gets the same budget as the sign-in itself (#570).
     const tempConfig = path.join(userDataDir, 'config.json');
     await expect.poll(() => existsSync(tempConfig), { timeout: 15_000 }).toBe(true);
     await expect
@@ -81,7 +89,7 @@ test('real org sign-in persists session + config into the temp dir, real dir unt
         } catch {
           return undefined;
         }
-      }, { timeout: 5_000 })
+      }, { timeout: 30_000 })
       .toBe('adapter');
 
     // The real user-data dir's keystone files are byte-for-byte untouched.
