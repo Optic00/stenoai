@@ -93,7 +93,7 @@ const {
   normalizeMarkdownForParsing,
 } = require('./note-sections');
 const { writeFileAtomicSync } = require('./atomic-write');
-const { createToastScheduler } = require('./toast-scheduler');
+const { createToastScheduler, toastLayering } = require('./toast-scheduler');
 const { readSnapshot, captureSnapshot, markEdited, editedFieldNames } = require('./note-snapshot');
 const {
   buildNoteReadyNotificationOptions,
@@ -394,6 +394,12 @@ let notificationWindow;
 // macOS-only but are harmlessly ignored on Windows. This is the exact window
 // config the pre-meeting toast already shipped with on both platforms, so
 // there's no new platform-specific surface to gate.
+//
+// Keyboard: the toast is deliberately never focusable, like the OS's own
+// banners, so it cannot steal focus from whatever the user is typing in. Every
+// toast action has a keyboard path elsewhere: Resume in the main window and the
+// tray menu, Take Notes via the record shortcut or tray, Summarise in the note
+// (#412).
 const { EventEmitter } = require('events');
 
 class Notification extends EventEmitter {
@@ -429,9 +435,11 @@ class Notification extends EventEmitter {
   // Called by toastScheduler when it is this toast's turn.
   _present() {
     const { screen } = require('electron');
-    const primaryDisplay = screen.getPrimaryDisplay();
-    const { width } = primaryDisplay.workAreaSize;
-    const { x, y } = primaryDisplay.workArea;
+    // The display the user is looking at, not always the primary one: someone
+    // presenting on an external monitor would otherwise never see it (#412).
+    const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    const { width } = display.workAreaSize;
+    const { x, y } = display.workArea;
 
     // Capture the window in a local `win` so the ready-to-show / closed
     // closures below always reference THIS toast's window — never a later one
@@ -521,8 +529,11 @@ class Notification extends EventEmitter {
     win.once('ready-to-show', () => {
       clearTimeout(readyTimer);
       win.showInactive();
-      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-      win.setAlwaysOnTop(true, 'screen-saver', 1);
+      // Only a persistent toast may cover a fullscreen app; see toastLayering.
+      // A persistent toast is still there after the user leaves fullscreen.
+      const layering = toastLayering(this);
+      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: layering.visibleOnFullScreen });
+      win.setAlwaysOnTop(true, layering.level, 1);
 
       // Keep the 15s auto-close (matches the pre-existing pre-meeting toast),
       // except for a persistent toast.
@@ -1873,6 +1884,18 @@ function updateTrayMenu() {
       label: 'Open StenoAI',
       click: showAndFocusWindow
     },
+    // A keyboard-reachable Resume for a paused recording: the "Recording
+    // paused" toast is never focusable (#412). Same renderer path as its button.
+    ...(isRecording && recordingRuntimeState.isPaused
+      ? [{
+          label: 'Resume Recording',
+          click: () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('auto-resume-requested');
+            }
+          },
+        }]
+      : []),
     {
       label: isRecording ? 'Stop Recording' : 'Start Recording',
       click: () => {
@@ -6000,6 +6023,7 @@ function markRecordingPaused() {
   }
   recordingRuntimeState.isPaused = true;
   recordingRuntimeState.pausedAtMs = Date.now();
+  updateTrayMenu(); // offers Resume Recording
 }
 
 function markRecordingResumed() {
@@ -6011,6 +6035,7 @@ function markRecordingResumed() {
   }
   recordingRuntimeState.isPaused = false;
   recordingRuntimeState.pausedAtMs = null;
+  updateTrayMenu();
 }
 
 function getRecordingElapsedSeconds() {
@@ -6924,7 +6949,7 @@ function showSleepPausedNotification() {
       mainWindow.webContents.send('auto-resume-requested');
     }
   };
-  notif.on('action', (_evt, _index) => resume());
+  notif.on('action', () => resume());
   notif.on('click', resume);
   trackNotificationLifecycle(notif, 'sleep_paused');
   notif.show();
@@ -7769,7 +7794,7 @@ function showMeetingDetectedNotification(appName, originatingEvt, calEvent) {
   // Both the "Take Notes" button and the notification body start recording — one
   // action, so a single tap anywhere works.
   const trigger = () => requestAutoRecord(appName, originatingEvt, calEvent);
-  notif.on('action', (_evt, _index) => trigger()); // shown when banner style = Alerts
+  notif.on('action', () => trigger()); // shown when banner style = Alerts
   notif.on('click', () => trigger());              // body tap (always available)
   trackNotificationLifecycle(notif, 'meeting_detected');
   notif.show();
@@ -12640,8 +12665,8 @@ ipcMain.handle('close-notification-window', (event) => {
 });
 
 // Renderer → main: an action button was tapped on the generic (non-pre-meeting)
-// toast. Re-emit as the notification's 'action' event (with the button index,
-// matching Electron's Notification 'action' signature) so the call site's
+// toast. Re-emit as the notification's 'action' event (the button index on
+// details.actionIndex, matching Electron's Notification 'action' event) so the call site's
 // existing `.on('action', ...)` handler + trackNotificationLifecycle both fire.
 ipcMain.on('notification-action-clicked', (event, { actionId, notifId } = {}) => {
   if (fromToastWindow(event)) {
@@ -12650,7 +12675,9 @@ ipcMain.on('notification-action-clicked', (event, { actionId, notifId } = {}) =>
       const index = notif.payload.actions.findIndex((a) => a.id === actionId);
       if (index === -1) return;
       notificationWindow._analyticsInteracted = true;
-      notif.emit('action', {}, index);
+      // Electron 42 shape: the index lives on details.actionIndex; the old
+      // positional index argument is deprecated (#412).
+      notif.emit('action', { actionIndex: index });
     }
   }
 });
