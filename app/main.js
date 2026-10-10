@@ -532,7 +532,10 @@ class Notification extends EventEmitter {
       // Only a persistent toast may cover a fullscreen app; see toastLayering.
       // A persistent toast is still there after the user leaves fullscreen.
       const layering = toastLayering(this);
-      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: layering.visibleOnFullScreen });
+      win.setVisibleOnAllWorkspaces(true, {
+        visibleOnFullScreen: layering.visibleOnFullScreen,
+        skipTransformProcessType: layering.skipTransformProcessType,
+      });
       win.setAlwaysOnTop(true, layering.level, 1);
 
       // Keep the 15s auto-close (matches the pre-existing pre-meeting toast),

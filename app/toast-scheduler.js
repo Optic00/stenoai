@@ -142,13 +142,20 @@ function createToastScheduler({ present, dismissWindow, onDropped = () => {}, ma
  * read macOS Focus or Windows Do Not Disturb, so this is the closest respect we
  * can give it. Both settings only take effect on macOS.
  *
+ * skipTransformProcessType: without it, Electron switches the macOS process
+ * type on every setVisibleOnAllWorkspaces call, which shows or hides the Dock
+ * icon behind the user's "Hide Dock icon" setting. Only covering fullscreen
+ * needs that switch, so an ordinary toast skips it and leaves the Dock alone;
+ * the persistent toast keeps the behaviour it has always had.
+ *
  * @param {{ persistent?: boolean }} toast
- * @returns {{ visibleOnFullScreen: boolean, level: 'screen-saver' | 'floating' }}
+ * @returns {{ visibleOnFullScreen: boolean, skipTransformProcessType: boolean,
+ *   level: 'screen-saver' | 'floating' }}
  */
 function toastLayering({ persistent } = {}) {
   return persistent
-    ? { visibleOnFullScreen: true, level: 'screen-saver' }
-    : { visibleOnFullScreen: false, level: 'floating' };
+    ? { visibleOnFullScreen: true, skipTransformProcessType: false, level: 'screen-saver' }
+    : { visibleOnFullScreen: false, skipTransformProcessType: true, level: 'floating' };
 }
 
 module.exports = { createToastScheduler, toastLayering };
