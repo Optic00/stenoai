@@ -12617,6 +12617,9 @@ async function firePreMeetingNotification(event) {
     ? new Date(event.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : '';
   notif.payload.meeting_url = event.meeting_url;
+  // The calendar's own colour for the accent bar; the toast stays neutral
+  // without one (#412).
+  if (event.color) notif.payload.color = event.color;
   notif.payload.attendees = event.attendees
     ? event.attendees.map((a) => a.name || a.email).join(', ')
     : '';
