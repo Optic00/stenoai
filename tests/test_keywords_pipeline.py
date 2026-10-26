@@ -22,7 +22,10 @@ def _reset_config():
 class _ConfigTempDirMixin(unittest.TestCase):
     def setUp(self):
         self._orig_dd = os.environ.get("STENOAI_USER_DATA_DIR")
-        self._tmp = tempfile.mkdtemp()
+        from src import config as _config
+        self._orig_config = _config._config_instance
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._tmp = self._tmpdir.name
         os.environ["STENOAI_USER_DATA_DIR"] = self._tmp
         _reset_config()
 
@@ -31,7 +34,9 @@ class _ConfigTempDirMixin(unittest.TestCase):
             os.environ["STENOAI_USER_DATA_DIR"] = self._orig_dd
         else:
             os.environ.pop("STENOAI_USER_DATA_DIR", None)
-        _reset_config()
+        from src import config as _config
+        _config._config_instance = self._orig_config
+        self._tmpdir.cleanup()
 
 
 class SilenceSentinelHealingGuardTests(_ConfigTempDirMixin):

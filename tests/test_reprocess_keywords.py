@@ -27,10 +27,12 @@ class A2ReprocessTests(unittest.TestCase):
 
     def setUp(self):
         self._orig_dd = os.environ.get("STENOAI_USER_DATA_DIR")
-        self._tmp = tempfile.mkdtemp()
+        from src import config as _config
+        self._orig_config = _config._config_instance
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._tmp = self._tmpdir.name
         os.environ["STENOAI_USER_DATA_DIR"] = self._tmp
         # Fresh config bound to the temp data dir.
-        from src import config as _config
         _config._config_instance = None
         from src.config import get_config
         get_config().set_custom_keywords(
@@ -43,7 +45,8 @@ class A2ReprocessTests(unittest.TestCase):
         else:
             os.environ.pop("STENOAI_USER_DATA_DIR", None)
         from src import config as _config
-        _config._config_instance = None
+        _config._config_instance = self._orig_config
+        self._tmpdir.cleanup()
 
     def _run_reprocess(self, summary_path):
         # Patch the whole OllamaSummarizer class so __init__ never runs (no real
