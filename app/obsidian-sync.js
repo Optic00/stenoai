@@ -362,18 +362,18 @@ function registerObsidianSync({
     return b.endsWith(SUMMARY_SUFFIX) ? b.slice(0, -SUMMARY_SUFFIX.length) : null;
   }
 
-  // A vault file counts as "externally edited" when its current bytes differ
-  // from what we recorded writing. First-ever write (no entry) is never a conflict.
+  // A vault file is externally edited only when its readable bytes differ from
+  // what we wrote. An unreadable file must still be preserved, but cannot
+  // justify a permanent fork claiming the user edited it.
   function isExternallyEdited(absVaultPath, entry) {
     if (!entry) return false;
     try {
       const cur = sha256(retryTransientRead(() => fs.readFileSync(absVaultPath)));
       return cur !== entry.lastWrittenHash;
     } catch (err) {
-      // A missing file is safe to recreate. Any other read failure is not proof
-      // that the tracked file is unchanged: Windows search/AV can briefly lock
-      // a recently edited note. Preserve rather than risk clobbering it.
-      return !(err && err.code === 'ENOENT');
+      // A missing file is safe to recreate. Preserve any other unreadable file
+      // until a later sync can compare its bytes.
+      return err && err.code === 'ENOENT' ? false : 'unreadable';
     }
   }
 
@@ -522,8 +522,11 @@ function registerObsidianSync({
       // the fresh content is about to be written regardless.
       if (entry && entry.vaultRelPath !== vaultRelPath) {
         const absOld = path.join(cached.vaultPath, entry.vaultRelPath);
-        if (isExternallyEdited(absOld, entry)) {
-          if (onConflict === 'fork') return forkExternallyEdited(entry.vaultRelPath);
+        const oldFileState = isExternallyEdited(absOld, entry);
+        if (oldFileState) {
+          if (onConflict === 'fork' && oldFileState === true) {
+            return forkExternallyEdited(entry.vaultRelPath);
+          }
           recordConflict(idx, stem, entry.vaultRelPath, 'external-edit');
           if (ownIdx) saveIndex(idx);
           return { status: 'conflict' };
@@ -542,7 +545,6 @@ function registerObsidianSync({
         // hash path so a no-op needs only one vault read.
         if (!err || err.code !== 'ENOENT') {
           if (entry && entry.vaultRelPath === vaultRelPath) {
-            if (onConflict === 'fork') return forkExternallyEdited(vaultRelPath);
             recordConflict(idx, stem, vaultRelPath, 'external-edit');
             if (ownIdx) saveIndex(idx);
             return { status: 'conflict' };

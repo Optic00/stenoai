@@ -438,14 +438,15 @@ test('persistent ownership-index read errors fail closed without changing vault 
   }
 });
 
-test('a persistently locked vault read forks without a long retry', (t) => {
+test('a persistently locked tracked vault file stays tracked without a false fork', (t) => {
   const h = harness();
   t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 
   h.writeNote('n1', NOTE);
   h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
   const original = path.join(h.vault, 'Sales', '2026-07-15 Acme Q3 Planning.md');
-  fs.writeFileSync(original, 'HAND-EDITED IN OBSIDIAN');
+  const originalBytes = fs.readFileSync(original, 'utf8');
+  const originalRelPath = h.eng.loadIndex().notes.n1.vaultRelPath;
   h.writeNote('n1', NOTE.replace('Ship the pricing page Friday.', 'Ship the pricing page Thursday.'));
 
   const readFileSync = fs.readFileSync;
@@ -468,24 +469,27 @@ test('a persistently locked vault read forks without a long retry', (t) => {
   }
   const elapsedMs = Date.now() - startedAt;
 
-  assert.equal(result.status, 'forked');
+  assert.equal(result.status, 'conflict');
   assert.ok(elapsedMs < 250, `persistent read lock blocked for ${elapsedMs}ms`);
   assert.equal(reads, 3, 'one attempt plus the two bounded retries');
-  assert.equal(fs.readFileSync(original, 'utf8'), 'HAND-EDITED IN OBSIDIAN');
-  assert.match(
-    fs.readFileSync(path.join(h.vault, result.vaultRelPath), 'utf8'),
-    /Ship the pricing page Thursday\./,
-  );
+  assert.equal(fs.readFileSync(original, 'utf8'), originalBytes);
+  assert.deepEqual(fs.readdirSync(path.dirname(original)), [path.basename(original)]);
+  assert.equal(h.eng.loadIndex().notes.n1.vaultRelPath, originalRelPath);
+  assert.equal(h.eng.loadIndex().conflicts.n1.reason, 'external-edit');
+  assert.equal(h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'), { onConflict: 'fork' }).status,
+    'synced', 'retry succeeds after lock release');
+  assert.equal(h.eng.loadIndex().conflicts.n1, undefined);
 });
 
-test('an access-denied vault read forks without retrying', (t) => {
+test('an access-denied tracked vault file is preserved without a false fork', (t) => {
   const h = harness();
   t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 
   h.writeNote('n1', NOTE);
   h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
   const original = path.join(h.vault, 'Sales', '2026-07-15 Acme Q3 Planning.md');
-  fs.writeFileSync(original, 'HAND-EDITED IN OBSIDIAN');
+  const originalBytes = fs.readFileSync(original, 'utf8');
+  const originalRelPath = h.eng.loadIndex().notes.n1.vaultRelPath;
   h.writeNote('n1', NOTE.replace('Ship the pricing page Friday.', 'Ship the pricing page Thursday.'));
 
   const readFileSync = fs.readFileSync;
@@ -506,13 +510,58 @@ test('an access-denied vault read forks without retrying', (t) => {
     fs.readFileSync = readFileSync;
   }
 
-  assert.equal(result.status, 'forked');
+  assert.equal(result.status, 'conflict');
   assert.equal(reads, 1);
-  assert.equal(fs.readFileSync(original, 'utf8'), 'HAND-EDITED IN OBSIDIAN');
-  assert.match(
-    fs.readFileSync(path.join(h.vault, result.vaultRelPath), 'utf8'),
-    /Ship the pricing page Thursday\./,
-  );
+  assert.equal(fs.readFileSync(original, 'utf8'), originalBytes);
+  assert.deepEqual(fs.readdirSync(path.dirname(original)), [path.basename(original)]);
+  assert.equal(h.eng.loadIndex().notes.n1.vaultRelPath, originalRelPath);
+  assert.equal(h.eng.loadIndex().conflicts.n1.reason, 'external-edit');
+  assert.equal(h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'), { onConflict: 'fork' }).status,
+    'synced', 'retry succeeds after permission returns');
+  assert.equal(h.eng.loadIndex().conflicts.n1, undefined);
+});
+
+test('a locked old-name vault file cannot trigger a false fork during rename', (t) => {
+  for (const code of ['EBUSY', 'EPERM']) {
+    const h = harness();
+    t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+    h.writeNote('n1', NOTE);
+    h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'));
+    const original = path.join(h.vault, 'Sales', '2026-07-15 Acme Q3 Planning.md');
+    const originalBytes = fs.readFileSync(original, 'utf8');
+    const originalRelPath = h.eng.loadIndex().notes.n1.vaultRelPath;
+    h.writeNote('n1', NOTE.replace('Acme Q3 Planning', 'Acme Renamed'));
+
+    const readFileSync = fs.readFileSync;
+    let reads = 0;
+    fs.readFileSync = function patchedReadFileSync(filePath, ...args) {
+      if (filePath === original) {
+        reads += 1;
+        const error = new Error(`temporarily locked (${code})`);
+        error.code = code;
+        throw error;
+      }
+      return readFileSync.call(this, filePath, ...args);
+    };
+    let result;
+    try {
+      result = h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'), { onConflict: 'fork' });
+    } finally {
+      fs.readFileSync = readFileSync;
+    }
+
+    assert.equal(result.status, 'conflict', code);
+    assert.equal(reads, 3, code);
+    assert.equal(fs.readFileSync(original, 'utf8'), originalBytes, code);
+    assert.deepEqual(fs.readdirSync(path.dirname(original)), [path.basename(original)], code);
+    assert.equal(h.eng.loadIndex().notes.n1.vaultRelPath, originalRelPath, code);
+    assert.equal(h.eng.loadIndex().conflicts.n1.reason, 'external-edit', code);
+
+    assert.equal(h.eng.syncNoteBySummaryPath(path.join(h.output, 'n1_summary.md'), { onConflict: 'fork' }).status,
+      'synced', `${code}: retry after lock release`);
+    assert.equal(h.eng.loadIndex().conflicts.n1, undefined, code);
+    assert.deepEqual(fs.readdirSync(path.dirname(original)), ['2026-07-15 Acme Renamed.md'], code);
+  }
 });
 
 test('repeated reprocess conflicts retain every preserved copy in the ledger', (t) => {
