@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { FileAudio, MessageSquare, MoreHorizontal, Monitor, PanelLeftClose, PanelLeftOpen, PencilLine } from 'lucide-react';
+import { FileArchive, FileAudio, MessageSquare, MoreHorizontal, Monitor, PanelLeftClose, PanelLeftOpen, Plus } from 'lucide-react';
 import type { UseMutationResult } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -9,15 +9,18 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import {
   useSetSystemAudio,
   useSystemAudioSetting,
   useSystemAudioSupport,
 } from '@/hooks/useSettings';
-import type { RecordingStatus } from '@/hooks/useRecording';
+import { useRecording, type RecordingStatus } from '@/hooks/useRecording';
 import { useImportAudio } from '@/hooks/useImportAudio';
 import { useRoute, navigate } from '@/lib/router';
 import { cn, isMac } from '@/lib/utils';
+import { MEETING_TRANSFER_COPY, useImportMeetingPackage } from '@/hooks/useMeetingTransfer';
+import { t } from '@/i18n';
 
 interface MainToolbarProps {
   recordingStatus: RecordingStatus;
@@ -78,26 +81,32 @@ export function MainToolbar({
             Settings — SettingsNav is non-collapsible, so there's nothing for
             it to toggle. */}
         {!settingsMode && (
-          <button
-            type="button"
-            onClick={onToggleSidebar}
-            aria-label={sidebarCollapsed ? 'Show sidebar' : 'Hide sidebar'}
-            title={sidebarCollapsed ? 'Show sidebar' : 'Hide sidebar'}
-            style={{
-              position: 'fixed',
-              top: 14,
-              left: toggleLeft,
-              zIndex: 30,
-              WebkitAppRegion: 'no-drag',
-            } as React.CSSProperties}
-            className="inline-flex h-[26px] w-7 items-center justify-center rounded-md text-[color:var(--fg-2)] transition-colors hover:bg-[color:var(--surface-hover)] hover:text-[color:var(--fg-1)]"
-          >
-            {sidebarCollapsed ? (
-              <PanelLeftOpen className="size-[15px]" />
-            ) : (
-              <PanelLeftClose className="size-[15px]" />
-            )}
-          </button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={onToggleSidebar}
+                aria-label={sidebarCollapsed ? t('toolbar.showSidebar') : t('toolbar.hideSidebar')}
+                style={{
+                  position: 'fixed',
+                  top: 14,
+                  left: toggleLeft,
+                  zIndex: 30,
+                  WebkitAppRegion: 'no-drag',
+                } as React.CSSProperties}
+                className="inline-flex h-[26px] w-7 items-center justify-center rounded-md text-[color:var(--fg-2)] transition-colors hover:bg-[color:var(--surface-hover)] hover:text-[color:var(--fg-1)]"
+              >
+                {sidebarCollapsed ? (
+                  <PanelLeftOpen className="size-[15px]" />
+                ) : (
+                  <PanelLeftClose className="size-[15px]" />
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {sidebarCollapsed ? t('toolbar.showSidebar') : t('toolbar.hideSidebar')}
+            </TooltipContent>
+          </Tooltip>
         )}
         {/* Starting a new recording with options isn't a Settings action. */}
         {!settingsMode && (
@@ -114,17 +123,17 @@ export function MainToolbar({
             className={cn('record-btn', isRecording && 'is-recording')}
             aria-label={
               isRecording
-                ? 'Open recording in progress'
+                ? t('toolbar.openRecordingProgress')
                 : showChatPrimary
-                  ? 'New chat'
-                  : 'New note'
+                  ? t('toolbar.newChat')
+                  : t('toolbar.newNote')
             }
             title={
               isRecording
-                ? 'Open recording in progress'
+                ? t('toolbar.openRecordingProgress')
                 : showChatPrimary
-                  ? 'New chat'
-                  : 'New note'
+                  ? t('toolbar.newChat')
+                  : t('toolbar.newNote')
             }
           >
             {isRecording ? (
@@ -145,17 +154,17 @@ export function MainToolbar({
                 >
                   {formatElapsed(elapsedSeconds)}
                 </span>
-                <span>{isPaused ? 'Paused' : 'Recording'}</span>
+                <span>{isPaused ? t('toolbar.paused') : t('toolbar.recording')}</span>
               </>
             ) : showChatPrimary ? (
               <>
                 <MessageSquare className="size-[13px]" />
-                New chat
+                {t('toolbar.newChat')}
               </>
             ) : (
               <>
-                <PencilLine className="size-[13px]" />
-                New note
+                <Plus className="size-[13px]" />
+                {t('toolbar.newNote')}
               </>
             )}
           </button>
@@ -177,35 +186,43 @@ function RecordingOptionsPopover({
   const systemAudioSupport = useSystemAudioSupport();
   // macOS default is on (system_audio_enabled defaults true on darwin).
   const enabled = systemAudio.data ?? true;
-  // macOS only: the toggle chooses mic-only vs mic+system. On Windows the
-  // product decision is always mic+system, so the toggle is hidden (the
-  // renderer forces loopback on there). Also hidden while support is loading
-  // or on a Mac without loopback support (pre-14.4).
+  // macOS only: the toggle chooses mic-only vs mic+system. On Windows and
+  // Linux the product decision is always mic+system, so the toggle is hidden
+  // (the renderer forces loopback on there). Also hidden while support is
+  // loading or on a Mac without loopback support (pre-14.4).
   const showSystemAudio = isMac && systemAudioSupport.data?.supported === true;
   // Controlled so the import action can close the popover when it fires — the
   // import's progress then shows as a processing row in the meeting list,
   // not in this (now closed) popover.
   const [open, setOpen] = React.useState(false);
+  const importMeeting = useImportMeetingPackage();
+  const recording = useRecording();
+  const transferBlocked = disabled || recording.isLoading || recording.status !== 'idle'
+    || recording.reprocessingSummaryFiles.size > 0;
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-8"
-          aria-label="Recording options"
-          title="Recording options"
-        >
-          <MoreHorizontal className="size-4" />
-        </Button>
-      </PopoverTrigger>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <PopoverTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8"
+              aria-label={t('toolbar.recordingOptions')}
+            >
+              <MoreHorizontal className="size-4" />
+            </Button>
+          </PopoverTrigger>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">{t('toolbar.recordingOptions')}</TooltipContent>
+      </Tooltip>
       <PopoverContent align="end" className="w-72" data-recording-options>
         <div className="space-y-3">
           <div className="space-y-0.5">
-            <p className="text-sm font-medium">Recording options</p>
+            <p className="text-sm font-medium">{t('toolbar.recordingOptions')}</p>
             <p className="text-xs text-muted-foreground">
-              Deep links and the tray menu also start and stop recording.
+              {t('toolbar.recordingOptions.deepLinksNote')}
             </p>
           </div>
 
@@ -221,7 +238,7 @@ function RecordingOptionsPopover({
                     htmlFor="maintoolbar-system-audio"
                     className="text-sm font-medium"
                   >
-                    Record system audio
+                    {t('toolbar.recordSystemAudio')}
                   </label>
                   <Switch
                     id="maintoolbar-system-audio"
@@ -231,7 +248,7 @@ function RecordingOptionsPopover({
                   />
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Capture both sides of calls. Turn off to record your mic only.
+                  {t('toolbar.recordSystemAudio.hint')}
                 </p>
               </div>
             </div>
@@ -249,14 +266,36 @@ function RecordingOptionsPopover({
           >
             <FileAudio className="mt-0.5 size-4 flex-shrink-0 text-muted-foreground" />
             <div className="flex-1 space-y-0.5">
-              <p className="text-sm font-medium">Import audio file…</p>
+              <p className="text-sm font-medium">{t('toolbar.importAudioFile')}</p>
               <p className="text-xs text-muted-foreground">
                 {disabled
-                  ? 'Stop the current recording to import a file.'
-                  : 'Transcribe and summarise an existing recording. It will appear in the list while it processes.'}
+                  ? t('toolbar.importAudio.disabledHint')
+                  : t('toolbar.importAudio.hint')}
               </p>
             </div>
           </button>
+          {isMac && (
+            <button
+              type="button"
+              disabled={transferBlocked || importMeeting.isPending}
+              onClick={() => {
+                setOpen(false);
+                importMeeting.mutate(undefined);
+              }}
+              className="flex w-full items-start gap-3 rounded-md border p-3 text-left transition-colors hover:bg-[color:var(--surface-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+              style={{ borderColor: 'var(--border-subtle)' }}
+            >
+              <FileArchive className="mt-0.5 size-4 flex-shrink-0 text-muted-foreground" />
+              <div className="flex-1 space-y-0.5">
+                <p className="text-sm font-medium">{MEETING_TRANSFER_COPY.importAction}</p>
+                <p className="text-xs text-muted-foreground">
+                  {transferBlocked
+                    ? MEETING_TRANSFER_COPY.importBlocked
+                    : MEETING_TRANSFER_COPY.importDescription}
+                </p>
+              </div>
+            </button>
+          )}
         </div>
       </PopoverContent>
     </Popover>

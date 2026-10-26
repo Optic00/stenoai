@@ -348,16 +348,13 @@
     transition: background var(--dur-fast) var(--ease);
     line-height: 1.3;
   }
-  .sb-row:hover { background: var(--surface-hover); }
+  /* --surface-active, not --surface-hover: sb-row sits on the sidebar's
+     --surface-sunken background, which equals --surface-hover in light mode
+     (both --paper-1) — that hover would be invisible. */
+  .sb-row:hover { background: var(--surface-active); }
   .sb-row.active {
-    background: var(--surface-raised);
-    box-shadow: 0 1px 2px rgba(27,27,25,0.04), 0 0 0 1px var(--border-subtle);
+    background: var(--surface-active);
     font-weight: 500;
-  }
-  .dark .sb-row.active,
-  [data-theme="dark"] .sb-row.active {
-    background: var(--surface-raised);
-    box-shadow: 0 0 0 1px var(--border-subtle);
   }
   .sb-row svg { color: var(--fg-2); flex-shrink: 0; }
   .sb-row.active svg { color: var(--fg-1); }
@@ -591,6 +588,21 @@
     to   { opacity: 1; transform: translateY(0) scale(1); }
   }
 
+  /* One bubble in the live transcript. The panel is a 200px viewport onto a
+     list that grows for the whole meeting, so the great majority of rows are
+     scrolled out of sight - content-visibility lets the browser skip their
+     style, layout and paint while a partial arrives up to ~5x a second.
+     `contain-intrinsic-size: auto` reserves a plausible height for a row that
+     has never been rendered and remembers the real one afterwards, which keeps
+     the scrollbar and the scroll-to-bottom honest. */
+  .live-row {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 44px;
+  }
+
+  /* Not itself clickable — only the copy/minimize buttons inside are, via
+     .mv-chat-tool's own hover. No cursor/hover here so the row doesn't imply
+     the whole header is a click target. */
   .mv-transcript-head {
     display: flex;
     align-items: center;
@@ -599,13 +611,10 @@
     width: 100%;
     background: transparent;
     border: 0;
-    cursor: pointer;
     font-family: var(--font-sans);
     text-align: left;
     color: var(--fg-1);
-    transition: background var(--dur-fast) var(--ease);
   }
-  .mv-transcript-head:hover { background: var(--surface-hover); }
 
   .mv-transcript-label {
     flex: 1;
@@ -808,3 +817,25 @@
     margin: 1em 0;
   }
 }
+
+/* Chat uses semantic Markdown too: list counters belong to the enclosing ol,
+   including loose and nested items. Keep the existing compact bubble rhythm. */
+.chat-markdown p { margin: 0.375rem 0; }
+.chat-markdown ul, .chat-markdown ol { margin: 0.375rem 0; padding-left: 1.25rem; }
+.chat-markdown ul { list-style: disc; }
+.chat-markdown ol { list-style: decimal; }
+.chat-markdown li { margin: 0.125rem 0; }
+.chat-markdown h1, .chat-markdown h2, .chat-markdown h3,
+.chat-markdown h4, .chat-markdown h5, .chat-markdown h6 {
+  margin: 0.75rem 0 0.375rem; font-size: 1em; font-weight: 600;
+}
+.chat-markdown pre { overflow-x: auto; padding: 0.75rem; margin: 0.5rem 0; border-radius: 6px; background: var(--surface-active); }
+.chat-markdown code { font-family: var(--font-mono); font-size: 0.9em; background: var(--surface-active); border-radius: 3px; padding: 0.1em 0.25em; }
+.chat-markdown pre code { padding: 0; }
+.chat-markdown table { display: block; overflow-x: auto; border-collapse: collapse; margin: 0.5rem 0; }
+.chat-markdown th, .chat-markdown td { padding: 0.375rem 0.625rem; border-bottom: 1px solid var(--border-subtle); }
+.chat-markdown th { font-weight: 600; }
+.chat-markdown a { text-decoration: underline; }
+.chat-markdown blockquote { border-left: 2px solid var(--border-subtle); padding-left: 0.75rem; color: var(--fg-2); }
+.chat-markdown > :first-child { margin-top: 0; }
+.chat-markdown > :last-child { margin-bottom: 0; }

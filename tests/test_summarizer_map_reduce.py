@@ -8,8 +8,20 @@ from src.summarizer import OllamaSummarizer, MAP_PROMPT_OVERHEAD_TOKENS, MAP_OUT
 
 
 def _make_summarizer(model_name="llama3.2:3b"):
+    # __init__ calls _ensure_ollama_ready() for the local provider -- without
+    # mocking it, construction hits the REAL local Ollama server and, if the
+    # model isn't installed, triggers a REAL multi-GB `ollama pull` (this was
+    # a live bug: every test in this file did exactly that on any machine
+    # with Ollama actually running, e.g. via ollama.list()/.pull() in
+    # src.summarizer._ensure_model_available). Mirrors the correct pattern
+    # already used in test_summarizer_template.py's _s() helper.
     cfg = Config()
-    return OllamaSummarizer(model_name=model_name, ai_provider="local", config=cfg)
+    # Patch out the Ollama readiness/start check during construction — these are
+    # unit tests for pure helpers (chunk budget, split, prompt build) and must
+    # not depend on a live Ollama server. Matches the pattern the sibling
+    # summarizer test modules already use, and keeps the suite hermetic in CI.
+    with mock.patch.object(OllamaSummarizer, "_ensure_ollama_ready"):
+        return OllamaSummarizer(model_name=model_name, ai_provider="local", config=cfg)
 
 
 class ChunkBudgetTests(unittest.TestCase):
@@ -312,6 +324,11 @@ class ReducePromptTests(unittest.TestCase):
         self.assertIn("## Key Topics", prompt)
         self.assertIn("## Key Points", prompt)
         self.assertIn("## Action Items", prompt)
+
+    def test_prompts_ask_for_an_empty_action_items_section(self):
+        s = _make_summarizer()
+        for prompt in (s._create_reduce_prompt(["result"]), s._create_markdown_prompt("transcript")):
+            self.assertIn("If there are no action items, leave that section empty with no bullets.", prompt)
 
     def test_reduce_prompt_includes_notes_when_provided(self):
         s = _make_summarizer()

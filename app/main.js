@@ -1,4 +1,18 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, systemPreferences, globalShortcut, safeStorage, Tray, Menu, nativeImage, Notification, powerMonitor, net, session, desktopCapturer } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, systemPreferences, globalShortcut, Tray, Menu, nativeImage, powerMonitor, net, session } = require('electron');
+
+// safeStorage is accessed lazily via getSafeStorage(), NOT destructured from the
+// require above. On macOS, merely retrieving the safeStorage binding at load
+// time used to register an app-ready observer that eagerly initialized OSCrypt
+// and touched the login Keychain — popping the "<app> Safe Storage" permission
+// dialog on every launch even for users who had no stored secret at all
+// (Electron 42.0.0 regression, made lazy again in 42.4.1). Keeping the binding
+// out of the top-level destructure means loading main.js can never trigger that
+// access; the first Keychain touch happens only when a credential helper below
+// actually runs (saving a cloud key, org sign-in, calendar connect). require()
+// is cached, so getSafeStorage() is cheap.
+function getSafeStorage() {
+  return require('electron').safeStorage;
+}
 
 // Prevent EPIPE crashes when stdout/stderr pipe is broken (e.g. launching terminal closed)
 process.stdout?.on('error', () => {});
@@ -37,15 +51,57 @@ const path = require('path');
 // Backend CLI seam (spawn wrapper, process-tree kill, bundled-backend paths,
 // runPythonScript), the debug-log sink, and the quit teardown registry are
 // carved out of this file (RFC #327, Phase 0); wired once below via factories.
-const { spawn, killProcessTree, createBackendCli } = require('./backend-cli');
+const { spawn, killProcessTree, createBackendCli, withoutOpenAiAsrKey } = require('./backend-cli');
+const {
+  isEncryptedKeyCleared,
+  legacyKeyMigrationAction,
+  loadEncryptedKeyForOrigin,
+  markEncryptedKeyClearedAtomically,
+  readOpenAiAsrConfigSnapshot,
+  readOpenAiAsrEndpointSnapshot,
+  saveEncryptedKeyAtomically,
+} = require('./openai-asr-key-store');
+// Keep an unreadable config distinct from a readable config without a legacy
+// key. Migration may treat only the latter as complete.
+const OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE = Symbol('openai-asr-config-snapshot-unreadable');
+const { registerOpenAiAsrIpc } = require('./openai-asr-ipc');
 const { createDebugLog } = require('./debug-log');
 const { createTeardownRegistry } = require('./teardown');
 const { registerFoldersIpc } = require('./folders-ipc');
+const { registerSettingsIpc } = require('./settings-ipc');
+const { registerMeetingTransferIpc, copyRegularFile } = require('./meeting-transfer-ipc');
+const { STORE_DOCUMENT_LIMIT } = require('./meeting-transfer-store');
+const { registerPersonSampleIpc } = require('./person-sample-ipc');
+const { registerSpeakerIpc } = require('./speaker-ipc');
+const { registerObsidianSync } = require('./obsidian-sync');
+const { registerObsidianIpc } = require('./obsidian-ipc');
+const { isSafeToAutoInstall } = require('./update-idle-gate');
+const { describeUpdateError, updateErrorPhase, isMissingUpdateFeedError } = require('./update-error-copy');
+const { isOSUpdateEligible, MIN_MACOS_FOR_AUTOUPDATE } = require('./update-os-gate');
 const processingLog = require('./processing-log');
-const { isMeetingApp, allowsDeviceLevelFallback } = require('./meeting-detect');
+const { isMeetingApp, allowsDeviceLevelFallback, isMacos14Plus } = require('./meeting-detect');
+const { isLinuxLoopbackSupported, startLoopbackCapture, createFrameAligner, createSerialQueue } = require('./linux-loopback');
 const { sweepOrphanedLiveSnapshots } = require('./live-snapshot-sweep');
+const { shareTempDir, sweepShareTemp, SHARE_TEMP_MAX_AGE_MS } = require('./share-temp');
 const { userNotesFilePath } = require('./notes-file');
+const {
+  setSummary,
+  setKeyPoints,
+  setActionItems,
+  setDiscussionAreas,
+  containsStructuralLine,
+  normalizeMarkdownForParsing,
+} = require('./note-sections');
+const { writeFileAtomicSync } = require('./atomic-write');
+const { createToastScheduler, toastLayering } = require('./toast-scheduler');
+const { readSnapshot, captureSnapshot, markEdited, editedFieldNames } = require('./note-snapshot');
+const {
+  buildNoteReadyNotificationOptions,
+  buildTranscriptReadyBody,
+  buildCaptureErrorBody,
+} = require('./notification-copy');
 const { makeLineReader } = require('./backend-stream');
+const { classifyReprocessError } = require('./reprocess-error');
 // Pure deep-link (stenoai://) parsing/sanitizing lives in ./shortcut-url
 // (unit-tested). The stateful side — window creation, IPC dispatch,
 // notifications — stays here and calls parseShortcutUrl().
@@ -56,6 +112,9 @@ const {
   parseShortcutUrl,
 } = require('./shortcut-url');
 const { parseSetupCheckOutput } = require('./setup-check-parse');
+const { parseSpeakerModelStatusOutput } = require('./speaker-model-status');
+const { createSpeakerModelPreparer } = require('./speaker-model-prepare');
+const { reprepareSpeakerModelsAfterUpgrade } = require('./speaker-model-upgrade');
 const { isDiagnosticStdoutLine, sanitizeArgsForLog } = require('./diagnostics-filter');
 // Pure analytics bucketing/classification/sanitization lives in
 // ./analytics-helpers (unit-tested). trackEvent() itself and every IPC
@@ -67,6 +126,7 @@ const {
   sanitizeTrackProperties,
   calendarMeetingProvider,
   classifyErrorReason,
+  classifySummarizationStreamError,
   captureSanitizedException,
   sanitizeModelForAnalytics,
   summarizeCalendarSnapshot,
@@ -82,25 +142,106 @@ const os = require('os');
 const { URL, URLSearchParams } = require('url');
 const crypto = require('crypto');
 const { EXPORT_CANCELED } = require('./ipc-sentinels');
+const { mayExposeMainWindow } = require('./e2e-window-visibility');
 const { PostHog } = require('posthog-node');
 const { initMain } = require('electron-audio-loopback');
 const { autoUpdater } = require('electron-updater');
 
 // E2E test-harness hooks. Set via env vars; production sees none of these.
 //   STENOAI_USER_DATA_DIR — per-test temp userData dir (must be set before app.whenReady)
-//   STENOAI_E2E=1         — skip tray, auto-updater, PostHog telemetry
+//   STENOAI_E2E=1         — skip tray, auto-updater, PostHog telemetry, and
+//                           the post-upgrade speaker-model re-download unless
+//                           STENOAI_E2E_SPEAKER_UPGRADE=1 opts a spec into it
 //   STENOAI_E2E_MOCK_IPC=1 — install deterministic mock IPC handlers
+//   STENOAI_E2E_HEADLESS=1 - keep the main window rendered but never visible/focused
 if (process.env.STENOAI_USER_DATA_DIR) {
   app.setPath('userData', process.env.STENOAI_USER_DATA_DIR);
 }
 const IS_E2E = process.env.STENOAI_E2E === '1';
+// The subset of the harness that redirects WHERE BYTES GO: the STENOAI_E2E_*_PATH
+// seams in export-transcript / export-note-pdf / save-diagnostics, and the
+// path-returning seam in share-note-file. Those need a second condition beyond
+// IS_E2E, because IS_E2E is nothing but an environment variable: a signed build
+// started with STENOAI_E2E=1 plus one of those paths would silently write a
+// user's export to an attacker-chosen location instead of the file they picked
+// in the save dialog, and never show the dialog at all.
+//
+// `!app.isPackaged` is the right second condition rather than a stricter one:
+// every e2e lane launches the DEV binary from source (`electron.launch({ args:
+// ['.'] })` in e2e/fixtures/electron.ts, and the release gate's T1 smoke runs
+// the same way), so no legitimate test run is packaged. A packaged build now
+// ignores these seams entirely, whatever it is started with.
+//
+// Deliberately NOT folded into IS_E2E itself: its other ~30 uses gate the tray,
+// the dock, the scheduler and telemetry, and re-gating those on packaging would
+// be a far wider behavioural change than closing this hole.
+const ALLOW_E2E_PATH_SEAMS = IS_E2E && !app.isPackaged;
 const IS_E2E_MOCK_IPC = process.env.STENOAI_E2E_MOCK_IPC === '1';
+const IS_E2E_HEADLESS = IS_E2E && process.env.STENOAI_E2E_HEADLESS === '1';
+
+// Carry chat history over from v0.8.0, the one release named "StenoAI".
+if (app.isPackaged && !process.env.STENOAI_USER_DATA_DIR) {
+  require('./legacy-user-data').migrateLegacyUserData({
+    fs, path, appDataDir: app.getPath('appData'), userDataDir: app.getPath('userData'),
+  });
+}
+
+// Global (system-wide) accelerator to toggle recording. CommandOrControl
+// resolves to Cmd on macOS and Ctrl on Windows/Linux, so no manual
+// process.platform split is needed. The env override lets the e2e T2 spec
+// register a low-collision accelerator that can't clash with whatever the
+// real host already occupies (see e2e/specs/record-hotkey.t2.spec.ts).
+const RECORD_HOTKEY_ACCEL = process.env.STENOAI_E2E_RECORD_ACCEL || 'CommandOrControl+Shift+R';
+
+// Shared toggle-recording handler for the global shortcut — reused by the
+// startup registration and the live-apply set-record-hotkey IPC handler so
+// both bind the exact same behaviour.
+function handleRecordHotkey() {
+  console.log('Global hotkey triggered: toggle recording');
+  if (mainWindow) {
+    mainWindow.webContents.send('toggle-recording-hotkey');
+  }
+}
+
+// Direct config.json read (no Python subprocess) for the startup registration
+// gate — mirrors the launch-on-login / notifications snapshot reads. The
+// startup backend call is skipped under IS_E2E, so a subprocess gate would be
+// untestable in T2. Absence of the key = ON (back-compat: the shortcut was
+// unconditionally registered before this setting existed).
+function recordHotkeyEnabledFromDisk() {
+  try {
+    const cfgPath = path.join(getUserDataDir(), 'config.json');
+    if (fs.existsSync(cfgPath)) {
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+      return cfg.record_hotkey_enabled !== false;
+    }
+  } catch (e) {
+    console.warn('Failed to read record_hotkey_enabled from config:', e?.message);
+  }
+  return true;
+}
+
+// Idempotently drive the global record hotkey to `enabled` and report the
+// resulting registration. globalShortcut.register() returns false when the
+// accelerator is ALREADY registered (including by us), so a bare register on a
+// repeat-enable — or an enable that races the startup registration — would
+// report a spurious failure while isRegistered() is actually true. Guarding on
+// isRegistered() keeps both call sites idempotent and the return value honest.
+function applyRecordHotkey(enabled) {
+  if (enabled) {
+    if (!globalShortcut.isRegistered(RECORD_HOTKEY_ACCEL)) {
+      globalShortcut.register(RECORD_HOTKEY_ACCEL, handleRecordHotkey);
+    }
+  } else if (globalShortcut.isRegistered(RECORD_HOTKEY_ACCEL)) {
+    globalShortcut.unregister(RECORD_HOTKEY_ACCEL);
+  }
+  return globalShortcut.isRegistered(RECORD_HOTKEY_ACCEL);
+}
 if (IS_E2E_MOCK_IPC) {
   require('./e2e-mock-ipc').install({ ipcMain, BrowserWindow });
 }
 
-// Distinguish dev runs from the packaged "Steno" app in the dock, About menu,
-// and Cmd+Tab. Production keeps the productName from package.json untouched.
+// Give development runs a distinct dock, About menu, and Cmd+Tab name.
 if (!app.isPackaged) {
   app.setName('Steno Dev');
 }
@@ -116,6 +257,29 @@ if (!app.isPackaged) {
 // Windows that's irrelevant (Chromium uses WASAPI loopback) and passing it is
 // at best a no-op, so we don't.
 initMain({ forceCoreAudioTap: process.platform === 'darwin' });
+
+/*
+ * electron-audio-loopback's enable handler obtains a real screen source for
+ * the video track, which unnecessarily couples system-audio recording to the
+ * macOS Screen Recording permission. The renderer still requests video:true,
+ * so the callback must include request.frame: an audio-only response throws
+ * after consuming the one-shot callback. Electron also invokes the display
+ * media handler without awaiting it, so callback failures must be caught here
+ * to avoid an unhandled rejection crashing the main process.
+ *
+ * Keep this override platform-neutral: audio:'loopback' retains the package's
+ * semantics on Windows while avoiding the same callback crash landmine.
+ */
+ipcMain.removeHandler('enable-loopback-audio');
+ipcMain.handle('enable-loopback-audio', () => {
+  session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+    try {
+      callback({ video: request.frame, audio: 'loopback' });
+    } catch (err) {
+      console.error('[loopback] display media callback failed:', err);
+    }
+  });
+});
 
 // Windows taskbar identity. Without an explicit AppUserModelID matching the
 // installer's, the taskbar shows a default/Electron icon (and groups the window
@@ -139,10 +303,30 @@ function isCoreAudioTapSupported() {
   }
 }
 
+// Whether the auto-detect-meetings watcher may run on this OS. Gated to
+// macOS 14+ because the mic-monitor only has a reliable per-app signal there;
+// on macOS 12/13 it falls back to a coarse device-level signal that misfires
+// (see #116). Pure version logic lives in ./meeting-detect (unit-tested).
+function isAutoDetectSupported() {
+  try {
+    return isMacos14Plus(process.platform, process.getSystemVersion());
+  } catch (_) {
+    // A getSystemVersion() throw is treated like an unparseable version, but
+    // only PERMISSIVELY on darwin (a real 14+ Mac must never lose the feature
+    // over a probe hiccup). On non-darwin the feature is unsupported regardless,
+    // so a throw there stays false — consistent with isMacos14Plus.
+    return process.platform === 'darwin';
+  }
+}
+
 // Whether system-audio (loopback) capture is available on this OS at all.
 // macOS: CoreAudio Process Tap (14.4+). Windows: electron-audio-loopback uses
 // Chromium's WASAPI loopback on Windows 10+ (both Win10 and Win11 report major
-// version 10). Linux: not wired. Drives the Settings/MainToolbar toggle.
+// version 10). Linux: a PipeWire monitor-port capture (see ./linux-loopback.js)
+// bypassing Chromium's getDisplayMedia path entirely — that path would route
+// through xdg-desktop-portal's ScreenCast picker on Wayland just to get a
+// throwaway video track, a real UX regression versus mac/Windows showing no
+// dialog at all. Drives the Settings/MainToolbar toggle.
 function isSystemAudioSupported() {
   if (process.platform === 'darwin') return isCoreAudioTapSupported();
   if (process.platform === 'win32') {
@@ -153,6 +337,7 @@ function isSystemAudioSupported() {
       return true; // assume a modern Windows if the version probe fails
     }
   }
+  if (process.platform === 'linux') return isLinuxLoopbackSupported();
   return false;
 }
 
@@ -185,6 +370,215 @@ function getOutputDir() {
 
 let mainWindow;
 let notificationWindow;
+
+// ── Custom notification toast ────────────────────────────────────────────────
+// Drop-in replacement for Electron's `Notification` that renders our OWN
+// frameless BrowserWindow toast (renderer route `/notification` →
+// NotificationToast.tsx) instead of an OS banner, so every notification is
+// visually consistent and theme-aware on macOS AND Windows. It mirrors the
+// slice of Electron's Notification API the app relies on:
+//   new Notification({ title, body, actions, iconType })
+//   .show() / .close() / .on('click'|'action'|'close') / static isSupported()
+// Being API-compatible means every existing call site — and
+// trackNotificationLifecycle — keeps working unchanged; they just render a
+// custom UI. See app/renderer/src/components/NotificationToast.tsx for the view.
+//
+// Events (kept identical to Electron's Notification so trackNotificationLifecycle
+// still tells an interaction from a passive dismiss):
+//   'click'  — the toast body was tapped        (renderer → notification-body-clicked)
+//   'action' — an action button was tapped      (renderer → notification-action-clicked, index arg)
+//   'close'  — the toast went away by ANY means (body/action click-through, the
+//              X button, the 15s auto-close, or being superseded)
+//
+// Single-toast semantics: only one toast window exists at a time; showing a new
+// one supersedes (closes) the current one — matching the pre-existing
+// pre-meeting toast.
+//
+// Cross-platform: the window options (transparent, alwaysOnTop, skipTaskbar,
+// focusable:false, hasShadow:false, positioned top-right via workArea) and the
+// setVisibleOnAllWorkspaces/setAlwaysOnTop calls are all valid on macOS AND
+// Windows — the `visibleOnFullScreen` option and the `'screen-saver'` level are
+// macOS-only but are harmlessly ignored on Windows. This is the exact window
+// config the pre-meeting toast already shipped with on both platforms, so
+// there's no new platform-specific surface to gate.
+//
+// Keyboard: the toast is deliberately never focusable, like the OS's own
+// banners, so it cannot steal focus from whatever the user is typing in. Every
+// toast action has a keyboard path elsewhere: Resume in the main window and the
+// tray menu, Take Notes via the record shortcut or tray, Summarise in the note
+// (#412).
+const { EventEmitter } = require('events');
+
+class Notification extends EventEmitter {
+  constructor(options = {}) {
+    super();
+    this.options = options;
+    this.payload = {
+      id: `n_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+      title: options.title || '',
+      body: options.body || options.subtitle || '',
+      actions: (options.actions || []).map((a) => ({
+        // Electron actions have no id; key by text (the app's actions are all
+        // single-button with a unique label, so this is stable).
+        id: a.text,
+        text: a.text,
+        type: a.type,
+      })),
+    };
+    if (options.iconType) this.payload.iconType = options.iconType;
+    if (options.detail) this.payload.detail = options.detail;
+    // A persistent toast has no auto-close; it stays until acted on or closed
+    // from code, and comes back after a toast that interrupted it (#412).
+    this.persistent = Boolean(options.persistent);
+    // Toasts sharing a tag replace each other instead of queueing (#412).
+    this.tag = options.tag || null;
+  }
+
+  show() {
+    // One toast on screen at a time; later ones wait their turn (#412).
+    toastScheduler.show(this);
+  }
+
+  // Called by toastScheduler when it is this toast's turn.
+  _present() {
+    const { screen } = require('electron');
+    // The display the user is looking at, not always the primary one: someone
+    // presenting on an external monitor would otherwise never see it (#412).
+    const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    const { width } = display.workAreaSize;
+    const { x, y } = display.workArea;
+
+    // Capture the window in a local `win` so the ready-to-show / closed
+    // closures below always reference THIS toast's window — never a later one
+    // that superseded it via the module-level `notificationWindow`. Reading the
+    // module-level var inside those closures was the original closure bug: a
+    // fast-following toast reassigned it, and the earlier toast's timers/handlers
+    // then acted on the wrong window (closing the new toast, leaking the old).
+    const win = new BrowserWindow({
+      width: 400,
+      height: 70,
+      x: x + width - 425,
+      y: y + 1,
+      // Create HIDDEN and only ever show via showInactive() in ready-to-show
+      // below. Without this, `show` defaults to true, so the constructor shows
+      // the window with the *activating* show() — which brings the whole app to
+      // the foreground (firing app.on('activate') → mainWindow.show()/focus()),
+      // so a passive toast appearing wrongly refocuses Steno. focusable:false
+      // stops the toast taking key focus but does NOT stop app activation; only
+      // show:false + showInactive() keeps the app in the background.
+      show: false,
+      // Because the toast now stays in a backgrounded app, a click on its
+      // buttons would otherwise be swallowed as the app-activating click (so the
+      // user has to click twice — once to activate, once to act). acceptFirstMouse
+      // makes that first click register as a real click on the button.
+      acceptFirstMouse: true,
+      frame: false,
+      transparent: true,
+      alwaysOnTop: true,
+      resizable: false,
+      skipTaskbar: true,
+      focusable: false,
+      hasShadow: false,
+      backgroundColor: '#00000000',
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        preload: path.join(__dirname, 'preload.js'),
+      },
+    });
+    notificationWindow = win;
+    // Deny window.open + block foreign navigation on the toast window too, so the
+    // security guards cover EVERY BrowserWindow (#377). allowExternalLinks lets a
+    // Join/meeting link route out via shell.openExternal.
+    hardenWindow(win, { allowExternalLinks: true });
+    win._activeCustomNotification = this;
+    // Also pin the window to the notification instance so a handler bound to
+    // THIS notif (e.g. the pre-meeting 'close' dismissal-telemetry handler) can
+    // read its OWN window's flags rather than the module-level `notificationWindow`,
+    // which a superseding toast reassigns out from under a not-yet-fired 'close'.
+    this._window = win;
+    // Set true by close-notification-window / the action+body IPC handlers.
+    // Scoped to this window instance (not a module-level flag) so a superseding
+    // toast can't leak interaction state across windows. Only the pre-meeting
+    // path reads it (to avoid double-counting a renderer-tracked dismiss against
+    // the main-side auto-close dismiss); the other notifications rely on
+    // trackNotificationLifecycle's own click/dismiss bookkeeping.
+    win._analyticsInteracted = false;
+
+    let autoCloseTimer;
+    let readyTimer;
+    // Registered immediately (not inside ready-to-show) so a toast closed
+    // BEFORE it finishes loading still reaches the scheduler and clears the
+    // module-level ref; the auto-close timer simply hasn't been armed yet.
+    win.on('closed', () => {
+      if (autoCloseTimer) clearTimeout(autoCloseTimer);
+      if (readyTimer) clearTimeout(readyTimer);
+      if (notificationWindow === win) notificationWindow = null;
+      // False when the window only closed to let another toast through; this
+      // toast is queued again and has not been dismissed.
+      const closedForGood = toastScheduler.windowClosed(this);
+      if (closedForGood) this.emit('close');
+    });
+
+    // A window that never loads, or whose renderer dies before first paint,
+    // never fires ready-to-show. Close it, or every later toast would wait
+    // behind it.
+    const closeUnloaded = () => {
+      if (!win.isDestroyed()) win.close();
+    };
+    win.webContents.once('did-fail-load', closeUnloaded);
+    win.webContents.once('render-process-gone', closeUnloaded);
+    readyTimer = setTimeout(closeUnloaded, 10000);
+    const rendererDist = path.join(__dirname, 'renderer', 'dist', 'index.html');
+    win.loadFile(rendererDist, { hash: '/notification' }).catch(closeUnloaded);
+
+    win.once('ready-to-show', () => {
+      clearTimeout(readyTimer);
+      win.showInactive();
+      // Only a persistent toast may cover a fullscreen app; see toastLayering.
+      // A persistent toast is still there after the user leaves fullscreen.
+      const layering = toastLayering(this);
+      win.setVisibleOnAllWorkspaces(true, {
+        visibleOnFullScreen: layering.visibleOnFullScreen,
+        skipTransformProcessType: layering.skipTransformProcessType,
+      });
+      win.setAlwaysOnTop(true, layering.level, 1);
+
+      // Keep the 15s auto-close (matches the pre-existing pre-meeting toast),
+      // except for a persistent toast.
+      if (!this.persistent) {
+        autoCloseTimer = setTimeout(() => {
+          if (!win.isDestroyed()) win.close();
+        }, 15000);
+      }
+
+      win.webContents.send('show-notification', this.payload);
+      // Only now is the toast actually on screen; analytics count it here.
+      this.emit('show');
+    });
+  }
+
+  close() {
+    // A toast still waiting its turn is dropped without ever showing; the one
+    // on screen has its window closed, which emits 'close' via 'closed'.
+    if (toastScheduler.cancel(this) === 'removed') this.emit('close');
+  }
+
+  static isSupported() {
+    return true;
+  }
+}
+
+const toastScheduler = createToastScheduler({
+  present: (notif) => notif._present(),
+  dismissWindow: (notif) => {
+    if (notif._window && !notif._window.isDestroyed()) notif._window.close();
+  },
+  // Pushed out of a full queue without ever showing.
+  onDropped: (notif) => notif.emit('close'),
+});
+
 let pythonProcess;
 let tray = null;
 let isQuitting = false;
@@ -195,18 +589,25 @@ let shortcutQueue = [];
 let pendingShortcutUrls = [];
 let rendererShortcutReady = false;
 let launchedByShortcut = false;
-// Screen Recording permission as of process launch, frozen once at startup.
-// macOS doesn't apply a mid-session grant to the running process — only a
-// relaunch picks it up — so gates that decide "is loopback usable this
-// session" must read this, not the live systemPreferences status, or a
-// mid-session grant re-enables a code path (electron-audio-loopback's
-// setDisplayMediaRequestHandler) that's still broken until the app restarts.
-let screenPermissionAtLaunch = 'granted';
 // true when this launch was triggered by the OS login item (auto-launch).
 // Set once at startup (before the app_opened event). On a login launch we
 // suppress the first window show so Steno starts hidden in the tray/menu bar,
 // and we tag telemetry so background opens don't inflate DAU/funnels.
 let launchedHidden = false;
+
+/**
+ * The only route through which the main window may be exposed.
+ * Playwright can fully drive a hidden BrowserWindow, so E2E runs use the same
+ * renderer without repeatedly stealing focus from the host desktop.
+ */
+function exposeMainWindow({ focus = true } = {}) {
+  if (!mayExposeMainWindow({ isE2EHeadless: IS_E2E_HEADLESS })) return false;
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  if (!mainWindow.isVisible()) mainWindow.show();
+  if (focus) mainWindow.focus();
+  return true;
+}
 
 // SHORTCUT_PROTOCOL and the pure deep-link parsing/sanitizing helpers
 // (extractShortcutUrlFromArgv, sanitizeShortcutUrlForLogs, parseShortcutUrl,
@@ -474,13 +875,19 @@ const POSTHOG_HOST = 'https://us.i.posthog.com';
 // Google Calendar OAuth2 configuration
 const GOOGLE_CLIENT_ID = '281073275073-20da4u5t9luk2366vd5ai0a2r55d5pf5.apps.googleusercontent.com';
 const GOOGLE_CLIENT_SECRET = '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';
-const GOOGLE_SCOPES = 'https://www.googleapis.com/auth/calendar.readonly';
+// `openid` + the email scope get an `id_token` back in the token exchange
+// response, which we decode locally to read the connected account's email —
+// no extra userinfo API call needed.
+const GOOGLE_SCOPES = 'openid https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email';
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
-const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 
 // Outlook Calendar OAuth2 configuration (PKCE public client — no client secret)
 const OUTLOOK_CLIENT_ID = '53a8ba1f-3a2e-4fc9-afb1-b9b8ff13de19';
-const OUTLOOK_SCOPES = 'Calendars.Read offline_access';
+// See GOOGLE_SCOPES comment — openid/email here for the same id_token decode.
+// `profile` is required for the `preferred_username` claim to be populated
+// (Microsoft's id_token claims reference) — the fallback we use when a
+// work/school account has no `email` claim.
+const OUTLOOK_SCOPES = 'Calendars.Read offline_access openid email profile';
 const OUTLOOK_AUTH_URL = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize';
 const OUTLOOK_TOKEN_URL = 'https://login.microsoftonline.com/common/oauth2/v2.0/token';
 
@@ -627,7 +1034,7 @@ function trackEvent(eventName, properties = {}) {
         ...properties
       }
     });
-  } catch (error) {
+  } catch {
     // Silent fail -- telemetry must never break the app
   }
 }
@@ -651,12 +1058,19 @@ ipcMain.on('track', (_event, eventName, properties) => {
 // click/action from an unclicked auto-dismiss/timeout.
 function trackNotificationLifecycle(notif, type, extraProps = {}) {
   let clicked = false;
+  let shown = false;
   const props = { type, ...extraProps };
-  trackEvent('notification_shown', props);
+  // Counted when the toast is actually on screen, once even if an interrupted
+  // persistent toast is presented again; a toast dropped from the queue was
+  // never shown and is neither shown nor dismissed (#412).
+  notif.once('show', () => {
+    shown = true;
+    trackEvent('notification_shown', props);
+  });
   notif.on('click', () => { clicked = true; trackEvent('notification_clicked', props); });
   notif.on('action', () => { clicked = true; trackEvent('notification_clicked', props); });
   notif.on('close', () => {
-    if (!clicked) trackEvent('notification_dismissed', props);
+    if (shown && !clicked) trackEvent('notification_dismissed', props);
   });
 }
 
@@ -670,7 +1084,7 @@ async function shutdownTelemetry() {
       posthogClient = null;
       console.log('Telemetry shut down');
     }
-  } catch (error) {
+  } catch {
     // Silent fail
   }
 }
@@ -761,6 +1175,17 @@ function getAllowedBaseDirs() {
   }
   return dirs;
 }
+
+// Obsidian vault sync engine (#413). Closures capture the (hoisted) path
+// helpers; the mirror stays inert until initObsidianSync() loads the cached
+// config at startup. folders.json sits beside the output dir.
+const obsidianSync = registerObsidianSync({
+  getUserDataDir,
+  getAllowedBaseDirs,
+  validateSafeFilePath,
+  resolveFoldersJsonPath: () => path.join(path.dirname(getOutputDir()), 'folders.json'),
+  sendDebugLog,
+});
 
 // Sync resolver for the audio recordings folder. Mirrors the path order used
 // by the async `get-recordings-dir` handler (custom storage > packaged data
@@ -946,6 +1371,369 @@ function validateSafeFilePath(filepath, allowedBaseDirs) {
   }
 }
 
+// --- Soft-delete: single-summary tombstone deferred delete (#234) ----------
+// Deleting a note HIDES only its summary file, by renaming it into a hidden
+// sibling dir (`output/.pending-delete/<id>/`). Every backend scan identifies a
+// note SOLELY by its summary glob (`list_meetings` / global chat glob
+// `output/<stem>_summary.{json,md}`, non-recursive), so hiding the summary makes the
+// note invisible to all of them via a SINGLE atomic same-filesystem rename — no
+// multi-file moves, no cross-volume copy, no manifest, no restore/purge/sweep.
+//
+// The transcript, recording and sidecars are NOT moved: they stay in place and
+// are unlinked only when the delete COMMITS (window elapsed / explicit dismiss /
+// clean quit). Undo renames the summary back. A crash mid-window leaves the
+// hidden summary on disk; startup recovery renames it back so the note REAPPEARS
+// (fail-safe: a lost undo window must never vanish a note, only ever un-delete).
+//
+// State is owned by MAIN (the renderer only shows a display-only countdown).
+// pendingDeletes maps an id -> its record; pendingDeleteBySummary indexes the
+// canonical original summary path -> id for dedup.
+const PENDING_DELETE_DIRNAME = '.pending-delete';
+const DELETE_WINDOW_MS = 8000;
+// id -> { id, meeting, summaryFileKey, hiddenDir, originalSummaryPath,
+//         hiddenSummaryPath, canonicalSummary, ancillaryPaths, deadline,
+//         state, timer }
+// A note names EXACTLY ONE summary_file; we hide that single file (one atomic
+// rename). No multi-variant/twin bookkeeping — see the delete handler's note on
+// the anomalous, fail-safe .json+.md twin edge.
+const pendingDeletes = new Map();
+// canonical(the note's original summary path) -> id, so a second delete of the
+// same summary is rejected.
+const pendingDeleteBySummary = new Map();
+
+// Canonicalize a path via realpath, falling back to a parent-realpath + basename
+// (for a path whose leaf no longer exists, e.g. an already-hidden summary) and
+// finally the lexical resolve. Used for identity comparisons only.
+function canonicalPathForCompare(p) {
+  const resolved = path.resolve(p);
+  try {
+    return fs.realpathSync(resolved);
+  } catch (_) {
+    try {
+      return path.join(fs.realpathSync(path.dirname(resolved)), path.basename(resolved));
+    } catch (_) {
+      return resolved;
+    }
+  }
+}
+
+// An id is generated by us (`<ts>-<hex>`) but comes back from the untrusted
+// renderer on undo/commit. We only ever use it as a Map key (undo/commit read
+// the hidden path from OUR record, never build a path from the renderer id), but
+// reject any separator/parent token as defense-in-depth.
+function isSafePendingId(id) {
+  return (
+    typeof id === 'string' &&
+    id.length > 0 &&
+    !id.includes('/') &&
+    !id.includes('\\') &&
+    !id.includes('..') &&
+    id !== '.' &&
+    id !== '..'
+  );
+}
+
+// Canonical STEM identity for a summary path: strip the `_summary.{md,json}`
+// suffix and keep the containing dir, so the two format variants of one note
+// (<stem>_summary.json / <stem>_summary.md) collapse to the SAME key. Used by
+// isSummaryBusy so deleting the .json while a job rewrites the .md (or vice
+// versa) is still seen as busy. Falls back to the full canonical path when the
+// basename isn't a summary variant (never matches an unrelated file).
+function summaryStemKey(summaryAbs) {
+  const canon = canonicalPathForCompare(summaryAbs);
+  const dir = path.dirname(canon);
+  const base = path.basename(canon);
+  for (const suf of ['_summary.md', '_summary.json']) {
+    if (base.endsWith(suf)) {
+      return path.join(dir, base.slice(0, -suf.length));
+    }
+  }
+  return canon;
+}
+
+// Is a note (by its summary path) currently in an active pipeline — recording
+// into, queued/processing, or reprocessing? A delete must be refused for such a
+// note, or a finishing job would rewrite (resurrect) or re-upload the summary we
+// just hid = the note reappears / leaks after the user deleted it. Compares by
+// canonical STEM (not exact path) so deleting one format variant while a job is
+// rewriting the other variant of the SAME note is still caught — otherwise the
+// job could resurrect the summary while commit unlinks the audio.
+function isSummaryBusy(summaryAbs) {
+  const target = summaryStemKey(summaryAbs);
+  const candidates = [];
+  for (const key of activeReprocessJobs.keys()) candidates.push(key);
+  if (currentRecordingAppendTarget) candidates.push(currentRecordingAppendTarget);
+  if (currentProcessingJob) {
+    if (currentProcessingJob.appendTo) candidates.push(currentProcessingJob.appendTo);
+    if (currentProcessingJob.summaryFile) candidates.push(currentProcessingJob.summaryFile);
+  }
+  for (const job of processingQueue) {
+    if (job && job.appendTo) candidates.push(job.appendTo);
+    if (job && job.summaryFile) candidates.push(job.summaryFile);
+  }
+  return candidates.some((c) => summaryStemKey(c) === target);
+}
+
+// A trashable meeting file must live directly in an allowed base's output/,
+// recordings/, or transcripts/ folder — NOT just anywhere under the broad
+// allowed roots. This rejects a crafted meeting whose audio_file points at,
+// say, <userData>/config.json (Codex C2): config.json is under an allowed base,
+// but its parent dir is not one of the meeting-file folders. realpath-resolving
+// both the candidate's parent and each leaf dir closes the symlink gap.
+function isAllowedMeetingSource(src, allowedBaseDirs) {
+  const leafDirs = [];
+  for (const base of allowedBaseDirs) {
+    for (const sub of ['output', 'recordings', 'transcripts']) {
+      const p = path.join(base, sub);
+      let real;
+      try {
+        real = fs.realpathSync(p);
+      } catch (_) {
+        real = path.resolve(p);
+      }
+      leafDirs.push(real);
+    }
+  }
+  const parent = path.dirname(src);
+  let realParent;
+  try {
+    realParent = fs.realpathSync(parent);
+  } catch (_) {
+    realParent = path.resolve(parent);
+  }
+  return leafDirs.includes(realParent);
+}
+
+// Transfer tracks belong only to the validated summary's immutable stem.
+// Neither a receipt nor the renderer can supply a different media directory.
+function transferMediaDirectory(outputDir, stem) {
+  if (!/^transfer_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(stem ?? '')) return null;
+  try {
+    const root = path.join(fs.realpathSync(outputDir), '.meeting-transfer');
+    const media = path.join(root, stem);
+    for (const directory of [root, media]) {
+      if (!fs.lstatSync(directory).isDirectory() || fs.realpathSync(directory) !== directory) return null;
+    }
+    return media;
+  } catch (_) { return null; }
+}
+
+// No-clobber occupancy test. Uses lstat (NOT existsSync) so a DANGLING symlink
+// at the path counts as occupied: existsSync follows the link and returns false
+// for a broken target, which would let a renameSync silently REPLACE the symlink
+// (and, if it weren't dangling, write THROUGH it out of the sandbox). Any lstat
+// success — regular file, dir, symlink, broken symlink — means "occupied".
+function pathIsOccupied(p) {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch (err) {
+    // Only a genuine "not found" proves the path is free. A transient lstat
+    // error (EIO / EACCES / ...) must fail SAFE — treat the path as occupied so
+    // we never renameSync over something we couldn't inspect.
+    if (err && err.code === 'ENOENT') return false;
+    return true;
+  }
+}
+
+// Remove a hidden summary's `.pending-delete/<id>/` scaffold, then best-effort
+// remove the now-empty `.pending-delete/` parent (rmdir fails, harmlessly, if
+// another pending delete still occupies it). Keeps output/ tidy between windows.
+function removeHiddenScaffold(idDir) {
+  try {
+    fs.rmSync(idDir, { recursive: true, force: true });
+  } catch (_) {}
+  try {
+    fs.rmdirSync(path.dirname(idDir));
+  } catch (_) {}
+}
+
+// Commit a pending delete: PERMANENTLY unlink the hidden summary + every
+// ancillary file (transcript / recording(s) / reports sidecar), then the
+// `.pending-delete/<id>` scaffold. This is the FINAL delete — no rollback.
+// Called when the undo window elapses, on an explicit dismiss
+// (commit-delete-meeting), and synchronously for every entry at clean quit.
+// Best-effort + idempotent: a missing file / unknown id is fine.
+function commitPendingDelete(id) {
+  const entry = pendingDeletes.get(id);
+  if (!entry) return;
+  // Mark committing FIRST so a racing undo-delete-meeting loses (it checks state).
+  entry.state = 'committing';
+  if (entry.timer) {
+    clearTimeout(entry.timer);
+    entry.timer = null;
+  }
+  // Returns true if the file is gone after this call (unlinked or already
+  // absent), false if it survived every retry (e.g. a permanently locked file).
+  const unlinkBestEffort = (p) => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        fs.unlinkSync(p);
+        return true;
+      } catch (err) {
+        if (err && err.code === 'ENOENT') return true; // already gone — done.
+        // Transient (EBUSY/EPERM on Windows): retry a couple of times, else give
+        // up (best-effort — a residual file is recovered/cleaned on next launch).
+      }
+    }
+    return false;
+  };
+  // The hidden summary IS the note. If it can't be permanently removed (e.g. a
+  // locked file), do NOT drop the pending record, remove the scaffold, or delete
+  // the ancillaries: leaving the hidden summary under .pending-delete/<id>/ lets
+  // startup recovery rename it back so the note REAPPEARS intact (fail-safe — the
+  // note un-deletes rather than half-committing with its transcript/recording
+  // already gone). Bailing before the ancillary unlinks keeps a full restore
+  // possible. A later quit-time sweep / next launch retries the commit.
+  if (!unlinkBestEffort(entry.hiddenSummaryPath)) {
+    console.warn(
+      `Commit: hidden summary unremovable, leaving for startup recovery: ${entry.hiddenSummaryPath}`,
+    );
+    return;
+  }
+  // The note is now permanently gone — mirror the deletion into the Obsidian
+  // vault (#413) if sync is on. Runs at the single commit choke point so the
+  // timer, explicit-dismiss and quit paths all mirror; preserves an
+  // externally-edited vault copy (skip + flag) rather than clobbering it.
+  try { obsidianSync.removeNoteBySummaryPath(entry.originalSummaryPath); } catch (_) {}
+  // Ancillary files (transcript / recording(s) / reports sidecar) are hygiene,
+  // not the note itself: a rare permanently-locked orphan is accepted (fail-safe
+  // direction — never risk the note over a stray file). Log any that survived.
+  for (const p of entry.ancillaryPaths) {
+    // Recheck the private media ancestors after the undo window as well.
+    if (entry.transferMediaDir && path.dirname(p) === entry.transferMediaDir
+      && transferMediaDirectory(path.dirname(entry.originalSummaryPath), path.basename(entry.transferMediaDir)) !== entry.transferMediaDir) {
+      console.warn('Commit: retained transfer media after storage revalidation failed:', path.basename(entry.transferMediaDir));
+      continue;
+    }
+    if (!unlinkBestEffort(p)) {
+      console.warn(`Commit: orphaned ancillary file (could not remove): ${p}`);
+    }
+  }
+  if (entry.transferMediaDir
+    && transferMediaDirectory(path.dirname(entry.originalSummaryPath), path.basename(entry.transferMediaDir)) === entry.transferMediaDir) {
+    // Only an empty directory may go; a failed unlink preserves its contents.
+    try { fs.rmdirSync(entry.transferMediaDir); } catch (_) {}
+  }
+  removeHiddenScaffold(entry.hiddenDir);
+  pendingDeletes.delete(id);
+  if (pendingDeleteBySummary.get(entry.canonicalSummary) === id) {
+    pendingDeleteBySummary.delete(entry.canonicalSummary);
+  }
+}
+
+// Synchronously commit EVERY pending delete. Called at clean quit — the undo
+// window ends at quit, so a still-pending delete becomes permanent. Electron
+// does NOT await quit handlers, so this does only synchronous fs work and never
+// blocks quit. A force-kill / crash that skips this leaves hidden summaries on
+// disk, which startup recovery turns back into visible notes (fail-safe).
+function commitAllPendingDeletesSync() {
+  for (const id of [...pendingDeletes.keys()]) {
+    try {
+      commitPendingDelete(id);
+    } catch (_) {}
+  }
+}
+
+// Startup RECOVERY (NON-destructive — replaces the old purge-on-launch). A hidden
+// summary still under `output/.pending-delete/<id>/` at launch is from a prior
+// session whose undo window was cut short by a crash / force-kill. RENAME it back
+// to output/ so the note REAPPEARS — a crash mid-window must never vanish a note,
+// only ever un-delete it. Then remove the empty scaffold. Best-effort; never
+// blocks launch. If the original path is occupied, LEAVE the hidden copy + log
+// (never clobber). Scans every allowed base's output/ (custom storage included).
+function recoverPendingDeletesOnLaunch() {
+  const outputDirs = new Set();
+  for (const base of getAllowedBaseDirs()) {
+    outputDirs.add(path.join(base, 'output'));
+  }
+  for (const outputDir of outputDirs) {
+    const pendingRoot = path.join(outputDir, PENDING_DELETE_DIRNAME);
+    let rootStat;
+    try {
+      rootStat = fs.lstatSync(pendingRoot);
+    } catch (_) {
+      continue; // No `.pending-delete` dir here — nothing to recover.
+    }
+    if (!rootStat.isDirectory()) {
+      console.warn('.pending-delete is not a real directory — skipping recovery:', pendingRoot);
+      continue;
+    }
+    let idDirs;
+    try {
+      idDirs = fs.readdirSync(pendingRoot);
+    } catch (_) {
+      continue;
+    }
+    for (const idDir of idDirs) {
+      const idPath = path.join(pendingRoot, idDir);
+      try {
+        if (!fs.lstatSync(idPath).isDirectory()) continue;
+        for (const name of fs.readdirSync(idPath)) {
+          const hidden = path.join(idPath, name);
+          // Only recover regular files (the only thing we ever hide is a summary).
+          if (!fs.lstatSync(hidden).isFile()) continue;
+          const original = path.join(outputDir, name);
+          // No-clobber (lstat, not existsSync, so a dangling symlink at the
+          // destination counts as occupied and is never replaced). The residual
+          // TOCTOU between this check and the renameSync is accepted: single-user
+          // desktop, synchronous handler, sub-ms window; Node has no atomic
+          // rename-no-replace.
+          if (pathIsOccupied(original)) {
+            console.warn(`Recovery: original occupied, leaving hidden copy: ${hidden}`);
+            continue;
+          }
+          fs.renameSync(hidden, original);
+          console.log(`Recovery: restored hidden summary -> ${original}`);
+        }
+      } catch (e) {
+        console.warn(`Recovery: failed for ${idPath} (non-fatal):`, e?.message);
+      }
+      // Remove the (now hopefully empty) `.pending-delete/<id>` scaffold. rmdir
+      // fails loudly-but-caught if a hidden copy was intentionally left behind.
+      try {
+        fs.rmdirSync(idPath);
+      } catch (_) {}
+    }
+    // Remove the empty `.pending-delete` root.
+    try {
+      fs.rmdirSync(pendingRoot);
+    } catch (_) {}
+  }
+}
+
+// #377 — harden every BrowserWindow against untrusted navigation. The renderer
+// routes all real external links through the `open-external` IPC (shell.openExternal),
+// so nothing legitimately relies on window.open or on navigating the window away
+// from the bundled renderer. Deny window.open outright, and cancel any full-page
+// navigation — the SPA uses in-app routing, so a will-navigate here is a
+// foreign/injected navigation, never a real route change. Interactive windows still
+// let a genuine http(s) link (a target=_blank "Report an issue", or a link
+// inside a note) open in the user's browser instead of silently dying.
+function hardenWindow(win, { allowExternalLinks = false } = {}) {
+  const wc = win.webContents;
+  wc.setWindowOpenHandler(({ url }) => {
+    // HTTP(S) only — matches the will-navigate branch below and the established
+    // `open-external` IPC policy (no mailto/other schemes; nothing legitimate in
+    // the renderer opens a non-http(s) popup). #377 review.
+    if (allowExternalLinks && /^https?:/i.test(url)) {
+      shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
+  wc.on('will-navigate', (event) => {
+    // Electron 42: read the target off the event (the positional `url` arg is
+    // deprecated). will-navigate only fires on a real document navigation — the
+    // SPA's hash routing never reaches here, so anything that does is foreign.
+    const url = event.url;
+    if (url === wc.getURL()) return; // reload of the exact trusted document is fine
+    event.preventDefault();
+    if (allowExternalLinks && /^https?:/i.test(url)) {
+      shell.openExternal(url);
+    }
+  });
+}
+
 function createWindow(options = {}) {
   rendererShortcutReady = false;
 
@@ -970,6 +1758,11 @@ function createWindow(options = {}) {
       sandbox: true,
       preload: path.join(__dirname, 'preload.js'),
       scrollBounce: true,
+      // backgroundThrottling is left at its default (true) and toggled at
+      // runtime instead — see applyRecordingBackgroundThrottling(). We only
+      // disable throttling WHILE recording (renderer-owned capture timers must
+      // run full-rate even when the window is hidden), and let a
+      // backgrounded-idle app throttle normally so it doesn't burn CPU.
     },
     // Windows/Linux render the Electron application menu as an in-window menu
     // bar (File/Edit/View/…); macOS puts it in the global bar. Hide it off-mac
@@ -991,6 +1784,7 @@ function createWindow(options = {}) {
   }
 
   mainWindow = new BrowserWindow(windowOpts);
+  hardenWindow(mainWindow, { allowExternalLinks: true });
 
   const rendererDist = path.join(__dirname, 'renderer', 'dist', 'index.html');
   const hash = process.env.STENOAI_RENDERER_HASH;
@@ -1012,9 +1806,7 @@ function createWindow(options = {}) {
     if (launchedHidden) {
       return;
     }
-    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
-      mainWindow.show();
-    }
+    exposeMainWindow({ focus: false });
   };
 
   mainWindow.once('ready-to-show', () => {
@@ -1088,10 +1880,7 @@ function updateTrayIcon(recording) {
 }
 
 function showAndFocusWindow() {
-  if (mainWindow) {
-    mainWindow.show();
-    mainWindow.focus();
-  }
+  exposeMainWindow();
 }
 
 function updateTrayMenu() {
@@ -1105,6 +1894,18 @@ function updateTrayMenu() {
       label: 'Open Steno',
       click: showAndFocusWindow
     },
+    // A keyboard-reachable Resume for a paused recording: the "Recording
+    // paused" toast is never focusable (#412). Same renderer path as its button.
+    ...(isRecording && recordingRuntimeState.isPaused
+      ? [{
+          label: 'Resume Recording',
+          click: () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('auto-resume-requested');
+            }
+          },
+        }]
+      : []),
     {
       label: isRecording ? 'Stop Recording' : 'Start Recording',
       click: () => {
@@ -1200,8 +2001,24 @@ function rewarmParakeet(reason) {
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
+  const meetingTransfer = registerMeetingTransferIpc({
+    app, ipcMain, dialog, getMainWindow: () => mainWindow, exposeMainWindow,
+    getOutputDir, getUserDataDir,
+    isBusy: () => currentRecordingProcess !== null || systemAudioRecordingActive || isProcessing || activeReprocessJobs.size > 0,
+    readMeeting: readMeetingForTransfer,
+    findAudioSource: findMeetingTransferAudio,
+    prepareAudio: prepareMeetingTransferAudio,
+    makeShareMenu: items => new (require('electron').ShareMenu)(items),
+  });
+  if (process.platform === 'darwin') {
+    for (const arg of process.argv.slice(1)) meetingTransfer.openFile(arg);
+  }
+
   ipcMain.on('warmup-parakeet-hint', () => rewarmParakeet('renderer-hint'));
   app.on('second-instance', (event, argv) => {
+    if (process.platform === 'darwin') {
+      for (const arg of argv.slice(1)) meetingTransfer.openFile(arg);
+    }
     const shortcutUrl = extractShortcutUrlFromArgv(argv);
     if (shortcutUrl) {
       if (app.isReady()) {
@@ -1214,11 +2031,7 @@ if (!gotSingleInstanceLock) {
       }
     }
 
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.show();
-      mainWindow.focus();
-    }
+    exposeMainWindow();
   });
 
   // Sends the custom in-app quit dialog to the renderer and waits for a response.
@@ -1227,8 +2040,7 @@ if (!gotSingleInstanceLock) {
   // preserve any active recording rather than killing it silently.
   async function showCustomQuitDialog(type, jobCount) {
     if (!mainWindow || mainWindow.isDestroyed()) return true;
-    mainWindow.show();
-    mainWindow.focus();
+    exposeMainWindow();
     mainWindow.webContents.send('show-quit-dialog', { type, jobCount });
     return new Promise((resolve) => {
       const handler = (_event, data) => {
@@ -1257,7 +2069,7 @@ if (!gotSingleInstanceLock) {
         if (mainWindow && !mainWindow.isDestroyed()) {
           try {
             await mainWindow.webContents.executeJavaScript('stopSystemAudioRecording("quit")');
-          } catch (e) {
+          } catch {
             // Best effort -- file is saved even if processing doesn't start
           }
         }
@@ -1299,9 +2111,6 @@ if (!gotSingleInstanceLock) {
   });
 
   app.whenReady().then(async () => {
-    if (process.platform === 'darwin') {
-      try { screenPermissionAtLaunch = systemPreferences.getMediaAccessStatus('screen'); } catch (_) {}
-    }
     // Resolve whether this launch was an OS login-item auto-launch BEFORE the
     // app_opened event and the first window show below. macOS reports it via
     // wasOpenedAtLogin (the deprecated openAsHidden no longer works on 13+);
@@ -1352,6 +2161,29 @@ if (!gotSingleInstanceLock) {
       console.warn('processing-log init failed (non-fatal):', e?.message);
     }
 
+    // Migrate the pre-safeStorage plaintext ASR credential on every launch,
+    // independent of the active engine or whether Settings is opened. The
+    // helper encrypts, verifies a decrypt/readback, then asks the backend to
+    // remove plaintext only after that succeeds.
+    void migrateLegacyOpenAiAsrApiKey();
+
+    // Speaker models cached before the FluidAudio 0.17 upgrade no longer
+    // load, and meeting processing never downloads; fetch them again in the
+    // background for users who had opted in (see speaker-model-upgrade.js).
+    // The shared preparer reports progress to Settings like any download.
+    // Off in e2e like the other network-bound startup work: a spec that seeds
+    // an old cache against the real sidecar must not start a real download.
+    if (!IS_E2E_MOCK_IPC && (!IS_E2E || process.env.STENOAI_E2E_SPEAKER_UPGRADE === '1')) {
+      void reprepareSpeakerModelsAfterUpgrade({
+        platform: process.platform,
+        userDataDir: getUserDataDir(),
+        env: process.env,
+        checkStatus: () => runSpeakerModelCommand('speaker-model-status'),
+        prepare: () => prepareSpeakerModels(),
+        onLog: sendDebugLog,
+      });
+    }
+
     // Application menu. macOS uses the global menu bar with mac-only roles
     // (services/hide/unhide). Windows/Linux get a slimmer, platform-correct
     // menu — kept (editing accelerators, Settings, Help) but hidden by default
@@ -1370,7 +2202,7 @@ if (!gotSingleInstanceLock) {
     const helpSubmenu = {
       role: 'help',
       submenu: [
-        { label: 'Learn More', click: () => shell.openExternal('https://github.com/ruzin/stenoai') },
+        { label: 'Learn More', click: () => shell.openExternal('https://github.com/stenolabs/stenoai') },
         { label: 'Report a Bug', click: () => shell.openExternal('https://discord.gg/DZ6vcQnxxu') }
       ]
     };
@@ -1446,10 +2278,29 @@ if (!gotSingleInstanceLock) {
       spawnParakeetWarmup();
     }
 
+    // Register the global hotkey for toggle recording, unless the user turned
+    // it off in Settings. CommandOrControl resolves per-platform (Cmd on
+    // macOS, Ctrl on Windows/Linux). Gate on the persisted preference read
+    // directly from config.json — absence of the key = ON (back-compat).
+    // MUST run before createWindow(): the renderer queries get-record-hotkey
+    // on mount and caches { registered }, so registering only after the
+    // slow awaits below would report a transient registered:false as a
+    // registration failure ("couldn't register" hint, hidden shortcut copy).
+    if (recordHotkeyEnabledFromDisk()) {
+      if (applyRecordHotkey(true)) {
+        console.log(`Global hotkey registered: ${RECORD_HOTKEY_ACCEL}`);
+      } else {
+        console.error(`Failed to register global hotkey: ${RECORD_HOTKEY_ACCEL}`);
+      }
+    } else {
+      console.log('Global record hotkey disabled by preference — not registering');
+    }
+
     createWindow();
     if (!IS_E2E && loadShowMenuBarIconEnabled()) createTray();
     setupAutoUpdater();
     setupAutoMeetingDetector();
+    setupDevNotificationTriggers();
     // Pre-meeting heads-up scheduler (calendar-time based). Skipped under E2E —
     // tests drive the show-premeeting-notification IPC seam directly; this would
     // otherwise start a background calendar poll.
@@ -1470,6 +2321,15 @@ if (!gotSingleInstanceLock) {
     powerMonitor.on('suspend', freezeInactivityWatchdogsForSleep);
     powerMonitor.on('resume', promptResumeAfterWake);
     powerMonitor.on('resume', thawInactivityWatchdogsAfterWake);
+    // Re-evaluate the idle auto-install gate when the machine wakes or the
+    // screen unlocks — a downloaded update can then install the moment the
+    // user has stepped away, without waiting for the next 60s tick. Cheap and
+    // self-guarding (no-ops unless an update is staged). E2E-gated so the test
+    // suite never even wires it (belt-and-braces with the gate's own guards).
+    if (!IS_E2E) {
+      powerMonitor.on('lock-screen', () => { maybeAutoInstallWhenIdle().catch(() => {}); });
+      powerMonitor.on('resume', () => { maybeAutoInstallWhenIdle().catch(() => {}); });
+    }
     const protocolRegistered = registerShortcutProtocolClient();
     sendDebugLog(`Protocol handler registration (${SHORTCUT_PROTOCOL}): ${protocolRegistered}`);
 
@@ -1557,6 +2417,25 @@ if (!gotSingleInstanceLock) {
       console.warn('Live-snapshot sweep failed (non-fatal):', e?.message);
     }
 
+    // Sweep share-sheet temp files older than a day. This is the ONLY cleanup
+    // for that directory: a file handed to ShareMenu must survive as long as the
+    // destination holds it (an open Mail draft, an AirDrop transfer waiting to be
+    // accepted), and popup() never reports when that ends - so nothing is deleted
+    // during a session. See share-temp.js for the full reasoning. Best-effort: an
+    // undeletable temp directory must not interrupt a launch.
+    try {
+      const { deleted } = sweepShareTemp(
+        shareTempDir(app.getPath('temp')),
+        Date.now(),
+        SHARE_TEMP_MAX_AGE_MS,
+      );
+      if (deleted.length > 0) {
+        sendDebugLog(`Swept ${deleted.length} stale share temp file(s)`);
+      }
+    } catch (e) {
+      console.warn('Share temp sweep failed (non-fatal):', e?.message);
+    }
+
     // Load custom storage path for file validation. Skipped under E2E (spawns
     // the backend; the test tiers keep startup backend-free).
     if (!IS_E2E) {
@@ -1567,9 +2446,45 @@ if (!gotSingleInstanceLock) {
           _cachedCustomStoragePath = spData.storage_path;
           console.log('Custom storage path loaded:', _cachedCustomStoragePath);
         }
-      } catch (e) {
+      } catch {
         // Non-fatal - custom path just won't be cached
       }
+    }
+
+    // Recover any soft-deleted notes whose undo window was cut short by a crash
+    // (#234): a hidden summary still under output/.pending-delete/ is renamed back
+    // so the note REAPPEARS (fail-safe — a lost window never vanishes a note).
+    // Best-effort — a failure here must never block launch. Cross-platform;
+    // getUserDataDir() honors STENOAI_USER_DATA_DIR so tests/e2e stay isolated.
+    // MUST run AFTER the custom storage path load above: recovery scans every
+    // getAllowedBaseDirs() output/ dir, and that list only includes the custom
+    // storage path once _cachedCustomStoragePath is set — sweeping earlier would
+    // miss a custom-storage user's hidden summaries, leaving a crash-orphaned
+    // note invisible (effectively lost) instead of restoring it.
+    try {
+      recoverPendingDeletesOnLaunch();
+    } catch (e) {
+      console.warn('pending-delete recovery on launch failed (non-fatal):', e?.message);
+    }
+
+    // Load the Obsidian sync config into the engine's cache (so per-note hooks
+    // never shell Python) and reconcile any index drift from changes made while
+    // the app was closed (#413). After the storage-path + pending-delete steps
+    // so getAllowedBaseDirs() is complete. Best-effort — never blocks launch.
+    try {
+      const [osEnabled, osVault] = await Promise.all([
+        runPythonScript('simple_recorder.py', ['get-obsidian-sync'], true),
+        runPythonScript('simple_recorder.py', ['get-obsidian-vault-path'], true),
+      ]);
+      obsidianSync.setCachedConfig({
+        enabled: !!JSON.parse(osEnabled.trim()).obsidian_sync_enabled,
+        vaultPath: JSON.parse(osVault.trim()).obsidian_vault_path || '',
+      });
+      // Fire-and-forget: reconcile yields internally, so it must not block the
+      // awaited launch sequence.
+      obsidianSync.reconcileOnLaunch().catch(() => {});
+    } catch (e) {
+      console.warn('Obsidian sync init failed (non-fatal):', e?.message);
     }
 
     // Clear any .import reservation markers orphaned by a crash mid-import. No
@@ -1589,21 +2504,6 @@ if (!gotSingleInstanceLock) {
     // dir and misses a custom-storage user's notes entirely. Deferred off the
     // critical path so the per-note frontmatter scan never delays first paint.
     setImmediate(sweepStuckProcessingFlags);
-
-    // Register global hotkey for toggle recording (Cmd+Shift+R on macOS, Ctrl+Shift+R on Windows/Linux)
-    const hotkeyModifier = process.platform === 'darwin' ? 'Command+Shift+R' : 'Ctrl+Shift+R';
-    const registered = globalShortcut.register(hotkeyModifier, () => {
-      console.log('Global hotkey triggered: toggle recording');
-      if (mainWindow) {
-        mainWindow.webContents.send('toggle-recording-hotkey');
-      }
-    });
-
-    if (registered) {
-      console.log(`Global hotkey registered: ${hotkeyModifier}`);
-    } else {
-      console.error(`Failed to register global hotkey: ${hotkeyModifier}`);
-    }
 
     if (pendingShortcutUrls.length > 0) {
       const urlsToProcess = [...pendingShortcutUrls];
@@ -1645,6 +2545,13 @@ if (!gotSingleInstanceLock) {
       killProcessTree(ollamaPid);
       ollamaPid = null;
     }
+    // Commit every pending soft-delete synchronously (#234): the undo window ends
+    // at quit, so a still-pending delete becomes permanent. Sync-only (Electron
+    // does not await quit handlers). A crash that skips this leaves hidden
+    // summaries that startup recovery turns back into notes (fail-safe).
+    try {
+      commitAllPendingDeletesSync();
+    } catch (_) {}
     // Drain the teardown registry (RFC #327 ground rule 4) BEFORE the async
     // telemetry shutdown — Electron does not await quit handlers, so work after
     // the first await is not a reliable barrier. Synchronous + idempotent;
@@ -1672,8 +2579,7 @@ if (!gotSingleInstanceLock) {
       // Only show if the window has finished its initial load.
       // On first launch, windowReadyToShow is false until React mounts.
       if (windowReadyToShow) {
-        mainWindow.show();
-        mainWindow.focus();
+        exposeMainWindow();
       }
       launchedByShortcut = false;
     } else {
@@ -1713,11 +2619,7 @@ if (!gotSingleInstanceLock) {
 
 // Focus window handler (used by notification click to bring app to foreground)
 ipcMain.on('focus-window', () => {
-    if (mainWindow) {
-        if (mainWindow.isMinimized()) mainWindow.restore();
-        mainWindow.show();
-        mainWindow.focus();
-    }
+    exposeMainWindow();
 });
 
 ipcMain.on('shortcut-renderer-ready', () => {
@@ -1767,11 +2669,9 @@ ipcMain.handle('get-system-audio-support', async () => {
     // Windows loopback works but is pending hardware verification, so the UI
     // labels it experimental and ships it opt-in (default off).
     const experimental = process.platform === 'win32';
-    let screenPermission = 'unknown';
     let osVersion = '';
     if (process.platform === 'darwin') {
       try { osVersion = process.getSystemVersion(); } catch (_) {}
-      try { screenPermission = systemPreferences.getMediaAccessStatus('screen'); } catch (_) {}
     } else {
       try { osVersion = process.getSystemVersion(); } catch (_) {}
     }
@@ -1781,69 +2681,10 @@ ipcMain.handle('get-system-audio-support', async () => {
       experimental,
       platform: process.platform,
       osVersion,
-      screenPermission,
-      screenPermissionAtLaunch,
     };
   } catch (error) {
     return { success: false, error: error.message };
   }
-});
-
-// Safely triggers macOS's native Screen Recording permission prompt for a
-// 'not-determined' user, by calling desktopCapturer.getSources() directly in
-// a plain try/caught async handler. Deliberately NOT the same code path as
-// the recording capture flow: electron-audio-loopback's own request handler
-// makes this same call inside an async function passed straight to
-// session.setDisplayMediaRequestHandler, which Electron invokes without
-// awaiting/catching — a failure there becomes an unhandled rejection that
-// used to crash the whole app (see useSystemAudioCapture.ts's
-// screenPermissionOk gate). Calling it here, in an ordinary ipcMain.handle,
-// has no such landmine: a rejection is just a normal rejected promise this
-// handler catches like any other. Only meaningful on macOS — 'not-determined'
-// only exists there.
-ipcMain.handle('request-screen-recording-permission', async () => {
-  if (process.platform !== 'darwin') {
-    return { success: true, screenPermission: 'granted' };
-  }
-  try {
-    await desktopCapturer.getSources({ types: ['screen'] });
-  } catch (error) {
-    sendDebugLog(`[loopback] screen recording permission request failed: ${error.message}`);
-  }
-  let screenPermission = 'unknown';
-  try { screenPermission = systemPreferences.getMediaAccessStatus('screen'); } catch (_) {}
-  return { success: true, screenPermission };
-});
-
-// Once denied/restricted, macOS will not re-prompt — the user has to flip it
-// in System Settings themselves. Deep-links straight to the Screen Recording
-// pane. The URL is a fixed literal (not renderer-supplied), so this is safe
-// despite the generic 'open-external' handler restricting to http/https only.
-ipcMain.handle('open-screen-recording-settings', async () => {
-  if (process.platform !== 'darwin') {
-    return { success: false, error: 'macOS only' };
-  }
-  try {
-    await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
-    return { success: true };
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-});
-
-// Screen Recording permission changes don't take effect for an already-running
-// process (unlike mic/camera) — macOS requires a full relaunch. Offered as a
-// one-click follow-up after granting so the user doesn't have to know that.
-ipcMain.handle('relaunch-app', async () => {
-  if (process.platform !== 'darwin') {
-    return { success: false, error: 'macOS only' };
-  }
-  // app.quit() (not app.exit()) so before-quit/will-quit still run: the
-  // recording-in-progress confirmation, WebM finalization, Ollama pid-tree
-  // kill, and telemetry flush all live there.
-  app.relaunch();
-  app.quit();
-  return { success: true };
 });
 
 // Debug functionality handled by side panel now
@@ -1851,6 +2692,22 @@ ipcMain.handle('relaunch-app', async () => {
 // Backend communication - always uses bundled stenoai executable
 // runPythonScript is provided by createBackendCli(...) wired near the top of
 // this file (verbatim body moved to ./backend-cli).
+
+// Recovers a graceful {"success": false, "error": ...} a CLI command printed
+// to stdout right before exiting non-zero (see runPythonScript's err.stdout
+// above) -- without this, a real "already exists"/"not found" message gets
+// discarded in favor of a generic "Python script failed with code 1: <stderr>"
+// wrapper that's useless to a human. Falls back to that generic message when
+// stdout wasn't valid JSON (an actual crash, not a graceful failure).
+function parsePythonFailureJson(error) {
+  try {
+    const parsed = JSON.parse(error.stdout || '');
+    if (parsed && typeof parsed === 'object' && parsed.success === false) return parsed;
+  } catch (_) {
+    // stdout wasn't JSON -- fall through to the generic error below.
+  }
+  return { success: false, error: error.message };
+}
 
 async function getBackendStatusInternal(silent = true) {
   const result = await runPythonScript('simple_recorder.py', ['status'], silent);
@@ -2030,6 +2887,11 @@ async function readReportsSidecar(meetingPath, allowedOutputDirs) {
   }
 }
 
+// Mirrors simple_recorder._parse_meeting_markdown so the detail page (get-meeting)
+// can render .md meetings without a Python round-trip. The two parsers MUST stay
+// byte-for-byte equivalent on everything they surface into session_info / the
+// meeting dict — they drift silently otherwise (see #346, and #313 for a prior
+// drift). Any change here has to land in _parse_meeting_markdown too.
 function parseMeetingMarkdown(content, mdPath) {
   // Split frontmatter
   const meta = {};
@@ -2067,6 +2929,8 @@ function parseMeetingMarkdown(content, mdPath) {
       }
     }
   }
+
+  body = normalizeMarkdownForParsing(body);
 
   // Parse markdown body into sections keyed by lowercased `## ` heading.
   const sections = {};
@@ -2167,6 +3031,7 @@ function parseMeetingMarkdown(content, mdPath) {
     diarised_text: meta.is_diarised ? sections.transcript || '' : null,
     user_notes: sections['user notes'] ?? null,
     folders: meta.folders || [],
+    continued_recordings: Array.isArray(meta.continued_recordings) ? meta.continued_recordings : [],
   };
 }
 
@@ -2219,6 +3084,54 @@ async function validateMeetingFilePath(summaryFile) {
   return { realPath, allowedOutputDirs };
 }
 
+// The transfer exporter reads a stable saved snapshot rather than trusting
+// renderer-supplied meeting content or an arbitrary audio path.
+async function readMeetingForTransfer(summaryFile) {
+  const validated = await validateMeetingFilePath(summaryFile);
+  if (validated.error) throw { code: 'unsafe_storage' };
+  const handle = await fs.promises.open(validated.realPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.size > BigInt(STORE_DOCUMENT_LIMIT)) throw { code: 'unsafe_storage' };
+    const bytes = await handle.readFile();
+    const after = await handle.stat({ bigint: true });
+    if (before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) throw { code: 'source_changed' };
+    const content = bytes.toString('utf8');
+    const meeting = validated.realPath.endsWith('.md')
+      ? parseMeetingMarkdown(content, validated.realPath) : JSON.parse(content);
+    if (!meeting.session_info) throw { code: 'unsafe_storage' };
+    return { realPath: validated.realPath, meeting, fingerprint: require('crypto').createHash('sha256').update(bytes).digest('hex') };
+  } finally { await handle.close(); }
+}
+
+async function findMeetingTransferAudio(summaryFile) {
+  return require('./meeting-transfer-audio').findAudioSource(summaryFile, getAllowedBaseDirs(), IMPORT_AUDIO_EXTENSIONS);
+}
+
+async function prepareMeetingTransferAudio(source) {
+  const { sourcePath, identity } = source;
+  const { privateDirectory } = require('./meeting-transfer-store');
+  const root = await privateDirectory(getUserDataDir(), 'meeting-transfer');
+  const scratch = await fs.promises.mkdtemp(path.join(root, 'audio-'));
+  const cleanup = () => fs.promises.rm(scratch, { recursive: true, force: true });
+  try {
+    const input = path.join(scratch, 'source' + path.extname(sourcePath));
+    await copyRegularFile(sourcePath, input, identity);
+    const target = path.join(scratch, 'track.caf');
+    const backendDir = path.dirname(getBackendPath());
+    const candidates = name => [path.join(backendDir, '_internal', name), path.join(backendDir, name)];
+    const helperCandidates = candidates('steno-audio-encode');
+    if (!app.isPackaged) helperCandidates.push(path.join(__dirname, '..', 'bin', 'steno-audio-encode'));
+    const values = await require('./meeting-transfer-audio').convertTransferAudio(input, target, {
+      nativeHelper: helperCandidates.find(candidate => fs.existsSync(candidate)),
+      ffmpeg: candidates('ffmpeg').find(candidate => fs.existsSync(candidate)),
+    });
+    await fs.promises.chmod(target, 0o600);
+    const metadata = { ...values, logicalTrackID: 'track-1', kind: 'imported' };
+    return { audio: [{ metadata, sourcePath: target }], cleanup };
+  } catch (error) { await cleanup(); throw error; }
+}
+
 ipcMain.handle('get-meeting', async (_event, summaryFile) => {
   try {
     const validated = await validateMeetingFilePath(summaryFile);
@@ -2227,6 +3140,22 @@ ipcMain.handle('get-meeting', async (_event, summaryFile) => {
     }
     const { realPath: realResolved, allowedOutputDirs } = validated;
     const content = await fs.promises.readFile(realResolved, 'utf-8');
+    const summaryBase = path.basename(realResolved);
+    const summarySuffix = summaryBase.endsWith('_summary.md')
+      ? '_summary.md'
+      : summaryBase.endsWith('_summary.json')
+        ? '_summary.json'
+        : null;
+    let hasSpeakerSidecar = false;
+    if (summarySuffix) {
+      const meetingStem = summaryBase.slice(0, -summarySuffix.length);
+      const speakerSidecarPath = path.join(path.dirname(realResolved), `${meetingStem}_speakers.json`);
+      try {
+        hasSpeakerSidecar = (await fs.promises.lstat(speakerSidecarPath)).isFile();
+      } catch {
+        hasSpeakerSidecar = false;
+      }
+    }
     if (summaryFile.endsWith('.md')) {
       // Legacy .md meetings are still listed by list-meetings, so their detail
       // pages route through here. Unlike the list payload, the detail page
@@ -2234,11 +3163,17 @@ ipcMain.handle('get-meeting', async (_event, summaryFile) => {
       // TranscriptPanel), so we return everything parseMeetingMarkdown yields.
       const mdMeeting = parseMeetingMarkdown(content, realResolved);
       const mdSidecar = await readReportsSidecar(realResolved, allowedOutputDirs);
-      return { success: true, meeting: { ...mdMeeting, reports: mdSidecar.reports, active_report: mdSidecar.active_report } };
+      // edited_fields comes LAST in every spread so it is always main's own
+      // reading of the sidecar, never a value that happened to be parsed out of
+      // the note file. It drives the regenerate guard, so a note that cannot
+      // supply one has to arrive as an empty list rather than as undefined -
+      // editedFieldNames guarantees that for a missing, corrupt or
+      // wrong-versioned sidecar alike.
+      return { success: true, meeting: { ...mdMeeting, has_speaker_sidecar: hasSpeakerSidecar, reports: mdSidecar.reports, active_report: mdSidecar.active_report, edited_fields: editedFieldNames(realResolved) } };
     }
     const jsonMeeting = JSON.parse(content);
     const jsonSidecar = await readReportsSidecar(realResolved, allowedOutputDirs);
-    return { success: true, meeting: { ...jsonMeeting, reports: jsonSidecar.reports, active_report: jsonSidecar.active_report } };
+    return { success: true, meeting: { ...jsonMeeting, has_speaker_sidecar: hasSpeakerSidecar, reports: jsonSidecar.reports, active_report: jsonSidecar.active_report, edited_fields: editedFieldNames(realResolved) } };
   } catch (error) {
     return { success: false, error: error.message };
   }
@@ -2253,7 +3188,12 @@ ipcMain.handle('clear-state', async () => {
   }
 });
 
-ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, sessionName) => {
+ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, sessionName, retranscribe) => {
+  let errorCode = 'generation_failed';
+  const rememberError = (error) => {
+    const classified = classifyReprocessError(error);
+    if (classified !== 'generation_failed') errorCode = classified;
+  };
   try {
     // Security: symlink-safe containment-check the renderer-supplied summary path
     // before it reaches the backend CLI, and pass the canonical realPath (not the
@@ -2261,12 +3201,17 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
     // summaryFile — that's UI correlation the renderer matches on, not file access.
     const validated = await validateMeetingFilePath(summaryFile);
     if (validated.error) {
-      return { success: false, error: validated.error };
+      sendDebugLog(`Reprocess path validation failed: ${validated.error}`);
+      return { success: false, error: 'Note generation failed', error_code: errorCode };
     }
     const { realPath } = validated;
 
     const args = ['reprocess', realPath];
     if (regenerateTitle) args.push('--regenerate-title');
+    // Re-transcribe (#266): re-run ASR on the source recording with the current
+    // settings before re-summarising. The backend emits HEARTBEAT:transcribe:*
+    // during ASR, which the same inactivity watchdog below already resets on.
+    if (retranscribe) args.push('--retranscribe');
 
     sendDebugLog(`🔄 Reprocessing meeting: ${summaryFile}`);
     sendDebugLog(`$ stenoai ${args.join(' ')}`);
@@ -2281,8 +3226,10 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
     // stuck.
     activeReprocessJobs.set(summaryFile, { summaryFile, sessionName: sessionName || null });
 
-    const aiEnv = getAiEnv();
-    const reprocessEnv = Object.keys(aiEnv).length > 0 ? { ...require('process').env, ...aiEnv } : undefined;
+    const reprocessSecrets = retranscribe
+      ? { ...getAiEnv(), ...getTranscriptionEnv() }
+      : getAiEnv();
+    const reprocessEnv = getBackendEnv(reprocessSecrets);
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), args, {
@@ -2291,6 +3238,13 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
       });
 
       let stderrBuf = '';
+      // Mirrors the main pipeline: true only if summarization actually ran
+      // (STREAM_COMPLETE). "Generate notes" reprocess always summarises; a
+      // retranscribe with auto_summarize off wouldn't, so track it rather than
+      // assume. Threaded into processing-complete so the renderer fires
+      // "Note ready" only when notes exist (#bug2).
+      let summarizationCompleted = false;
+      let streamFailed = false;
 
       // Liveness watchdog — see makeInactivityWatchdog. Summary CHUNK:
       // lines (and HEARTBEAT: lines if a retranscribe is ever added here)
@@ -2320,6 +3274,7 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
               mainWindow.webContents.send('summary-title', { title, sessionName });
             }
           } else if (line === 'STREAM_COMPLETE') {
+            summarizationCompleted = true;
             if (mainWindow && !mainWindow.isDestroyed()) {
               mainWindow.webContents.send('summary-complete', { success: true, sessionName, summaryFile });
             }
@@ -2329,10 +3284,15 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
             }
           } else if (line.startsWith('STREAM_ERROR:')) {
             const errMsg = line.slice('STREAM_ERROR:'.length);
+            streamFailed = true;
+            rememberError(errMsg);
             sendDebugLog(`❌ Reprocess stream error: ${errMsg}`);
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('summary-complete', { success: false, sessionName, summaryFile });
+              mainWindow.webContents.send('summary-complete', { success: false, sessionName, summaryFile, error_code: errorCode });
             }
+          } else if (line.startsWith('ERROR:')) {
+            rememberError(line.slice('ERROR:'.length));
+            forwardDiagnosticStdout(line, 'reprocess');
           } else {
             // Unclassified stdout: forward only diagnostic markers, drop content.
             forwardDiagnosticStdout(line, 'reprocess');
@@ -2351,24 +3311,61 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
 
       proc.on('close', (code) => {
         watchdog.clear();
-        if (code === 0) {
+        if (code === 0 && !streamFailed && !watchdog.timedOut) {
           console.log(`✅ Completed reprocessing: ${sessionName}`);
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('processing-complete', {
-              success: true,
-              sessionName,
-              summaryFile,
-              message: 'Reprocessing completed successfully'
-            });
-          }
-          resolve();
+          // Reprocess / generate-notes / re-transcribe rewrote the note — mirror
+          // it into the vault (#413) if sync is on. Use the canonical realPath
+          // (not the renderer alias) so it indexes under the true summary stem.
+          try { if (realPath) obsidianSync.syncNoteBySummaryPath(realPath); } catch (_) {}
+          // Look up the saved meeting so the completion event carries meetingData
+          // with the note's CURRENT title — reprocess may have generated an LLM
+          // title, so `sessionName` here can still be the 'Note' placeholder. The
+          // renderer's note-ready notification reads meetingData.session_info.name
+          // for its body; without this it falls back to the generic string and
+          // the note title never shows. Mirrors the recording-complete path.
+          runPythonScript('simple_recorder.py', ['list-meetings'], true)
+            .then((meetingsResult) => {
+              const allMeetings = JSON.parse(meetingsResult);
+              const processedMeeting =
+                allMeetings.find((m) => m.session_info?.summary_file === summaryFile) || null;
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('processing-complete', {
+                  success: true,
+                  sessionName,
+                  summaryFile,
+                  meetingData: processedMeeting,
+                  notesGenerated: summarizationCompleted,
+                  message: 'Reprocessing completed successfully'
+                });
+              }
+            })
+            .catch((error) => {
+              console.error('Error fetching reprocessed meeting:', error);
+              // Fall back to firing without meetingData — the note-ready title
+              // may be generic, but the note is still in the list + sidebar.
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('processing-complete', {
+                  success: true,
+                  sessionName,
+                  summaryFile,
+                  notesGenerated: summarizationCompleted,
+                  message: 'Reprocessing completed successfully'
+                });
+              }
+            })
+            .finally(() => resolve());
         } else {
+          // A STREAM_ERROR is more specific than a generic exit or trailing
+          // diagnostic. Keep it through both terminal events and the result.
+          if (errorCode === 'generation_failed' && watchdog.timedOut) errorCode = 'generation_timeout';
+          if (errorCode === 'generation_failed') rememberError(stderrBuf);
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('processing-complete', {
               success: false,
               sessionName,
               summaryFile,
               message: `Reprocessing failed (exit ${code})`,
+              error_code: errorCode,
             });
           }
           reject(new Error(`reprocess exited with code ${code}: ${stderrBuf.slice(-500)}`));
@@ -2380,9 +3377,50 @@ ipcMain.handle('reprocess-meeting', async (event, summaryFile, regenerateTitle, 
     return { success: true };
   } catch (error) {
     sendDebugLog(`❌ Reprocessing failed: ${error.message}`);
-    return { success: false, error: error.message };
+    if (errorCode === 'generation_failed') rememberError(error);
+    return { success: false, error: 'Note generation failed', error_code: errorCode };
   } finally {
     activeReprocessJobs.delete(summaryFile);
+  }
+});
+
+// Re-transcribe availability (#266): report whether the source recording for a
+// note still exists on disk, so the renderer can offer "Re-transcribe" only when
+// re-running ASR is actually possible (keep-recordings was on). Read-only.
+ipcMain.handle('recording-available', async (event, summaryFile) => {
+  try {
+    // Same containment check the reprocess path uses — the renderer is untrusted.
+    const validated = await validateMeetingFilePath(summaryFile);
+    if (validated.error) {
+      return { success: false, error: validated.error };
+    }
+    // Derive the recording stem from the note filename: <stem>_summary.{md,json}.
+    const base = path.basename(validated.realPath).replace(/\.(md|json)$/, '');
+    const stem = base.endsWith('_summary') ? base.slice(0, -'_summary'.length) : base;
+    // The recording keeps the note's stem with an arbitrary extension (native
+    // .wav, system-audio .webm, imported .m4a/.mp3), so match on stem, not glob.
+    const recordingsDir = resolveRecordingsDir();
+    let available = false;
+    try {
+      for (const dirent of fs.readdirSync(recordingsDir, { withFileTypes: true })) {
+        // Require a regular file — matches the Python _find_recording_for_stem
+        // is_file() check, so a directory named e.g. `<stem>.wav` doesn't offer
+        // a re-transcribe that then fails with RETRANSCRIBE_NO_AUDIO (#266).
+        if (!dirent.isFile()) continue;
+        const name = dirent.name;
+        const dot = name.lastIndexOf('.');
+        const nameStem = dot > 0 ? name.slice(0, dot) : name;
+        if (nameStem === stem) {
+          available = true;
+          break;
+        }
+      }
+    } catch {
+      available = false; // recordings dir may not exist yet
+    }
+    return { success: true, available };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 });
 
@@ -2415,7 +3453,7 @@ ipcMain.handle('generate-report-meeting', async (event, summaryFile, templateId)
     activeReprocessJobs.set(summaryFile, { summaryFile, sessionName });
 
     const aiEnv = getAiEnv();
-    const reportEnv = Object.keys(aiEnv).length > 0 ? { ...require('process').env, ...aiEnv } : undefined;
+    const reportEnv = getBackendEnv(aiEnv);
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), args, {
@@ -2494,6 +3532,11 @@ ipcMain.handle('generate-report-meeting', async (event, summaryFile, templateId)
               sessionName,
               summaryFile,
               report: true,
+              // A report is only ever generated for a note that already has
+              // notes, so "notes exist" is true — preserves the pre-existing
+              // note-ready behavior and keeps this off the transcript-only
+              // "generate notes?" branch (#bug2).
+              notesGenerated: true,
               message: 'Report generation completed successfully'
             });
           }
@@ -2561,8 +3604,15 @@ ipcMain.handle('regen-meeting-title', async (event, summaryFile, sessionName) =>
     }
     const { realPath } = validated;
 
+    // Register this job so isSummaryBusy() sees it: regen-title rewrites the
+    // ORIGINAL summary path after a model wait, so a delete during that wait would
+    // let the regen resurrect the summary while commit unlinks the hidden copy +
+    // ancillaries = a resurrected note with lost audio. Keyed on the original
+    // summaryFile (isSummaryBusy canonicalizes keys); cleared in the finally.
+    activeReprocessJobs.set(summaryFile, { summaryFile, sessionName: sessionName || null });
+
     const aiEnv = getAiEnv();
-    const regenEnv = Object.keys(aiEnv).length > 0 ? { ...require('process').env, ...aiEnv } : undefined;
+    const regenEnv = getBackendEnv(aiEnv);
 
     await new Promise((resolve, reject) => {
       const proc = spawn(getBackendPath(), ['regen-title', realPath], {
@@ -2598,6 +3648,8 @@ ipcMain.handle('regen-meeting-title', async (event, summaryFile, sessionName) =>
     return { success: true };
   } catch (error) {
     return { success: false, error: error.message };
+  } finally {
+    activeReprocessJobs.delete(summaryFile);
   }
 });
 
@@ -2663,6 +3715,70 @@ ipcMain.handle('query-transcript', async (event, summaryFile, question) => {
 });
 
 const activeQueryProcs = new Map();
+const contextQueries = new Map();
+const { validateRequest: validateChatRequest, liveSnapshot, runQuery: runChatQuery } = require('./chat-query');
+
+ipcMain.on('chat-context-stream', async (event, queryId, request) => {
+  const sender = event.sender;
+  let chunkCount = 0;
+  let tracked = false;
+  const send = (channel, data) => {
+    if (channel === 'query-chunk') chunkCount++;
+    if (channel === 'query-done' && !tracked && data.error !== 'Answer stopped.') {
+      tracked = true;
+      trackEvent('chat_message_sent', {
+        success: data.success,
+        scope: request?.scope === 'live' || request?.scope === 'meeting' ? 'single_meeting' : 'global',
+        query_length: textLengthBucket(typeof request?.question === 'string' ? request.question : ''),
+        has_response: chunkCount > 0,
+      });
+    }
+    if (!sender.isDestroyed()) sender.send(channel, { queryId, ...data });
+  };
+  if (!mainWindow || sender !== mainWindow.webContents || event.senderFrame !== sender.mainFrame) return;
+  if (typeof queryId !== 'string' || !queryId || queryId.length > 256 || contextQueries.has(queryId)) return;
+  if (contextQueries.size >= 4) {
+    send('query-done', { success: false, error: 'Wait for another answer to finish.' });
+    return;
+  }
+  let cancelled = false;
+  const entry = { sender, cancel: () => { cancelled = true; } };
+  contextQueries.set(queryId, entry);
+  const onDestroyed = () => entry.cancel();
+  sender.once('destroyed', onDestroyed);
+  const cleanup = () => {
+    contextQueries.delete(queryId);
+    if (!sender.isDestroyed()) sender.removeListener('destroyed', onDestroyed);
+  };
+  try {
+    const payload = validateChatRequest(request);
+    if (payload.scope === 'live') {
+      if (!systemAudioRecordingActive || request.recordingId !== String(recordingRuntimeState.startedAtMs)
+          || !recordingRuntimeState.startedAtMs) throw new Error('This recording is no longer active.');
+      payload.transcript = liveSnapshot(liveTranscriptState);
+      // A continued recording can start after a cold launch, with no in-memory
+      // prior segments. Read its saved transcript via the validated note path.
+      if (currentRecordingAppendTarget) {
+        payload.file = currentRecordingAppendTarget;
+        payload.transcript = liveSnapshot({ segments: liveTranscriptState.segments });
+      }
+    } else if (payload.scope === 'meeting') {
+      const validated = await validateMeetingFilePath(request.file);
+      if (validated.error) throw new Error('This meeting is unavailable.');
+      payload.file = validated.realPath;
+    }
+    if (cancelled || sender.isDestroyed()) { cleanup(); return; }
+    const query = runChatQuery({
+      spawn: require('child_process').spawn,
+      backend: getBackendPath(), env: getBackendEnv(getAiEnv()), cwd: getBackendCwd(),
+      payload, send, onFinish: cleanup,
+    });
+    entry.cancel = query.cancel;
+  } catch (error) {
+    if (!cancelled) send('query-done', { success: false, error: error.message });
+    cleanup();
+  }
+});
 
 // Cancellation intent for streaming queries that are still in their pre-spawn
 // async window. query-transcript-stream now `await`s validateMeetingFilePath
@@ -2675,6 +3791,11 @@ const activeQueryProcs = new Map();
 const pendingQueryCancels = new Map();
 
 ipcMain.on('query-cancel', (_event, queryId) => {
+  const contextQuery = contextQueries.get(queryId);
+  if (contextQuery) {
+    if (contextQuery.sender === _event.sender) contextQuery.cancel();
+    return;
+  }
   const proc = activeQueryProcs.get(queryId);
   if (proc) {
     console.log(`[QUERY] Cancelling queryId=${queryId}`);
@@ -2703,7 +3824,7 @@ ipcMain.on('query-cancel', (_event, queryId) => {
 ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, question) => {
   console.log(`[QUERY] IPC received: question="${question.substring(0, 50)}" file="${summaryFile}"`);
   sendDebugLog(`🤖 Streaming query (${String(question || '').length} chars)`);
-  const env = { ...process.env, ...getAiEnv() };
+  const env = getBackendEnv(getAiEnv());
 
   // chat_message_sent restores visibility into single-meeting chat (dormant
   // since the old bare-ping ai_query_used stopped being reachable once chat
@@ -2759,7 +3880,7 @@ ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, questi
   let validated;
   try {
     validated = await validateMeetingFilePath(summaryFile);
-  } catch (err) {
+  } catch {
     // Defense-in-depth: validateMeetingFilePath is fail-closed and shouldn't
     // throw, but if it ever does (e.g. a future refactor), don't let it become
     // an unhandled rejection that can take down the main process.
@@ -2892,7 +4013,7 @@ ipcMain.on('query-transcript-stream', async (event, queryId, summaryFile, questi
 // fewer recent notes instead of overflowing. No retrieval (RAG) yet.
 ipcMain.on('chat-global-stream', (event, queryId, question, folderId) => {
   sendDebugLog(`💬 Global chat query (${String(question || '').length} chars, folder: ${folderId || 'all'})`);
-  const env = { ...process.env, ...getAiEnv() };
+  const env = getBackendEnv(getAiEnv());
 
   const args = ['chat-global-streaming', '-q', question];
   if (folderId && typeof folderId === 'string' && folderId !== 'all') {
@@ -2957,7 +4078,7 @@ ipcMain.on('chat-global-stream', (event, queryId, question, folderId) => {
             proc.kill();
             activeQueryProcs.delete(queryId);
           }
-        } catch (e) { /* ignore decode errors */ }
+        } catch { /* ignore decode errors */ }
       } else if (line === 'CHAT_STREAM_COMPLETE') {
         if (!event.sender.isDestroyed()) {
           event.sender.send('query-done', { queryId, success: true });
@@ -3095,9 +4216,10 @@ ipcMain.handle('export-transcript', async (event, defaultFilename, content) => {
       return { success: false, error: 'No transcript content to export.' };
     }
 
-    // Test-only seam: only honor it under e2e, so a stray env var in a real
-    // launch can't silently redirect a user's export to an arbitrary path.
-    const seamPath = IS_E2E ? process.env.STENOAI_E2E_EXPORT_PATH : undefined;
+    // Test-only seam: honored only in an UNPACKAGED e2e run, so a stray env var
+    // in a real launch can't silently redirect a user's export to an arbitrary
+    // path. See ALLOW_E2E_PATH_SEAMS - IS_E2E alone is just an env var.
+    const seamPath = ALLOW_E2E_PATH_SEAMS ? process.env.STENOAI_E2E_EXPORT_PATH : undefined;
     let targetPath = seamPath;
 
     if (!targetPath) {
@@ -3166,6 +4288,10 @@ async function renderHtmlToPdf(html) {
       // renderer-supplied document to PDF.
     },
   });
+  // Background render of renderer-supplied HTML: deny any popup and block any
+  // navigation the document might attempt (no openExternal — this is not an
+  // interactive window and must never spawn a browser tab on its own).
+  hardenWindow(win);
   try {
     const render = (async () => {
       // Load the HTML directly as a data URL (self-contained: CSS, font, and
@@ -3215,9 +4341,10 @@ ipcMain.handle('export-note-pdf', async (event, defaultFilename, html) => {
       return { success: false, error: 'No notes content to export.' };
     }
 
-    // Test-only seam: only honor it under e2e, so a stray env var in a real
-    // launch can't silently redirect a user's export to an arbitrary path.
-    const seamPath = IS_E2E ? process.env.STENOAI_E2E_EXPORT_PATH : undefined;
+    // Test-only seam: honored only in an UNPACKAGED e2e run (see
+    // ALLOW_E2E_PATH_SEAMS), so a stray env var in a real launch can't silently
+    // redirect a user's export to an arbitrary path.
+    const seamPath = ALLOW_E2E_PATH_SEAMS ? process.env.STENOAI_E2E_EXPORT_PATH : undefined;
     let targetPath = seamPath;
 
     if (!targetPath) {
@@ -3269,9 +4396,10 @@ ipcMain.handle('save-diagnostics', async (event, defaultFilename, content) => {
       return { success: false, error: 'No diagnostics content to save.' };
     }
 
-    // Test-only seam: only honor it under e2e, so a stray env var in a real
-    // launch can't silently redirect a user's save to an arbitrary path.
-    const seamPath = IS_E2E ? process.env.STENOAI_E2E_DIAGNOSTICS_PATH : undefined;
+    // Test-only seam: honored only in an UNPACKAGED e2e run (see
+    // ALLOW_E2E_PATH_SEAMS), so a stray env var in a real launch can't silently
+    // redirect a user's save to an arbitrary path.
+    const seamPath = ALLOW_E2E_PATH_SEAMS ? process.env.STENOAI_E2E_DIAGNOSTICS_PATH : undefined;
     let targetPath = seamPath;
 
     if (!targetPath) {
@@ -3310,6 +4438,129 @@ ipcMain.handle('save-diagnostics', async (event, defaultFilename, content) => {
   }
 });
 
+// Whether a native share sheet actually exists on this machine. macOS-only:
+// Electron exposes ShareMenu on darwin and nothing anywhere else. The second
+// half of the check is not paranoia - if a future Electron drops or renames the
+// export, this degrades to a hidden menu group instead of a main-process crash
+// on `new undefined(...)`.
+function shareSheetAvailable() {
+  if (process.platform !== 'darwin') return false;
+  try {
+    return typeof require('electron').ShareMenu === 'function';
+  } catch (_) {
+    return false;
+  }
+}
+
+// The renderer asks once and hides the three share entries when this is false.
+// That flag is only a hint for what to draw; the handler below re-checks, which
+// is what actually keeps a stray call from crashing the process.
+ipcMain.handle('share-capability', () => shareSheetAvailable());
+
+// Hand a note to the native macOS share sheet (AirDrop, Mail, Messages, Notes).
+// Follows the same split as the three export handlers above: the renderer builds
+// the content, we own the bytes. Differences from them, all deliberate:
+//   - No save dialog. The destination is our own managed temp directory, because
+//     the sheet needs a real file and the user never picks a location.
+//   - The filename is user-visible: it becomes the attachment name the recipient
+//     reads, so defaultExportFilename()'s dated slug is used as-is.
+//   - Files are never deleted during the session (see share-temp.js).
+// Returns { success } only; success means the sheet opened, since popup() has no
+// completion callback and the app never learns the destination.
+ipcMain.handle('share-note-file', async (event, kind, defaultFilename, payload, anchor) => {
+  try {
+    if (kind !== 'pdf' && kind !== 'text') {
+      return { success: false, error: 'Unsupported share type.' };
+    }
+    if (typeof payload !== 'string' || payload.length === 0) {
+      return { success: false, error: 'No content to share.' };
+    }
+
+    // Fail before rendering: a stray call off darwin must not pay for a 15
+    // second PDF render just to be refused. In an unpackaged e2e run we
+    // deliberately continue on every platform, because the file write is what
+    // those specs assert and T2 runs on Windows too.
+    if (!ALLOW_E2E_PATH_SEAMS && !shareSheetAvailable()) {
+      return { success: false, error: 'Sharing is not available on this platform.' };
+    }
+
+    // The renderer supplies a suggested name only. Unlike the export handlers,
+    // where the reduced name merely seeds a dialog the user confirms, here it is
+    // joined onto a directory we write into - so `.` and `..` have to be rejected
+    // as well, not just directory components.
+    const fallback = kind === 'pdf' ? 'notes.pdf' : 'notes.md';
+    let base = fallback;
+    if (typeof defaultFilename === 'string' && defaultFilename.trim()) {
+      const reduced = path.basename(defaultFilename).slice(0, 200);
+      if (reduced && reduced !== '.' && reduced !== '..') base = reduced;
+    }
+
+    const dir = shareTempDir(app.getPath('temp'));
+    const targetPath = path.join(dir, base);
+
+    // Rasterise BEFORE touching the destination, so a render failure leaves no
+    // file behind. Mirrors export-note-pdf.
+    const bytes = kind === 'pdf' ? await renderHtmlToPdf(payload) : payload;
+
+    // Atomic write: tmp file in the SAME directory, then rename into place.
+    // Sharing the same note twice overwrites the first file, which is fine: the
+    // content is identical and Mail copies an attachment into the draft. The
+    // exception, since the name is deliberately not randomised: another process
+    // running as the same user could have planted a file of that name in this
+    // directory first, and the rename would replace it. Accepted - the filename
+    // has to stay the readable one the recipient sees, and anyone who can write
+    // here can already read the notes we put here.
+    const tmpPath = path.join(dir, `.${base}.${require('crypto').randomBytes(6).toString('hex')}.tmp`);
+    try {
+      await fs.promises.writeFile(tmpPath, bytes, kind === 'pdf' ? undefined : 'utf-8');
+      await fs.promises.rename(tmpPath, targetPath);
+    } catch (writeErr) {
+      try { await fs.promises.unlink(tmpPath); } catch (_) {}
+      throw writeErr;
+    }
+
+    // Test-only seam, mirroring STENOAI_E2E_EXPORT_PATH: a native sheet cannot be
+    // automated (Playwright can neither see nor dismiss it, and an open sheet
+    // blocks the run), so under e2e we stop after the write and return where the
+    // file went. The path is returned ONLY here - outside the seam the renderer
+    // has no business knowing, and a leaked absolute path is exactly what the
+    // basename reduction exists to prevent.
+    if (ALLOW_E2E_PATH_SEAMS) return { success: true, path: targetPath };
+
+    // Re-check rather than trust the entry gate above: this is the line that
+    // stops `new undefined(...)` from taking the main process down.
+    if (!shareSheetAvailable()) {
+      return { success: false, error: 'Sharing is not available on this platform.' };
+    }
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return { success: false, error: 'No window to share from.' };
+    }
+    const { ShareMenu } = require('electron');
+    const menu = new ShareMenu({ filePaths: [targetPath] });
+    // Anchor on the clicked entry so the sheet pops from the button rather than
+    // the window corner. The rectangle was read up to 15 seconds ago, before the
+    // PDF render, so a scroll, a window move or a resize can have moved it, and
+    // after a shrink it can sit outside the window entirely. An out-of-range
+    // anchor is worse than none: dropping it lets Electron place the sheet with
+    // coordinates that are at least current. A malformed anchor is dropped for
+    // the same reason rather than defaulted to 0,0.
+    const popupOptions = { window: mainWindow };
+    if (anchor && Number.isFinite(anchor.x) && Number.isFinite(anchor.y)) {
+      const { width, height } = mainWindow.getContentBounds();
+      const x = Math.round(anchor.x);
+      const y = Math.round(anchor.y);
+      if (x >= 0 && y >= 0 && x <= width && y <= height) {
+        popupOptions.x = x;
+        popupOptions.y = y;
+      }
+    }
+    menu.popup(popupOptions);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: String(err && err.message ? err.message : err) };
+  }
+});
+
 // Replace (or remove, when empty) the "## User Notes" section at the tail of a
 // meeting markdown body. Kept a pure string transform so it's unit-testable and
 // never touches the summary/transcript sections above it. `body` is everything
@@ -3328,6 +4579,12 @@ function upsertUserNotesSection(body, notes) {
 }
 
 ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
+  // Which note content fields this call rewrote. Declared at handler scope, not
+  // inside the markdown branch, so the single write site further down can record
+  // the edit without guessing whether the variable exists. Only the markdown
+  // branch fills it: the legacy .json format has no snapshot sidecar and keeps
+  // its previous behaviour, so it always reports an empty list.
+  const changed = [];
   try {
     // Security: the renderer is untrusted, so containment-check the summary path
     // (symlink-safe, output/ only) and operate exclusively on the canonical
@@ -3338,6 +4595,108 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
     }
     const { realPath } = validated;
 
+    if (!updates || typeof updates !== 'object') {
+      return { success: false, error: 'Invalid update payload' };
+    }
+    const isMarkdown = realPath.endsWith('.md');
+
+    // Type-check the note content fields before anything is read or written.
+    // The section writers coerce with String(), so a wrong-typed value would
+    // not fail loudly - it would land in the note as "[object Object]", and a
+    // nested one would slip a forged heading past the structural scan below,
+    // which can only inspect strings: key_points: [['## Transcript']] holds no
+    // string to scan yet stringifies straight back into a heading. Rejecting
+    // the whole payload is both safer and kinder than writing a mangled note.
+    const isStringArray = (value) =>
+      Array.isArray(value) && value.every((item) => typeof item === 'string');
+    // `analysis` may be absent (or null, which is how an empty analysis can
+    // come back through a JSON round trip); a title is what makes a topic.
+    const isDiscussionAreaList = (value) =>
+      Array.isArray(value) &&
+      value.every(
+        (area) =>
+          area !== null &&
+          typeof area === 'object' &&
+          !Array.isArray(area) &&
+          typeof area.title === 'string' &&
+          (area.analysis === undefined || area.analysis === null || typeof area.analysis === 'string'),
+      );
+
+    // A bullet-list entry is ONE line by construction: renderBulletList writes
+    // "- <entry>", and both parsers keep only lines that start with "- "
+    // (app/main.js:2639/2647, and the Python mirror). A second line in an entry
+    // is therefore dropped on the next read, and the save after that rewrites
+    // the section from the parsed array and deletes it from the file too. The
+    // renderer is where such a string first becomes reachable, so refuse it
+    // here rather than joining or truncating it behind the user's back.
+    const LINE_BREAK = /[\r\n]/;
+
+    if (updates.summary !== undefined && typeof updates.summary !== 'string') {
+      return { success: false, error: 'summary must be a string.' };
+    }
+    if (updates.user_notes !== undefined && updates.user_notes !== null && typeof updates.user_notes !== 'string') {
+      return { success: false, error: 'user_notes must be a string or null.' };
+    }
+    if (updates.key_points !== undefined) {
+      if (!isStringArray(updates.key_points)) {
+        return { success: false, error: 'key_points must be an array of strings.' };
+      }
+      if (updates.key_points.some((item) => LINE_BREAK.test(item))) {
+        return { success: false, error: 'A key point may not contain a line break.' };
+      }
+    }
+    if (updates.action_items !== undefined) {
+      if (!isStringArray(updates.action_items)) {
+        return { success: false, error: 'action_items must be an array of strings.' };
+      }
+      if (updates.action_items.some((item) => LINE_BREAK.test(item))) {
+        return { success: false, error: 'An action item may not contain a line break.' };
+      }
+    }
+    if (updates.discussion_areas !== undefined) {
+      if (!isDiscussionAreaList(updates.discussion_areas)) {
+        return {
+          success: false,
+          error: 'discussion_areas must be an array of { title, analysis } objects.',
+        };
+      }
+      if (updates.discussion_areas.some((area) => LINE_BREAK.test(area.title))) {
+        return { success: false, error: 'A discussion title may not contain a line break.' };
+      }
+    }
+
+    // The renderer is untrusted: a field containing a '## ' line would forge a
+    // section boundary and silently rewrite the note's structure for every
+    // consumer (both parsers, the clipboard export, the PDF export, org share).
+    //
+    // Scan the NORMALIZED text, because that is the grammar the parsers
+    // actually split on: both of them run normalizeMarkdownForParsing (and its
+    // Python mirror) BEFORE the '## ' split, which breaks a reasoning close-tag
+    // away from a heading glued to it - so "b</think>## Summary" is a legal
+    // mid-line string at write time and a real heading at read time. Anchoring
+    // on '^' alone would let that through, and the forged heading would then
+    // win the parser's last-occurrence rule and blank the real section. This is
+    // not only an attack: the normalizer exists precisely because models emit
+    // that shape, so a user pasting model output hits it by accident. Tying the
+    // gate to the parser's own normalizer keeps the two from drifting apart.
+    // Reject, never strip: silently rewriting the user's text is worse.
+    const textCandidates = [
+      updates.summary,
+      ...(Array.isArray(updates.key_points) ? updates.key_points : []),
+      ...(Array.isArray(updates.action_items) ? updates.action_items : []),
+      ...(Array.isArray(updates.discussion_areas)
+        ? updates.discussion_areas.flatMap((area) => [area && area.title, area && area.analysis])
+        : []),
+    ].filter((value) => typeof value === 'string');
+    // My notes supports Markdown. Only level-two headings split the stored
+    // .md note into sections; other heading levels remain ordinary notes.
+    // JSON notes store this field separately and need no heading restriction.
+    const userNotesBoundary = isMarkdown && typeof updates.user_notes === 'string'
+      && /^## /m.test(normalizeMarkdownForParsing(updates.user_notes));
+    if (userNotesBoundary || textCandidates.some((value) => containsStructuralLine(normalizeMarkdownForParsing(value)))) {
+      return { success: false, error: 'A note field may not contain a markdown heading.' };
+    }
+
     // Read existing data
     if (!fs.existsSync(realPath)) {
       return {
@@ -3346,7 +4705,6 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
       };
     }
 
-    const isMarkdown = realPath.endsWith('.md');
     let data;
 
     if (isMarkdown) {
@@ -3375,6 +4733,24 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
       let body = raw;
       let updatedRaw = raw;
 
+      // Does this call touch the note's generated content (as opposed to only
+      // its title or the user's own notes)? Drives the snapshot capture below.
+      const structural =
+        updates.summary !== undefined ||
+        updates.key_points !== undefined ||
+        updates.action_items !== undefined ||
+        updates.discussion_areas !== undefined;
+
+      // Does it touch the note BODY at all? Every body writer - the generated
+      // sections AND the user's own notes - lives inside the frontmatter branch
+      // below, so this is what the missing-frontmatter guard has to key off.
+      // `structural` alone would leave the My-notes autosave (which records no
+      // edited field) reporting success over a file it never changed.
+      const bodyEdit = structural || updates.user_notes !== undefined;
+      // Set only where the body is actually reachable. A note whose frontmatter
+      // is missing or never closed leaves this false, and the guard fires.
+      let frontmatterParsed = false;
+
       if (raw.startsWith('---')) {
         // Split with NO limit and rejoin the tail: split('---', 3) DISCARDS any
         // '---' in the body (markdown thematic breaks in summaries, and the
@@ -3384,6 +4760,7 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
         // clearNoteProcessingFlag / parseMeetingMarkdown's split/slice(2).join.
         const parts = raw.split('---');
         if (parts.length >= 3) {
+          frontmatterParsed = true;
           const fmText = parts[1];
           body = parts.slice(2).join('---');
           const lines = fmText.split('\n');
@@ -3427,11 +4804,87 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
           if (updates.user_notes !== undefined) {
             body = upsertUserNotesSection(body, updates.user_notes);
           }
+
+          // Snapshot BEFORE the first structural edit. For a note that predates
+          // this feature the current content is the model's own output, because
+          // the note has never been editable - so a lazy capture here is still
+          // an accurate original.
+          if (structural && !readSnapshot(realPath)) {
+            try {
+              const before = parseMeetingMarkdown(raw, realPath);
+              captureSnapshot(
+                realPath,
+                {
+                  summary: before.summary,
+                  key_points: before.key_points,
+                  action_items: before.action_items,
+                  discussion_areas: before.discussion_areas,
+                  participants: before.participants,
+                },
+                'first_edit',
+              );
+            } catch (snapshotError) {
+              // note-snapshot's writes throw by design (a path it cannot derive
+              // a sidecar from must not be written to). That contract protects
+              // the note, and it must not also cost the user their edit: the
+              // sidecar is a diff base for later learning, the edit is the
+              // product. Log it and save anyway. The cost is that this note has
+              // no original to compare against, so a later regenerate cannot
+              // warn that it is about to discard edits (see the regenerate
+              // guard) - worth surfacing in the log, not worth refusing a save
+              // that would otherwise succeed.
+              console.error('Note snapshot capture failed (saving anyway):', snapshotError);
+            }
+          }
+
+          if (updates.summary !== undefined) {
+            body = setSummary(body, updates.summary);
+            changed.push('summary');
+          }
+          if (updates.discussion_areas !== undefined) {
+            body = setDiscussionAreas(body, updates.discussion_areas);
+            changed.push('discussion_areas');
+          }
+          if (updates.key_points !== undefined) {
+            body = setKeyPoints(body, updates.key_points);
+            changed.push('key_points');
+          }
+          if (updates.action_items !== undefined) {
+            body = setActionItems(body, updates.action_items);
+            changed.push('action_items');
+          }
+
           updatedRaw = `---${newLines.join('\n')}---${body}`;
         }
       }
 
-      fs.writeFileSync(realPath, updatedRaw, 'utf8');
+      // A content edit only reaches `body` inside the frontmatter block above.
+      // If we get here having been asked for one while that block was skipped,
+      // the note had no parsable frontmatter and the edit was silently dropped
+      // - report that instead of returning success over a file we did not
+      // change. This covers My notes as well as the generated sections: it is
+      // the autosaving editor, so it is the one that loses text unprompted.
+      if (bodyEdit && !frontmatterParsed) {
+        return { success: false, error: 'Note has no readable frontmatter; refusing to edit it.' };
+      }
+
+      // Atomic: a crash or a full disk mid-write must not leave a truncated
+      // note behind, and this write can now carry the summary itself.
+      writeFileAtomicSync(realPath, updatedRaw);
+      if (changed.length) {
+        try {
+          markEdited(realPath, changed);
+        } catch (snapshotError) {
+          // Same trade as the capture above: the note is already saved, so a
+          // sidecar bookkeeping failure must not turn a successful save into a
+          // reported failure.
+          console.error('Note snapshot update failed (note was saved):', snapshotError);
+        }
+      }
+
+      // Title/notes edits fire no processing-complete, so mirror explicitly
+      // (#413). A title change here drives the vault-file rename via the index.
+      try { obsidianSync.syncNoteBySummaryPath(realPath); } catch (_) {}
 
       data = {
         session_info: {
@@ -3470,7 +4923,10 @@ ipcMain.handle('update-meeting', async (event, summaryFilePath, updates) => {
 
     return {
       success: true,
-      message: 'Meeting updated successfully'
+      message: 'Meeting updated successfully',
+      // Markdown notes only: which generated sections this call rewrote. Empty
+      // for a title/notes-only save and for the legacy .json format.
+      edited_fields: changed,
     };
   } catch (error) {
     console.error('Update meeting error:', error);
@@ -3493,84 +4949,380 @@ ipcMain.handle('reveal-meeting-folder', async (event, filePath) => {
   }
 });
 
+// Soft-delete a note (#234): atomically HIDE only its summary file (rename into
+// `output/.pending-delete/<id>/`) so every backend scan stops seeing it, while
+// its transcript / recording / sidecars stay in place. Returns an id so the
+// renderer can offer Undo; MAIN owns an 8 s timer that COMMITS (permanently
+// unlinks everything) when it fires. Nothing is destroyed here.
 ipcMain.handle('delete-meeting', async (event, meetingData) => {
   try {
-    const fs = require('fs');
-    const path = require('path');
-
-    // meetingData is the actual meeting object, not a file path
     const meeting = meetingData;
-
-    // Build correct file paths from the meeting data - convert to absolute paths
     const projectRoot = path.join(__dirname, '..');
-
-    // Define allowed base directories for file operations (includes custom storage)
     const allowedBaseDirs = getAllowedBaseDirs();
 
-    const summaryFile = meeting.session_info?.summary_file;
-    const transcriptFile = meeting.session_info?.transcript_file;
-    const audioFile = meeting.session_info?.audio_file;
-    const sessionName = meeting.session_info?.name;
+    const summaryFile = meeting?.session_info?.summary_file;
+    // (#234) We deliberately IGNORE meeting.session_info.transcript_file /
+    // audio_file: those are renderer-supplied and arbitrary, so trusting them
+    // would let a crafted delete of note A name note B's files as ancillaries and
+    // permanently unlink them at commit. ALL ancillaries are derived from the
+    // validated summary's own STEM below — the real transcript/recording of a note
+    // ARE the stem-derived paths, so nothing legitimate is lost and the
+    // cross-note-destruction surface is closed.
+    //
+    // SCOPE (#234): gating/unsharing an org upload on delete is a separate
+    // follow-up, out of scope here — org upload sends renderer-supplied content
+    // strings (not live file reads), and the busy-guard already refuses a delete
+    // while the note is locally recording/processing/reprocessing.
 
-    // Convert relative paths to absolute paths
-    const absolutePaths = [];
-    if (summaryFile) {
-      absolutePaths.push(path.isAbsolute(summaryFile) ? summaryFile : path.join(projectRoot, summaryFile));
-    }
-    if (transcriptFile) {
-      absolutePaths.push(path.isAbsolute(transcriptFile) ? transcriptFile : path.join(projectRoot, transcriptFile));
-    }
-    if (audioFile) {
-      absolutePaths.push(path.isAbsolute(audioFile) ? audioFile : path.join(projectRoot, audioFile));
-    }
-    if (summaryFile && sessionName) {
-      const outputDir = path.dirname(path.isAbsolute(summaryFile) ? summaryFile : path.join(projectRoot, summaryFile));
-      const safeName = sessionName.replace(/[^a-zA-Z0-9_-]/g, '_');
-      absolutePaths.push(path.join(outputDir, `${safeName}_notes.txt`));
+    if (!summaryFile) {
+      // Without a summary there's nothing for a backend scan to key off — no note
+      // to hide. Treat as a no-op success (mirrors "nothing to delete").
+      return { success: true, message: 'No summary file to delete' };
     }
 
-    console.log('Attempting to delete files:', absolutePaths);
+    const toAbs = (p) => (path.isAbsolute(p) ? p : path.join(projectRoot, p));
+    const summaryPath = toAbs(summaryFile);
+    const outputDir = path.dirname(summaryPath);
 
-    let deletedCount = 0;
-    let validationErrors = 0;
-
-    // Delete all related files with path validation
-    for (const file of absolutePaths) {
-      try {
-        // Security: Validate file path is within allowed directories
-        if (!validateSafeFilePath(file, allowedBaseDirs)) {
-          console.error(`Security: Blocked attempt to delete file outside allowed directories: ${file}`);
-          validationErrors++;
-          continue;
-        }
-
-        if (fs.existsSync(file)) {
-          fs.unlinkSync(file);
-          deletedCount++;
-          console.log(`Deleted: ${file}`);
-        } else {
-          console.log(`File not found (already deleted?): ${file}`);
-        }
-      } catch (err) {
-        console.warn(`Could not delete ${file}:`, err.message);
+    // Derive the note's stem from its summary basename (<stem>_summary.{json,md}).
+    // Every ancillary is bound to this stem (never taken raw from the meeting obj).
+    const summaryBase = path.basename(summaryPath);
+    let stem = null;
+    for (const suf of ['_summary.md', '_summary.json']) {
+      if (summaryBase.endsWith(suf)) {
+        stem = summaryBase.slice(0, -suf.length);
+        break;
       }
     }
 
-    if (validationErrors > 0) {
-      return {
-        success: false,
-        error: `Blocked ${validationErrors} file deletion(s) due to security validation`
-      };
+    // Refuse a delete for a note that's currently active (recording into /
+    // queued / processing / reprocessing): a finishing job would rewrite
+    // (resurrect) or re-upload the summary we're about to hide.
+    if (isSummaryBusy(summaryPath)) {
+      return { success: false, error: 'note is busy (recording/processing)' };
     }
 
-    return {
-      success: true,
-      message: `Deleted meeting and ${deletedCount} associated files`
+    // Dedup: one pending delete per summary. Reject rather than replace (a stale
+    // caller view must not silently supersede an in-flight window).
+    const canonicalSummary = canonicalPathForCompare(summaryPath);
+    if (pendingDeleteBySummary.has(canonicalSummary)) {
+      return { success: false, error: 'delete already pending' };
+    }
+
+    // --- Enumerate the ANCILLARY file set (unlinked only at commit), bound to
+    // this note's STEM ONLY (never the renderer-supplied transcript_file /
+    // audio_file): the <stem>_reports.json and <stem>_original.json sidecars and
+    // the stem-derived transcript + recording(s). Only the SUMMARY file itself
+    // is hidden.
+    //
+    // Deliberately EXCLUDED: `<safeName>_notes.txt`. That draft-notes file is
+    // named from the renderer-controlled session title, NOT the stem, so two
+    // notes sharing a title share the file — committing this delete could
+    // permanently unlink another note's draft. It isn't safely bindable to this
+    // note's identity, so we leave it orphaned (the fail-safe direction).
+    const ancillaryCandidates = [];
+    // Stem-derived sidecars: <stem>_summary.{md,json} -> <stem>_<suffix>.
+    //   _reports.json  - generated template reports (#249 backups included).
+    //   _original.json - the model's own output for this note (app/note-snapshot.js
+    //     and simple_recorder.py's _write_original_snapshot). It holds summary,
+    //     key_points, action_items, discussion_areas AND participants, i.e. the
+    //     substance of the meeting and who was in it. Leaving it behind would
+    //     mean a committed delete still leaves a readable copy of the meeting on
+    //     disk, with no UI that ever shows it - a privacy regression against the
+    //     local-first promise, not just untidiness. Same "unlinked only at
+    //     commit" semantics as the rest: an undo must restore a COMPLETE note.
+    for (const sidecarSuffix of ['_reports.json', '_original.json']) {
+      let sidecarBase = null;
+      for (const suf of ['_summary.md', '_summary.json']) {
+        if (summaryBase.endsWith(suf)) {
+          sidecarBase = summaryBase.slice(0, -suf.length) + sidecarSuffix;
+          break;
+        }
+      }
+      if (!sidecarBase) {
+        const ext = path.extname(summaryBase);
+        sidecarBase = summaryBase.slice(0, summaryBase.length - ext.length) + sidecarSuffix;
+      }
+      ancillaryCandidates.push(path.join(outputDir, sidecarBase));
+    }
+    // Speakers sidecar: <stem>_speakers.json. Same class of miss as the
+    // reports sidecar was -- a per-meeting file added later that the delete
+    // enumeration never learned about. Reproduced end to end: the note,
+    // transcript and audio went, and an 84 KB file of VOICE EMBEDDINGS
+    // stayed behind, which is the worst thing in the set to leave on disk
+    // after someone deletes a meeting. It is stem-bound like the others, so
+    // it inherits the same containment checks and the same undo window.
+    //
+    // Note this removes only the meeting's per-cluster embeddings. A person
+    // CONFIRMED from this meeting keeps their voice profile in config.json,
+    // deliberately: those are bound to the person, not the meeting, and are
+    // what makes recognition work across recordings (verified against a real
+    // library, where working prototypes came from meetings deleted long ago).
+    // Deleting a person is its own explicit action in the Speakers panel.
+    if (stem) {
+      ancillaryCandidates.push(path.join(outputDir, `${stem}_speakers.json`));
+    }
+    // Imported transfer audio is bound to the same immutable summary stem.
+    // Enumerate only canonical track files, never paths from meeting JSON.
+    const transferMediaDir = transferMediaDirectory(outputDir, stem);
+    if (transferMediaDir) {
+      try {
+        for (const name of fs.readdirSync(transferMediaDir)) {
+          if (/^track-[1-9][0-9]*\.caf$/.test(name)) ancillaryCandidates.push(path.join(transferMediaDir, name));
+        }
+      } catch (_) { /* text-only package */ }
+    }
+    // Derive the transcript + recording from the summary stem (FACT A). A normal
+    // .md note carries ONLY summary_file, so without this the transcript and the
+    // RECORDING would be orphaned, defeating the whole point of #234 (protect the
+    // audio). Naming mirrors the backend: <base>/transcripts/<stem>_transcript.txt
+    // and <base>/recordings/<stem>.<ext> (any extension — imports stay .m4a/.mp3,
+    // system-audio is .webm, native captures are .wav; Codex C5).
+    if (stem) {
+      const dataRoot = path.dirname(outputDir); // summary is in <base>/output/
+      ancillaryCandidates.push(path.join(dataRoot, 'transcripts', `${stem}_transcript.txt`));
+      const recordingsDir = path.join(dataRoot, 'recordings');
+      try {
+        for (const name of fs.readdirSync(recordingsDir)) {
+          if (path.parse(name).name === stem) {
+            ancillaryCandidates.push(path.join(recordingsDir, name));
+          }
+        }
+      } catch (_) {
+        // recordings/ may not exist (summary-only note) — nothing to add.
+      }
+    }
+
+    // --- Security pre-pass on the SUMMARY (the only file we move). Must pass the
+    // broad containment check, live in an allowed meeting folder, and be a real
+    // regular file (reject a dir/symlink so a crafted meeting can't redirect the
+    // rename). Any failure blocks the whole delete before anything is touched.
+    if (!validateSafeFilePath(summaryPath, allowedBaseDirs)) {
+      console.error(`Security: Blocked delete of summary outside allowed dirs: ${summaryPath}`);
+      return { success: false, error: 'Blocked delete due to security validation' };
+    }
+    if (!isAllowedMeetingSource(summaryPath, allowedBaseDirs)) {
+      console.error(`Security: summary is not in an allowed meeting folder: ${summaryPath}`);
+      return { success: false, error: 'Blocked delete due to security validation' };
+    }
+    let summaryStat;
+    try {
+      summaryStat = fs.lstatSync(summaryPath);
+    } catch (_) {
+      // Already gone from disk — nothing for a scan to see. No-op success.
+      return { success: true, message: 'No files to delete' };
+    }
+    if (!summaryStat.isFile()) {
+      return { success: false, error: 'Summary is not a regular file' };
+    }
+
+    // --- Twin edge (ANOMALOUS, FAIL-SAFE): a note names EXACTLY ONE
+    // summary_file, and we hide only that one. If a stem somehow has BOTH
+    // <stem>_summary.json AND <stem>_summary.md, hiding the named one leaves the
+    // other, and the `output/<stem>_summary.{json,md}` scan keeps the note VISIBLE —
+    // so the delete under-hides (note REAPPEARS), never over-deletes: nothing is
+    // lost. This is accepted deliberately: the app's own writers only ever
+    // produce <stem>_summary.md (JSON summaries are legacy, read-only; reprocess
+    // rewrites in place without changing suffix), so a real twin can only arise
+    // from external/legacy state. Hiding all variants would be nicer, but NOT at
+    // the cost of the multi-file rename + rollback path (a failed rollback there
+    // can strand/destroy a summary) — for user AUDIO the single-file tombstone is
+    // the safer trade. A follow-up could hide every variant if it stays
+    // rollback-free.
+
+    // Filter ancillaries to the ones that EXIST, are regular files, and live in
+    // an allowed meeting folder — the only paths we'll unlink at commit. A bad
+    // one (missing, symlink, dir, out-of-folder) is skipped, never fatal. Exclude
+    // the summary itself (it's hidden, not unlinked as an ancillary).
+    const uniqueAncillary = [...new Set(ancillaryCandidates)].filter((p) => p !== summaryPath);
+    const ancillaryPaths = [];
+    for (const p of uniqueAncillary) {
+      if (!validateSafeFilePath(p, allowedBaseDirs)) {
+        console.warn(`Skipping ancillary outside allowed dirs (not tracked): ${p}`);
+        continue;
+      }
+      let st;
+      try {
+        st = fs.lstatSync(p);
+      } catch (_) {
+        continue; // Missing — nothing to unlink at commit.
+      }
+      if (!st.isFile()) {
+        console.warn(`Skipping non-regular-file ancillary (not tracked): ${p}`);
+        continue;
+      }
+      const isTransferTrack = transferMediaDir && path.dirname(p) === transferMediaDir
+        && /^track-[1-9][0-9]*\.caf$/.test(path.basename(p));
+      if (!isTransferTrack && !isAllowedMeetingSource(p, allowedBaseDirs)) {
+        console.warn(`Skipping ancillary outside allowed meeting folders (not tracked): ${p}`);
+        continue;
+      }
+      ancillaryPaths.push(p);
+    }
+
+    // --- Atomically HIDE the single summary. `.pending-delete/<id>/` is a
+    // sibling of the summary under output/, so renameSync is atomic on the same
+    // filesystem (no EXDEV).
+    const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    const pendingRoot = path.join(outputDir, PENDING_DELETE_DIRNAME);
+
+    // Fail-closed if the `.pending-delete` root exists but is NOT a real directory
+    // (a symlink/file). mkdirSync would follow a symlinked root and move the
+    // summary OUT of the sandbox, and startup recovery skips a non-dir root — the
+    // note would be stranded/lost. This matches the guard in
+    // recoverPendingDeletesOnLaunch().
+    try {
+      const rootStat = fs.lstatSync(pendingRoot);
+      if (!rootStat.isDirectory()) {
+        return { success: false, error: 'invalid pending-delete root' };
+      }
+    } catch (err) {
+      // ONLY a genuinely-missing root is fine (mkdir creates it below). Any other
+      // lstat error (EACCES, EIO, ...) must fail-closed: we can't prove the root
+      // is a safe directory, so refuse rather than mkdir into an unknown state.
+      if (!err || err.code !== 'ENOENT') {
+        return { success: false, error: 'cannot access pending-delete root' };
+      }
+    }
+
+    const hiddenDir = path.join(pendingRoot, id);
+    try {
+      fs.mkdirSync(hiddenDir, { recursive: true });
+    } catch (err) {
+      // e.g. output/ is read-only (fail-closed): nothing moved, originals intact.
+      return { success: false, error: `Failed to prepare pending-delete: ${err.message}` };
+    }
+
+    // Hide the summary with ONE same-filesystem rename. On failure remove the
+    // scaffold; the original is untouched (rename either fully succeeds or leaves
+    // the source in place) so there is no partial state to roll back.
+    const hiddenSummaryPath = path.join(hiddenDir, path.basename(summaryPath));
+    if (!validateSafeFilePath(hiddenSummaryPath, allowedBaseDirs)) {
+      try {
+        fs.rmSync(hiddenDir, { recursive: true, force: true });
+      } catch (_) {}
+      return { success: false, error: 'Blocked delete due to security validation' };
+    }
+    try {
+      fs.renameSync(summaryPath, hiddenSummaryPath);
+    } catch (err) {
+      try {
+        fs.rmSync(hiddenDir, { recursive: true, force: true });
+      } catch (_) {}
+      return { success: false, error: `Failed to hide summary: ${err.message}` };
+    }
+
+    // Record the pending delete + start MAIN's deadline timer.
+    const deadline = Date.now() + DELETE_WINDOW_MS;
+    const entry = {
+      id,
+      meeting,
+      // The exact `summary_file` string the renderer's list is keyed on, so a
+      // rehydrating renderer can match this note.
+      summaryFileKey: summaryFile,
+      hiddenDir,
+      originalSummaryPath: summaryPath,
+      hiddenSummaryPath,
+      canonicalSummary,
+      ancillaryPaths,
+      transferMediaDir,
+      deadline,
+      state: 'pending',
+      timer: null,
     };
+    entry.timer = setTimeout(() => {
+      try {
+        commitPendingDelete(id);
+      } catch (_) {}
+    }, DELETE_WINDOW_MS);
+    pendingDeletes.set(id, entry);
+    pendingDeleteBySummary.set(canonicalSummary, id);
+
+    return { success: true, id, deadline };
   } catch (error) {
     console.error('Delete meeting error:', error);
     return { success: false, error: error.message };
   }
+});
+
+// Undo a soft-delete (#234): rename the hidden summary back to its original path
+// so the note reappears in every backend scan. Near-infallible (one same-
+// filesystem rename). Loses only once the window has started committing.
+ipcMain.handle('undo-delete-meeting', async (event, id) => {
+  try {
+    if (!isSafePendingId(id)) {
+      return { success: false, error: 'Invalid delete id' };
+    }
+    const entry = pendingDeletes.get(id);
+    if (!entry || entry.state !== 'pending') {
+      // Missing or already committing — Undo loses once the commit starts.
+      return { success: false, error: 'nothing to undo' };
+    }
+    // No-clobber: if the original path is now occupied (e.g. the user re-recorded
+    // the same-stem note during the window), refuse — keep the tombstone intact.
+    // lstat (not existsSync) so a DANGLING symlink there also counts as occupied.
+    // The residual TOCTOU between this check and the renameSync below is accepted:
+    // single-user desktop, synchronous handler, sub-ms window; Node has no atomic
+    // rename-no-replace.
+    if (pathIsOccupied(entry.originalSummaryPath)) {
+      console.error(`Undo: original path occupied, refusing to clobber: ${entry.originalSummaryPath}`);
+      return { success: false, error: 'restore target already exists' };
+    }
+    // Restore the single summary with one same-filesystem rename.
+    try {
+      fs.renameSync(entry.hiddenSummaryPath, entry.originalSummaryPath);
+    } catch (err) {
+      return { success: false, error: `Undo failed: ${err.message}` };
+    }
+    // Success — clear the timer, drop the entry + its scaffold dir.
+    if (entry.timer) {
+      clearTimeout(entry.timer);
+      entry.timer = null;
+    }
+    removeHiddenScaffold(entry.hiddenDir);
+    pendingDeletes.delete(id);
+    if (pendingDeleteBySummary.get(entry.canonicalSummary) === id) {
+      pendingDeleteBySummary.delete(entry.canonicalSummary);
+    }
+    return { success: true, meeting: entry.meeting };
+  } catch (error) {
+    console.error('Undo delete meeting error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// Explicit COMMIT (#234): the user dismissed the toast (or its window elapsed and
+// the renderer wants to finalize now). Permanently removes the note's files.
+// Idempotent: an unknown / already-committed id is a success (nothing to do).
+ipcMain.handle('commit-delete-meeting', async (event, id) => {
+  try {
+    if (!isSafePendingId(id)) {
+      return { success: false, error: 'Invalid delete id' };
+    }
+    commitPendingDelete(id);
+    return { success: true };
+  } catch (error) {
+    console.error('Commit delete meeting error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+// List the notes with an in-flight soft-delete, so a freshly-loaded renderer can
+// rehydrate its Undo toasts (MAIN owns the deadline — the renderer must not
+// invent its own). Returns the exact `summary_file` string each note is listed
+// under, plus the id + deadline + meeting for the toast.
+ipcMain.handle('list-pending-deletes', async () => {
+  const pending = [];
+  for (const entry of pendingDeletes.values()) {
+    if (entry.state !== 'pending') continue;
+    pending.push({
+      id: entry.id,
+      summaryFile: entry.summaryFileKey,
+      deadline: entry.deadline,
+      meeting: entry.meeting,
+    });
+  }
+  return { success: true, pending };
 });
 
 // Queue status handler
@@ -3589,6 +5341,10 @@ ipcMain.handle('get-queue-status', async () => {
           ? Math.floor((Date.now() - currentProcessingStartedAtMs) / 1000)
           : 0),
     sessionName: currentRecordingSessionName,
+    recordingId: systemAudioRecordingActive && recordingRuntimeState.startedAtMs
+      ? String(recordingRuntimeState.startedAtMs) : null,
+    chatSummaryFile: systemAudioRecordingActive
+      ? (currentRecordingAppendTarget || activeSysAudioSummaryFile) : null,
     // The note (summary-file realpath) an active continue/resume is recording
     // INTO, so the renderer can tell "recording this note" from "recording a
     // different one" by identity rather than by the (collidable) display name.
@@ -3597,6 +5353,25 @@ ipcMain.handle('get-queue-status', async () => {
       (currentRecordingProcess !== null || systemAudioRecordingActive)
         ? (currentRecordingAppendTarget || null)
         : null,
+    // The real note file the CURRENT recording/processing session produces (the
+    // instant-stop placeholder written at stop, then rewritten in place by the
+    // pipeline). Lets useMeetings dedupe the synthetic "__live__/…" row against
+    // the real note once it exists, so one recording is never shown twice
+    // (#bug4). Deterministic from the audio stem, so it's the same key across
+    // this session's recording → processing phases.
+    //
+    // Precedence matters: prefer the ACTIVE recording's key over a PROCESSING
+    // job's. In the supported back-to-back flow (stop meeting A → immediately
+    // start meeting B while A is still processing), `sessionName` reports B (the
+    // recording), so liveSummaryFile must also be B's — otherwise it'd be A's,
+    // A's note is already in the list, and B's live row would be wrongly dropped
+    // (B shows no row at all). At B's own stop, teardown nulls
+    // activeSysAudioSummaryFile before currentProcessingJob is set to B, so the
+    // fallback still yields B and the intended dedup against B's placeholder
+    // fires. Only the Parakeet instant-stop path writes a placeholder, so this
+    // only actually bites there; Whisper/import have no placeholder (dedup is a
+    // no-op) and it's null when idle.
+    liveSummaryFile: activeSysAudioSummaryFile || currentProcessingJob?.summaryFile || null,
   };
 });
 
@@ -3702,10 +5477,8 @@ function spawnLiveTranscribe(sessionName) {
     liveTranscribeSessionName = null;
     liveTranscribeStdoutBuf = '';
   }
-  const aiEnv = getAiEnv();
-  const env = Object.keys(aiEnv).length > 0
-    ? { ...require('process').env, ...aiEnv }
-    : undefined;
+  const aiEnv = { ...getAiEnv(), ...getTranscriptionEnv() };
+  const env = getBackendEnv(aiEnv);
   parakeetLoadStartedAt = Date.now();
   liveTranscribeProcess = spawn(getBackendPath(), ['transcribe-stream'], {
     cwd: getBackendCwd(),
@@ -3976,7 +5749,8 @@ function loadTranscriptionEngine() {
     if (!fs.existsSync(cfgPath)) return 'parakeet';
     const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
     const engine = cfg.transcription_engine;
-    return engine === 'whisper' ? 'whisper' : 'parakeet';
+    if (engine === 'whisper' || engine === 'openai-asr') return engine;
+    return 'parakeet';
   } catch (_) {
     return 'parakeet';
   }
@@ -3993,12 +5767,21 @@ function loadTranscriptionContext() {
       return { engine: 'parakeet', model: 'parakeet', language: 'auto' };
     }
     const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
-    const engine = cfg.transcription_engine === 'whisper' ? 'whisper' : 'parakeet';
-    return {
-      engine,
+    const rawEngine = cfg.transcription_engine;
+    const engine = (rawEngine === 'whisper' || rawEngine === 'openai-asr') ? rawEngine : 'parakeet';
+    let model;
+    if (engine === 'whisper') {
+      model = sanitizeModelForAnalytics(cfg.whisper_model);
+    } else if (engine === 'openai-asr') {
+      model = sanitizeModelForAnalytics(cfg.openai_asr_model) || 'whisper-1';
+    } else {
       // Parakeet has no separate user-selectable model today (single bundled
       // default) -- report the engine name rather than guess a variant id.
-      model: engine === 'whisper' ? sanitizeModelForAnalytics(cfg.whisper_model) : 'parakeet',
+      model = 'parakeet';
+    }
+    return {
+      engine,
+      model,
       language: cfg.language || 'auto',
     };
   } catch (_) {
@@ -4054,8 +5837,38 @@ function loadShowMenuBarIconEnabled() {
   }
 }
 
+// Sync read of the idle auto-install setting; default ON (matches the Python
+// config default). Read fresh on every gate tick so flipping the toggle in
+// Settings takes effect without a relaunch. Same no-subprocess JSON read as the
+// helpers above — the source of truth is the Python config.
+function loadAutoInstallWhenIdleEnabled() {
+  try {
+    const cfgPath = path.join(getUserDataDir(), 'config.json');
+    if (!fs.existsSync(cfgPath)) return true;
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+    return cfg.auto_install_when_idle !== false;
+  } catch (_) {
+    return true;
+  }
+}
+
 // Global recording state management
 let systemAudioRecordingActive = false;  // Track system audio recording for tray/quit
+// Toggle renderer background-throttling to match recording state (#442 review).
+// While recording we must NOT throttle — capture is renderer-owned (MediaRecorder
+// timeslice + silence-auto-stop interval + the live-tap) and can run with the
+// window hidden (auto-detect starts without showing it), where Chromium would
+// otherwise clamp timers. When not recording we allow throttling so a
+// backgrounded-idle app doesn't waste CPU. Reads the flag, so it's correct
+// regardless of which start/stop path called it. Idempotent + fail-safe.
+function applyRecordingBackgroundThrottling() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    // setBackgroundThrottling(allowed): true = throttle when hidden (default),
+    // false = never throttle. We disallow throttling while recording.
+    mainWindow.webContents.setBackgroundThrottling(!systemAudioRecordingActive);
+  } catch (_) { /* older Electron / no webContents — harmless */ }
+}
 let currentRecordingProcess = null;
 let currentRecordingSessionName = null;  // Surfaced in get-queue-status so renderer knows which meeting is live
 let processingQueue = [];
@@ -4131,6 +5944,12 @@ let currentProcessingStartedAtMs = null;
 // IPC overwrote A's entry, and A's finally would null the state out while
 // B was still running, hiding B's badge. Entries are removed in each IPC's
 // finally so a Python crash or spawn error doesn't leave them stuck.
+//
+// NOTE (pre-existing, out of #234 scope): keyed by summaryFile, so TWO jobs on
+// the SAME summary path still overwrite each other's marker (and the first
+// finally clears it while the second runs). The reprocess UI's re-entrancy
+// guards prevent concurrent same-note jobs, so this isn't triggerable today; not
+// changed here to avoid altering the shared map's semantics.
 const activeReprocessJobs = new Map();
 let recordingRuntimeState = {
   startedAtMs: null,
@@ -4140,7 +5959,6 @@ let recordingRuntimeState = {
 };
 let ollamaProcess = null;  // Track spawned Ollama process for cleanup on quit
 let ollamaPid = null;      // Store PID separately since unref() disconnects the process
-let ollamaStartedByUs = false;
 
 // Content-free crash/force-quit detection (report Appendix: ~8% of macOS
 // recordings never fire recording_stopped at all -- a silent gap in the
@@ -4216,6 +6034,7 @@ function markRecordingPaused() {
   }
   recordingRuntimeState.isPaused = true;
   recordingRuntimeState.pausedAtMs = Date.now();
+  updateTrayMenu(); // offers Resume Recording
 }
 
 function markRecordingResumed() {
@@ -4227,6 +6046,7 @@ function markRecordingResumed() {
   }
   recordingRuntimeState.isPaused = false;
   recordingRuntimeState.pausedAtMs = null;
+  updateTrayMenu();
 }
 
 function getRecordingElapsedSeconds() {
@@ -4272,16 +6092,20 @@ let systemSuspendedForWatchdogs = false;
 
 function makeInactivityWatchdog(proc, ms, label) {
   let timer = null;
+  let timedOut = false;
   const arm = () => {
     timer = setTimeout(() => {
       timer = null;
+      timedOut = true;
       activeInactivityWatchdogs.delete(watchdog);
       console.error(`${label} produced no output for ${Math.round(ms / 60000)} minutes, killing`);
       sendDebugLog(`${label} inactive for ${Math.round(ms / 60000)} minutes — killing process`);
-      try { proc.kill(); } catch (e) { /* process already gone */ }
+      try { proc.kill(); } catch { /* process already gone */ }
     }, ms);
   };
   const watchdog = {
+    // Retain the cause after clear(): close handlers need it after cleanup.
+    get timedOut() { return timedOut; },
     // Any stdout/stderr activity proves liveness — push the deadline out.
     reset() {
       if (timer === null) return; // fired, cleared, or frozen — don't re-arm
@@ -4347,6 +6171,10 @@ async function processNextInQueue() {
   // so the catch block below can still read it after the inner Promise
   // executor's scope has closed.
   let processingStage = 'transcription';
+  // Captured from a STREAM_ERROR: line during the summarization stage, so the
+  // catch block below can classify the real failure reason for error_occurred
+  // instead of only seeing "exited with code N" (see classifySummarizationStreamError).
+  let summarizationStreamError = null;
   // Read once per job (not per marker) -- engine/model/language/provider
   // don't change mid-job, and this avoids a repeated config.json read on
   // every stdout line.
@@ -4355,10 +6183,18 @@ async function processNextInQueue() {
   // Set when TRANSCRIPTION_COMPLETE arrives, so summarization_completed's
   // processing_bucket measures summarization time alone, not the whole job.
   let transcriptionEndedAtMs = null;
+  // Set true only when STREAM_COMPLETE arrives (summarization actually ran).
+  // Stays false on the transcript-only path (auto_summarize off → the backend
+  // prints SUMMARY_SKIPPED, never STREAM_COMPLETE), so the renderer can fire
+  // "Note ready" only when notes really exist, and a "Transcript ready —
+  // generate notes?" prompt otherwise (#bug2/#bug3).
+  let summarizationCompleted = false;
 
   try {
-    const queueAiEnv = getAiEnv();
-    const queueEnv = Object.keys(queueAiEnv).length > 0 ? { ...require('process').env, ...queueAiEnv } : undefined;
+    // process-streaming does BOTH transcription (needs the ASR key) and
+    // summarization (needs the AI env), so merge both.
+    const queueAiEnv = { ...getAiEnv(), ...getTranscriptionEnv() };
+    const queueEnv = getBackendEnv(queueAiEnv);
     const processArgs = ['process-streaming', currentProcessingJob.audioFile, '--name', currentProcessingJob.sessionName];
     if (currentProcessingJob.notesFile && fs.existsSync(currentProcessingJob.notesFile)) {
       processArgs.push('--notes', currentProcessingJob.notesFile);
@@ -4445,6 +6281,7 @@ async function processNextInQueue() {
               mainWindow.webContents.send('summary-title', { title, sessionName: currentProcessingJob.sessionName });
             }
           } else if (line === 'STREAM_COMPLETE') {
+            summarizationCompleted = true;
             const summarizationStartMs = transcriptionEndedAtMs || currentProcessingStartedAtMs;
             trackEvent('summarization_completed', {
               success: true,
@@ -4464,6 +6301,17 @@ async function processNextInQueue() {
               model: transcriptionCtx.model,
               language: transcriptionCtx.language,
             });
+          } else if (line.startsWith('STREAM_ERROR:')) {
+            // Guarded on the WRITE (not just read at trackEvent time): today
+            // process_streaming only ever prints STREAM_ERROR during the
+            // summarization stage, but if that ever changed, an unguarded
+            // capture here would let a transcription-stage STREAM_ERROR
+            // masquerade as (or be overwritten by) a later summarization
+            // failure that dies without its own message.
+            if (processingStage === 'summarization') {
+              summarizationStreamError = line.slice('STREAM_ERROR:'.length).trim();
+            }
+            forwardDiagnosticStdout(line, 'process-streaming');
           } else if (line.startsWith('PROGRESS:')) {
             if (mainWindow && !mainWindow.isDestroyed()) {
               // Instant stop stamps the (deterministic) summaryFile so the
@@ -4508,6 +6356,13 @@ async function processNextInQueue() {
         if (code === 0) {
           console.log(`✅ Completed streaming processing: ${currentProcessingJob.sessionName}`);
           const sessionNameAtClose = currentProcessingJob.sessionName;
+          // Mirror the finished note into an Obsidian vault when sync is on
+          // (#413). Best-effort — a vault write must never affect processing.
+          try {
+            const finishedSummary = savedSummaryFile
+              || (currentProcessingJob && currentProcessingJob.summaryFile);
+            if (finishedSummary) obsidianSync.syncNoteBySummaryPath(finishedSummary);
+          } catch (_) {}
           // Notify frontend that streaming is done and meeting is saved
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('summary-complete', {
@@ -4539,10 +6394,12 @@ async function processNextInQueue() {
                 mainWindow.webContents.send('processing-complete', {
                   success: true,
                   sessionName: sessionNameAtClose,
+                  summaryFile: savedSummaryFile || undefined,
                   message: transcriptionFailedMsg
                     ? 'Transcription failed; recording preserved (not deleted)'
                     : 'Processing completed successfully',
                   meetingData: processedMeeting,
+                  notesGenerated: summarizationCompleted,
                   transcriptionFailed: Boolean(transcriptionFailedMsg),
                   transcriptionError: transcriptionFailedMsg || undefined
                 });
@@ -4556,9 +6413,11 @@ async function processNextInQueue() {
                 mainWindow.webContents.send('processing-complete', {
                   success: true,
                   sessionName: sessionNameAtClose,
+                  summaryFile: savedSummaryFile || undefined,
                   message: transcriptionFailedMsg
                     ? 'Transcription failed; recording preserved (not deleted)'
                     : 'Processing completed successfully',
+                  notesGenerated: summarizationCompleted,
                   transcriptionFailed: Boolean(transcriptionFailedMsg),
                   transcriptionError: transcriptionFailedMsg || undefined
                 });
@@ -4577,6 +6436,13 @@ async function processNextInQueue() {
       error_type: 'processing_queue',
       stage: processingStage,
       reason: classifyErrorReason(error),
+      // A STREAM_ERROR: line during the summarization stage carries the real
+      // failure reason (Ollama down, model missing, empty reduce result, ...)
+      // that classifyErrorReason can't see -- it only looked at stderr, which
+      // otherwise collapses every summarization crash into subprocess_exit_1.
+      ...(processingStage === 'summarization' && summarizationStreamError
+        ? { summarization_reason: classifySummarizationStreamError(summarizationStreamError) }
+        : {}),
     });
 
     // A processing crash (e.g. a metal::malloc OOM that SIGABRTs the
@@ -4933,12 +6799,14 @@ ipcMain.handle('start-recording-ui', async (_, sessionName, trigger, appendTo) =
     // retired, so there is no longer a mic-XOR-system fork here.
     sendDebugLog(`Starting renderer-driven recording (name ${String(actualSessionName || '').length} chars)`);
     currentRecordingSessionName = actualSessionName;
+    activeSysAudioSummaryFile = null;
     startRecordingRuntimeState();
     // Flip the active flag immediately so the queue handler reports
     // hasRecording=true on the very next poll, which is what cues the renderer
     // hook to fire startCapture. reportSystemAudioState then re-affirms it on
     // success / clears it on failure.
     systemAudioRecordingActive = true;
+    applyRecordingBackgroundThrottling();
     // Reset the live transcript buffer before the sidecar starts emitting.
     // On a resume/continue into the SAME note, preserve the previous session's
     // finalised segments as display-only `priorSegments` so the live bar shows
@@ -5077,9 +6945,13 @@ function showSleepPausedNotification() {
   const notif = new Notification({
     title: 'Recording paused',
     body: 'Paused while your computer was asleep. Resume to keep capturing.',
-    // `actions` renders on macOS only; the click handler below covers
-    // Windows, where the whole notification is the affordance.
+    iconType: 'alert',
+    // The Resume action button is always rendered by the custom toast (both
+    // platforms); the click handler below covers a body tap as well.
     actions: [{ type: 'button', text: 'Resume' }],
+    // The user is usually away when this fires, so it must still be there when
+    // they come back; closeSleepPausedNotification() removes it (#412).
+    persistent: true,
   });
   const resume = () => {
     sleepPausedNotif = null;
@@ -5088,7 +6960,7 @@ function showSleepPausedNotification() {
       mainWindow.webContents.send('auto-resume-requested');
     }
   };
-  notif.on('action', (_evt, _index) => resume());
+  notif.on('action', () => resume());
   notif.on('click', resume);
   trackNotificationLifecycle(notif, 'sleep_paused');
   notif.show();
@@ -5192,6 +7064,7 @@ ipcMain.handle('stop-recording-ui', async () => {
       liveTranscriptState.summaryFile = instantSummaryFile;
     }
     systemAudioRecordingActive = false;
+    applyRecordingBackgroundThrottling();
     stopLiveTranscribe();
     currentRecordingSessionName = null;
     // Captured before resetRecordingRuntimeState() clears startedAtMs.
@@ -5244,6 +7117,79 @@ ipcMain.handle('startup-setup-check', async () => {
   }
 });
 
+// Speaker-diarization engines the steno-diarize sidecar accepts. Mirrors
+// Config.VALID_DIARIZATION_ENGINES; checked here so a renderer-supplied value
+// can never reach the CLI argv as anything but a known engine name.
+const DIARIZATION_ENGINES = ['sortformer', 'nemotron3'];
+
+function isDiarizationEngine(value) {
+  return typeof value === 'string' && DIARIZATION_ENGINES.includes(value);
+}
+
+// `engine` (optional) targets that engine's models instead of the saved
+// setting -- Settings prepares a choice before persisting it.
+async function runSpeakerModelCommand(command, engine) {
+  if (process.platform !== 'darwin') {
+    return {
+      success: false,
+      ready: false,
+      error: 'Speaker diarization is unavailable on this system',
+    };
+  }
+  const args = [command];
+  if (engine !== undefined && engine !== null) {
+    if (!isDiarizationEngine(engine)) {
+      return { success: false, ready: false, error: 'Unknown speaker detection engine' };
+    }
+    args.push('--engine', engine);
+  }
+  const output = await runPythonScript('simple_recorder.py', args);
+  return parseSpeakerModelStatusOutput(output);
+}
+
+ipcMain.handle('speaker-model-status', async (event, engine) => {
+  try {
+    return await runSpeakerModelCommand('speaker-model-status', engine);
+  } catch {
+    sendDebugLog('Speaker diarization model status check failed');
+    return {
+      success: false,
+      ready: false,
+      error: 'Could not check the speaker diarization models',
+    };
+  }
+});
+
+// One shared download for onboarding and Settings; progress goes to the
+// renderer as 'speaker-models-progress' ({ percent, phase }).
+const prepareSpeakerModels = createSpeakerModelPreparer({
+  spawn,
+  getBackendPath,
+  getBackendCwd,
+  makeLineReader,
+  onLog: sendDebugLog,
+  platform: process.platform,
+  onProgress: (progress) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('speaker-models-progress', progress);
+    }
+  },
+});
+
+// `engine` (optional) downloads that engine's models instead of the saved
+// setting's -- Settings prepares a choice before persisting it.
+ipcMain.handle('setup-speaker-models', async (event, engine) => {
+  if (engine !== undefined && engine !== null && !isDiarizationEngine(engine)) {
+    return { success: false, ready: false, error: 'Unknown speaker detection engine' };
+  }
+  sendDebugLog('Preparing local speaker diarization models...');
+  const result = await prepareSpeakerModels(engine ?? undefined);
+  sendDebugLog(result.success && result.ready
+    ? 'Speaker diarization models ready'
+    : 'Speaker diarization model setup failed');
+  return result;
+});
+
 // ── Auto-updater ──
 // Mirrors the autoUpdater event sequence (available -> progress* ->
 // downloaded) so AboutTab can recover its state on every mount instead of
@@ -5262,6 +7208,138 @@ let pendingDownloadPercent = null;
 // a failed background update would show nothing. Cleared when a new cycle
 // starts (check / available / progress) or a download completes.
 let pendingUpdateError = null;
+// Whether that error survives a later successful check. A dropped connection
+// is disproved by one; a full disk, a missing update feed or a permission
+// problem is not, and clearing those on an unrelated success would hide a
+// condition that is still true. See update-error-copy.js.
+let pendingUpdateErrorSticky = false;
+// True between calling quitAndInstall and the app actually going away, so an
+// error that fires in that window is reported as a failed install rather than
+// as a failed check.
+let installingUpdate = false;
+
+// ── Idle auto-install ──
+// True once an update has finished downloading and is staged for install.
+// The safety gate (update-idle-gate.js) requires this before it will relaunch.
+let updateDownloadedReady = false;
+// The periodic idle checker's timer, and a one-shot latch so we call
+// quitAndInstall at most once even if a tick races the relaunch.
+let idleAutoInstallInterval = null;
+let autoInstallFired = false;
+// Idle threshold: the machine must have had no user input for this long before
+// we relaunch, so an auto-install never interrupts someone mid-task. 10 min.
+const IDLE_AUTO_INSTALL_THRESHOLD_SECONDS = 600;
+// How often to re-evaluate the gate. Cheap (a config read + a few booleans).
+const IDLE_AUTO_INSTALL_CHECK_MS = 60 * 1000;
+
+// Snapshot every input the safety gate needs, read fresh at call time. Kept in
+// one place so the initial check and the post-settle re-check (below) can't
+// drift — they must gather identical state or the re-check is meaningless.
+//   - streaming: in-flight AI query/summary/chat streams register a killable
+//     proc in activeQueryProcs.
+//   - otherJobsActive: reprocess (re-summarize), report generation, and title
+//     regeneration all run OUTSIDE isProcessing/processingQueue; each handler
+//     registers its job in activeReprocessJobs for the duration, so a non-empty
+//     map means one of those is in flight and a relaunch would kill it.
+function gatherIdleInstallState() {
+  return {
+    enabled: loadAutoInstallWhenIdleEnabled(),
+    updateReady: updateDownloadedReady,
+    isRecording: currentRecordingProcess !== null || systemAudioRecordingActive,
+    isProcessing,
+    queueLength: processingQueue.length,
+    liveActive: liveTranscribeProcess != null,
+    streaming: activeQueryProcs.size > 0 || contextQueries.size > 0,
+    otherJobsActive: activeReprocessJobs.size > 0,
+    idleSeconds: powerMonitor.getSystemIdleTime(),
+    idleThresholdSeconds: IDLE_AUTO_INSTALL_THRESHOLD_SECONDS,
+  };
+}
+
+// Gather the live in-flight state and, when the pure gate says it's safe,
+// relaunch into the downloaded update. Latches autoInstallFired to guarantee a
+// single quitAndInstall, clears the interval, and — critically — re-checks the
+// gate AFTER the autosave settle so a recording/job that started during that
+// window aborts the install (and re-arms the checker) instead of being killed.
+// No-op under E2E (never scheduled) and before an update is staged.
+async function maybeAutoInstallWhenIdle() {
+  if (autoInstallFired) return;
+  if (!isSafeToAutoInstall(gatherIdleInstallState())) return;
+
+  // Latch immediately (synchronously, before any await) so a second invocation
+  // — e.g. a powerMonitor resume firing during the settle — bails at the guard
+  // above and can't race us to a double quitAndInstall.
+  autoInstallFired = true;
+  if (idleAutoInstallInterval) {
+    clearInterval(idleAutoInstallInterval);
+    idleAutoInstallInterval = null;
+  }
+
+  sendDebugLog('Auto-updater: idle + nothing in flight — installing update and relaunching.');
+
+  // Best-effort: notes autosave in the renderer on every edit (there's no
+  // explicit flush IPC to await), so give any in-flight debounced autosave a
+  // short settle window before we relaunch. Never blocks the relaunch.
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  } catch (_) { /* best-effort only */ }
+
+  // Re-check after the await: work may have started during the 500ms settle
+  // (a recording, a queued/reprocess job, a chat stream). If it's no longer
+  // safe, ABORT rather than kill live work — reset the one-shot latch and
+  // re-arm the checker so a later idle window can retry.
+  if (!isSafeToAutoInstall(gatherIdleInstallState())) {
+    sendDebugLog('Auto-updater: work started during settle — aborting auto-install, will retry later.');
+    autoInstallFired = false;
+    startIdleAutoInstallChecker();
+    return;
+  }
+
+  trackEvent('update_auto_installed', {
+    version: pendingUpdateVersion || 'unknown',
+    idle_seconds: Math.round(powerMonitor.getSystemIdleTime()),
+  });
+
+  // Bypass the mainWindow 'close' handler's preventDefault+hide (same reason as
+  // the manual install-update path) so quitAndInstall actually quits + applies.
+  isQuitting = true;
+  // From here on, an updater error is an INSTALL failure, not a failed check.
+  installingUpdate = true;
+  // isSilent=true, isForceRunAfter=true — install without the wizard and
+  // relaunch the app afterwards.
+  autoUpdater.quitAndInstall(true, true);
+}
+
+// Start the periodic idle checker once an update is staged. Idempotent, and
+// inert under E2E (mirrors setupAutoUpdater's e2e no-op) so the suite never
+// schedules a timer or risks a quitAndInstall.
+function startIdleAutoInstallChecker() {
+  if (IS_E2E) return;
+  if (idleAutoInstallInterval || autoInstallFired) return;
+  idleAutoInstallInterval = setInterval(() => {
+    maybeAutoInstallWhenIdle().catch((e) => sendDebugLog(`Idle auto-install check failed: ${e.message}`));
+  }, IDLE_AUTO_INSTALL_CHECK_MS);
+  // Don't let this timer keep the event loop alive on its own.
+  if (idleAutoInstallInterval.unref) idleAutoInstallInterval.unref();
+}
+
+// Current OS version for the update gate, '' if it can't be read (→ fail open).
+function currentSystemVersionSafe() {
+  try { return process.getSystemVersion(); } catch (_) { return ''; }
+}
+
+// Whether electron-updater may run on this OS. See update-os-gate.js — darwin
+// below the 14.4 floor (MIN_MACOS_FOR_AUTOUPDATE) is blocked (so nothing
+// downloads and the idle installer has nothing to apply); non-darwin and
+// unparseable versions are eligible, with the manifest `minimumSystemVersion`
+// in latest-mac.yml as the authoritative backstop.
+function autoUpdateOSEligible() {
+  return isOSUpdateEligible({
+    platform: process.platform,
+    osVersion: currentSystemVersionSafe(),
+    minVersion: MIN_MACOS_FOR_AUTOUPDATE,
+  });
+}
 
 function setupAutoUpdater() {
   if (IS_E2E) {
@@ -5273,15 +7351,44 @@ function setupAutoUpdater() {
     sendDebugLog('Auto-updater: skipped (dev mode)');
     return;
   }
+  // Never auto-download/install onto a Mac below the launch floor — the build
+  // wouldn't start, and with idle auto-install (#425) it would replace a
+  // working install unattended. Skipping the whole setup means no download
+  // ever fires, so `update-downloaded` never fires and the idle checker never
+  // arms. (latest-mac.yml's minimumSystemVersion is the second layer.)
+  if (!autoUpdateOSEligible()) {
+    sendDebugLog(`Auto-updater: skipped — macOS ${currentSystemVersionSafe()} is below the ${MIN_MACOS_FOR_AUTOUPDATE} floor; this build won't launch here (#432).`);
+    return;
+  }
 
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
+
+  // Drop a stale non-sticky failure AND tell a mounted About tab, so the banner
+  // never outlives the state it describes. Sticky ones are left alone: a full
+  // disk, a permission problem or a missing feed is not disproved by starting or
+  // finding an update, only by bytes actually arriving (download-progress).
+  // Both callers need exactly this, and having it in one place is what stops the
+  // two from drifting apart — the earlier version cleared here but only emitted
+  // there, so the event never fired and About kept showing a settled failure
+  // next to a running download.
+  const clearNonStickyUpdateError = () => {
+    if (!pendingUpdateError || pendingUpdateErrorSticky) return;
+    pendingUpdateError = null;
+    if (mainWindow) mainWindow.webContents.send('update-error-cleared');
+  };
 
   autoUpdater.on('checking-for-update', () => {
     sendDebugLog('Auto-updater: checking for updates...');
     // Fresh cycle — clear any stale error from a previous failed check so a
     // rehydrating About tab doesn't show an error that's now being retried.
-    pendingUpdateError = null;
+    // Sticky ones stay: starting a check does not free disk space, grant write
+    // permission, or give this build an update feed, and those conditions are
+    // still true until something actually succeeds. They are cleared where that
+    // happens: a version found and fetched (update-available / download-progress
+    // / update-downloaded below), or a poll that comes back clean in the
+    // check-for-updates handler.
+    clearNonStickyUpdateError();
   });
 
   autoUpdater.on('update-available', (info) => {
@@ -5289,7 +7396,16 @@ function setupAutoUpdater() {
     // Matches the renderer's own `setDownloadPercent((p) => p ?? 0)` — marks
     // a download as started before the first real progress tick arrives.
     if (pendingDownloadPercent === null) pendingDownloadPercent = 0;
-    pendingUpdateError = null;
+    // Only the non-sticky ones. This event says a version was FOUND, i.e. the
+    // feed was readable — it does not say a single byte was written, so it
+    // cannot disprove a full disk or a permission problem. Those clear one
+    // event later, on the first download-progress tick, which does prove it.
+    // (Clearing them here made the banner vanish and come straight back when
+    // the unchanged condition failed the download again.)
+    //
+    // Usually a no-op, since checking-for-update already ran for this cycle —
+    // it covers a failure that arrived between the two events.
+    clearNonStickyUpdateError();
     if (mainWindow) {
       mainWindow.webContents.send('update-available', { version: info.version });
     }
@@ -5297,12 +7413,26 @@ function setupAutoUpdater() {
 
   autoUpdater.on('update-not-available', () => {
     sendDebugLog('Auto-updater: up to date');
+    // A completed cycle with nothing pending — clear even a sticky failure.
+    // This is the updater itself reporting success, unlike the GitHub poll in
+    // the check-for-updates handler (our own request, which proves nothing
+    // about whether the updater can read its feed or write to disk). Nothing is
+    // waiting to download or install any more, so a banner about a past attempt
+    // is describing a state that no longer exists — and a condition that really
+    // is still broken (no update feed) errors before ever reaching this event.
+    pendingUpdateError = null;
+    pendingUpdateErrorSticky = false;
+    // Tell a mounted About tab too — it keeps its own copy, and the events it
+    // already listens to (available/progress/downloaded) don't fire on a clean
+    // cycle, so without this the banner would sit there until a remount.
+    if (mainWindow) mainWindow.webContents.send('update-error-cleared');
   });
 
   autoUpdater.on('download-progress', (progress) => {
     sendDebugLog(`Auto-updater: downloading ${Math.round(progress.percent)}%`);
     pendingDownloadPercent = Math.round(progress.percent);
     pendingUpdateError = null;
+    pendingUpdateErrorSticky = false;
     if (mainWindow) {
       mainWindow.webContents.send('update-download-progress', { percent: Math.round(progress.percent) });
     }
@@ -5312,35 +7442,67 @@ function setupAutoUpdater() {
     sendDebugLog(`Auto-updater: v${info.version} ready to install`);
     pendingDownloadPercent = null;
     pendingUpdateError = null;
+    pendingUpdateErrorSticky = false;
     pendingUpdateVersion = info.version;
     if (mainWindow) {
       mainWindow.webContents.send('update-downloaded', { version: info.version });
     }
+    // The notification above is unchanged. Additionally, mark the update as
+    // staged and start the idle checker so it can install + relaunch on its
+    // own when the machine is idle and nothing is in flight. Try once right
+    // away in case the app is already idle (e.g. downloaded overnight).
+    updateDownloadedReady = true;
+    startIdleAutoInstallChecker();
+    maybeAutoInstallWhenIdle().catch(() => {});
   });
 
   autoUpdater.on('error', (err) => {
     const msg = (err && err.message) || String(err);
+    // Which phase failed, captured BEFORE the state is cleared below. Note it
+    // does NOT consider a staged update: a periodic check can fail long after a
+    // download succeeded, and calling that a failed download is the lie this
+    // whole path exists to stop telling.
+    //
+    // Known limit: electron-updater's error event does not say which attempt it
+    // belongs to, so a periodic check that fails WHILE a download is genuinely
+    // running is attributed to the download. That case was already reported as
+    // a download failure before this module existed, so the heuristic is not a
+    // regression — closing it needs per-attempt correlation the library does
+    // not expose.
+    const phase = updateErrorPhase({
+      downloadInFlight: pendingDownloadPercent !== null,
+      installing: installingUpdate,
+    });
     // Clear any in-flight download state regardless of which branch below
     // fires — otherwise a failure after 'update-available' (which seeds
     // pendingDownloadPercent to 0) leaves get-update-status reporting a
     // download is still running forever, and About would show a stuck
     // progress bar with no way to tell it failed.
     pendingDownloadPercent = null;
-    // Until a release carrying this platform's update feed (latest.yml on
-    // Windows) is published, the updater 404s on the feed file. That's an
-    // expected transitional state, not a real failure — log it quietly so it
-    // doesn't read as a scary stack trace for alpha testers, and don't
-    // surface it to the renderer as an error.
-    if (/latest(-mac)?\.yml/i.test(msg) && /(404|cannot find)/i.test(msg)) {
+    // Until a release carrying this platform's update feed is published
+    // (latest.yml on Windows, latest-linux*.yml on Linux — which ships none
+    // at all today), the updater 404s on the feed file. That's an expected
+    // state, not a real failure — log it quietly so it doesn't read as a
+    // scary stack trace for alpha testers, and don't surface it to the
+    // renderer as an error. See isMissingUpdateFeedError for why the match
+    // is not spelled out inline any more.
+    if (isMissingUpdateFeedError(msg)) {
       sendDebugLog('Auto-updater: no update feed published for this release yet — skipping.');
       return;
     }
+    // The raw text stays here, where it's useful for diagnosis. What reaches
+    // the About tab is one sentence naming the phase that failed and whether
+    // the user has to do anything — see update-error-copy.js.
     sendDebugLog(`Auto-updater error: ${msg}`);
+    const { message: userMessage, sticky } = describeUpdateError(msg, { phase });
+    // The install attempt (if any) is over — a later error is a fresh cycle.
+    installingUpdate = false;
     // Persist so a later About-tab mount can rehydrate it (the event below is
     // one-shot and only reaches an already-mounted listener).
-    pendingUpdateError = msg;
+    pendingUpdateError = userMessage;
+    pendingUpdateErrorSticky = sticky;
     if (mainWindow) {
-      mainWindow.webContents.send('update-error', { message: msg });
+      mainWindow.webContents.send('update-error', { message: userMessage });
     }
   });
 
@@ -5356,10 +7518,21 @@ function setupAutoUpdater() {
 }
 
 ipcMain.on('install-update', () => {
+  // Defense in depth for #432: today the renderer only shows "Restart to
+  // Update" once a real 'update-downloaded' fired (impossible under the floor,
+  // since setupAutoUpdater is skipped), so this is unreachable on an under-floor
+  // Mac. Gate it here too so a future renderer change can't reintroduce an
+  // ungated quitAndInstall onto a build this OS can't launch.
+  if (!autoUpdateOSEligible()) {
+    sendDebugLog('install-update: ignored — OS below the auto-update floor (#432).');
+    return;
+  }
   // Bypass the mainWindow 'close' handler's preventDefault+hide so that
   // quitAndInstall's window-close step actually quits the app. Without this
   // the app just minimises and Squirrel never gets to apply the update.
   isQuitting = true;
+  // From here on, an updater error is an INSTALL failure, not a failed check.
+  installingUpdate = true;
   autoUpdater.quitAndInstall(false, true);
 });
 
@@ -5380,8 +7553,10 @@ const MIC_MONITOR_HEALTHY_RESET_MS = 30_000;
 // Browsers route media capture through helper sub-processes (Safari →
 // com.apple.WebKit.GPU, Chrome → com.google.Chrome.helper, etc.), so the raw
 // app_name reads as "Safari Graphics and Media" / "Google Chrome Helper".
-// Translate those back to the user-recognisable parent app name.
+// FaceTime, Phone.app and Continuity calls use the daemon "avconferenced".
+// Translate both back to the user-recognisable parent app name.
 const APP_NAME_OVERRIDES = [
+  { match: /^com\.apple\.avconferenced/, name: 'Call' },
   { match: /^com\.apple\.WebKit/, name: 'Safari' },
   { match: /^com\.google\.Chrome/, name: 'Google Chrome' },
   { match: /^org\.chromium\./, name: 'Chromium' },
@@ -5409,23 +7584,30 @@ const ALLOW_DEVICE_LEVEL_FALLBACK = allowsDeviceLevelFallback(
   (() => { try { return process.getSystemVersion(); } catch (_) { return ''; } })(),
 );
 
-// Wait this long after the meeting app releases the mic before triggering
-// auto-pause + "Meeting ended" prompt. Verified empirically that Zoom/Meet/
-// Teams use software-mute (keep the OS-level stream open while muted), so
-// muting in-meeting does NOT emit a stop event and won't trip this debounce
-// — the only remaining false-positive source is a brief device switch.
-// 3s feels near-instant after a real meeting end; auto-resume handles any
-// rare device-switch case if the mic comes back within the window.
+// Wait this long after the meeting app releases the mic before auto-pausing.
+// Verified empirically that Zoom/Meet/Teams use software-mute (keep the
+// OS-level stream open while muted), so muting in-meeting does NOT emit a stop
+// event and won't trip this debounce — the only remaining false-positive source
+// is a brief device switch. 3s feels near-instant after a real meeting end;
+// auto-resume handles any rare device-switch case if the mic comes back within
+// the window.
 const MEETING_END_DEBOUNCE_MS = 3_000;
+
+// After auto-pausing on mic-release, hold the recording paused this long before
+// auto-stopping (finalizing). The grace absorbs the one real false positive — a
+// brief device switch — since auto-resume cancels the auto-stop if the mic
+// returns within it. Because a released mic reliably means the call ended (not
+// mute), we finalize automatically after this rather than prompting the user.
+const MEETING_END_AUTOSTOP_GRACE_MS = 10_000;
 
 let micMonitorProc = null;
 let micMonitorRespawnTimer = null;
 let micMonitorRespawnDelay = MIC_MONITOR_BACKOFF_BASE_MS;
 const lastNotifiedAt = new Map();
 // When the user accepts a "Meeting detected" notification we remember the
-// originating app so we can pair its subsequent mic-stop with the recording
-// and offer a "Summarise" prompt.
-let autoStartedSession = null; // { pid, app_id, appName, paused, pauseTimer, endNotif }
+// originating app so we can pair its subsequent mic-stop with the recording and
+// auto-stop when the meeting ends.
+let autoStartedSession = null; // { pid, app_id, appName, paused, pauseTimer, autoStopTimer }
 
 function humanizeAppName(evt) {
   for (const o of APP_NAME_OVERRIDES) {
@@ -5516,9 +7698,11 @@ async function handleMicEvent(line) {
   }
   if (evt.event !== 'start') return;
 
-  // Meeting briefly went silent then came back — same app resuming. Cancel
-  // any pending pause / dismiss the "Meeting ended" prompt / auto-resume the
-  // recording so the user doesn't have to do anything.
+  // Meeting briefly went silent then came back — same app resuming. Cancel any
+  // pending pause AND any pending auto-stop, and auto-resume the recording so
+  // the user doesn't have to do anything. Cancelling the auto-stop is the whole
+  // point of the grace window: a brief mic drop (device switch) must not
+  // finalize a still-live meeting.
   if (autoStartedSession && evt.app_id === autoStartedSession.app_id) {
     if (autoStartedSession.pauseTimer) {
       clearTimeout(autoStartedSession.pauseTimer);
@@ -5527,10 +7711,12 @@ async function handleMicEvent(line) {
     }
     if (autoStartedSession.paused) {
       autoStartedSession.paused = false;
-      if (autoStartedSession.endNotif) {
-        try { autoStartedSession.endNotif.close(); } catch (_) {}
-        autoStartedSession.endNotif = null;
+      if (autoStartedSession.autoStopTimer) {
+        clearTimeout(autoStartedSession.autoStopTimer);
+        autoStartedSession.autoStopTimer = null;
       }
+      // Meeting came back before the grace window elapsed — cancel the auto-stop
+      // and keep capturing.
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('auto-resume-requested');
       }
@@ -5568,8 +7754,8 @@ function handleMicStop(evt) {
   // Recording may have been stopped manually (Stop button, hotkey, shortcut)
   // since we accepted the auto-start. The autoStartedSession isn't notified
   // of that today, so without this guard the mic-stop event would schedule
-  // a phantom pause + "Meeting ended" notification for a recording that's
-  // already gone. Drop the session here so the next start is clean.
+  // a phantom pause + auto-stop for a recording that's already gone. Drop the
+  // session here so the next start is clean.
   if (!currentRecordingProcess && !systemAudioRecordingActive) {
     clearAutoStartedSession();
     return;
@@ -5585,7 +7771,21 @@ function handleMicStop(evt) {
       mainWindow.webContents.send('auto-pause-requested');
     }
     sendDebugLog(`[auto-detect] meeting ended (paused): ${autoStartedSession.appName}`);
-    autoStartedSession.endNotif = showMeetingEndedNotification(autoStartedSession.appName);
+    // Meeting ended: auto-stop silently after a short grace, then let the shared
+    // post-stop pipeline run. The summarise decision happens AFTER transcription
+    // via the same transcript-ready → "Summarise?" → note-ready notifications as
+    // a manual stop — no separate meeting-end prompt (it was redundant and made
+    // summarise a two-step flow). If the mic comes back within the grace,
+    // handleMicEvent above cancels this timer and auto-resumes. Otherwise the
+    // meeting has genuinely ended (a released mic ≠ mute — Zoom/Meet/Teams keep
+    // the stream open while muted, see MEETING_END_DEBOUNCE_MS), so we auto-stop
+    // — a meeting is never left stranded paused.
+    if (autoStartedSession.autoStopTimer) clearTimeout(autoStartedSession.autoStopTimer);
+    autoStartedSession.autoStopTimer = setTimeout(() => {
+      autoStartedSession.autoStopTimer = null;
+      sendDebugLog(`[auto-detect] auto-stopping ended meeting: ${autoStartedSession.appName}`);
+      autoStopEndedMeeting();
+    }, MEETING_END_AUTOSTOP_GRACE_MS);
   }, MEETING_END_DEBOUNCE_MS);
 }
 
@@ -5598,35 +7798,17 @@ function showMeetingDetectedNotification(appName, originatingEvt, calEvent) {
     title: 'Meeting detected',
     body: calEvent?.title || appName,
     actions: [{ type: 'button', text: 'Take Notes' }],
+    // Only the latest detection is worth a tap; an older one waiting in the
+    // toast queue would offer to record a meeting that is already over.
+    tag: 'meeting-detected',
   });
+  // Both the "Take Notes" button and the notification body start recording — one
+  // action, so a single tap anywhere works.
   const trigger = () => requestAutoRecord(appName, originatingEvt, calEvent);
-  notif.on('action', (_evt, _index) => trigger()); // shown when banner style = Alerts
-  notif.on('click', trigger);                       // body tap (always available)
+  notif.on('action', () => trigger()); // shown when banner style = Alerts
+  notif.on('click', () => trigger());              // body tap (always available)
   trackNotificationLifecycle(notif, 'meeting_detected');
   notif.show();
-}
-
-function showMeetingEndedNotification(appName) {
-  const notif = new Notification({
-    title: 'Meeting ended',
-    body: appName,
-    actions: [{ type: 'button', text: 'Summarise' }],
-  });
-  // Only the explicit Summarise button commits — body click just opens
-  // Steno so the user can decide (summarise / resume / leave paused) from
-  // the in-app UI. Once summarised the meeting is finalised and AI
-  // processing has begun, so a stray body tap shouldn't trigger it.
-  notif.on('action', (_evt, _index) => requestAutoSummarise());
-  notif.on('click', () => {
-    sendDebugLog('[auto-detect] Meeting ended notif body clicked — opening Steno (no commit)');
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      if (!mainWindow.isVisible()) mainWindow.show();
-      mainWindow.focus();
-    }
-  });
-  trackNotificationLifecycle(notif, 'meeting_ended');
-  notif.show();
-  return notif;
 }
 
 function requestAutoRecord(appName, originatingEvt, calEvent) {
@@ -5638,32 +7820,49 @@ function requestAutoRecord(appName, originatingEvt, calEvent) {
   // app-detection string (e.g. "an app — 2026-06-01 17:00") to the user
   // whenever title regeneration produced nothing.
   const sessionName = calEvent?.title || 'Note';
+  // A tap on a detection toast that is still on screen after a recording has
+  // started must not re-point auto-stop at another app's meeting.
+  // currentRecordingSessionName also covers a brief capture flap, during which
+  // systemAudioRecordingActive reads false while the recording is still live.
+  if (currentRecordingProcess || systemAudioRecordingActive || currentRecordingSessionName) {
+    sendDebugLog('[auto-detect] record request ignored: a recording is already running');
+    exposeMainWindow();
+    return;
+  }
   sendDebugLog(`[auto-detect] user requested record (calendar-titled: ${calEvent?.title ? 'yes' : 'no'})`);
 
   // Track the originating app so we can pair its mic-stop with this recording
-  // and offer a "Summarise" prompt when the meeting ends.
+  // and auto-stop when the meeting ends.
   autoStartedSession = {
     pid: originatingEvt?.pid ?? null,
     app_id: originatingEvt?.app_id ?? null,
     appName,
     paused: false,
     pauseTimer: null,
-    endNotif: null,
+    autoStopTimer: null,
   };
 
+  // Tapping "Take Notes" is an explicit "I'm going to take notes" — so bring
+  // Steno to the front and open the live note so the user can start typing.
+  // (The notification itself is passive and never steals focus; only this
+  // explicit tap does.) The renderer's auto-record handler then starts the
+  // recording and opens the live-note editor.
   if (mainWindow && !mainWindow.isDestroyed()) {
-    if (!mainWindow.isVisible()) mainWindow.show();
-    mainWindow.focus();
+    exposeMainWindow();
     mainWindow.webContents.send('auto-record-requested', { sessionName, appName });
   }
 }
 
-function requestAutoSummarise() {
-  sendDebugLog('[auto-detect] user requested summarise from end notification');
+// Auto-stop an ended auto-detected meeting once the mic has stayed released
+// through the grace window (see handleMicStop). STOPS the paused recording,
+// which drives the shared post-stop pipeline; the *summarise* decision then
+// happens after transcription (transcript-ready / note-ready notifications),
+// not here — identical to a manual stop. Sent on the `auto-summarise-requested`
+// channel (whose renderer handler just stops the recording); the channel name
+// predates the auto-stop rework and is kept to avoid 4-file churn.
+function autoStopEndedMeeting() {
   if (mainWindow && !mainWindow.isDestroyed()) {
-    if (!mainWindow.isVisible()) mainWindow.show();
-    mainWindow.focus();
-    mainWindow.webContents.send('auto-summarise-requested');
+    mainWindow.webContents.send('auto-summarise-requested', {});
   }
   clearAutoStartedSession();
 }
@@ -5671,10 +7870,59 @@ function requestAutoSummarise() {
 function clearAutoStartedSession() {
   if (!autoStartedSession) return;
   if (autoStartedSession.pauseTimer) clearTimeout(autoStartedSession.pauseTimer);
-  if (autoStartedSession.endNotif) {
-    try { autoStartedSession.endNotif.close(); } catch (_) {}
-  }
+  if (autoStartedSession.autoStopTimer) clearTimeout(autoStartedSession.autoStopTimer);
   autoStartedSession = null;
+}
+
+// Opt-in dev tool: global shortcuts to fire each completion notification on
+// demand, so their native macOS click/action behavior is verifiable in
+// `npm start` without a real meeting or a DMG rebuild. Enabled only in a dev
+// build with STENOAI_DEV_NOTIF_TRIGGERS=1 (never packaged, never E2E) so it
+// doesn't grab shortcuts from other contributors by default. These fire the SAME
+// functions the real flow uses (showMeetingDetected/TranscriptReady/NoteReady),
+// so what you see here matches a real meeting.
+//   Ctrl+Alt+1 → "Meeting detected" (Take Notes)
+//   Ctrl+Alt+2 → "Transcript ready" (Summarise) for the most recent note
+//   Ctrl+Alt+3 → "Note ready" for the most recent note
+const DEV_NOTIF_TRIGGERS_ENV = 'STENOAI_DEV_NOTIF_TRIGGERS';
+function setupDevNotificationTriggers() {
+  if (IS_E2E || app.isPackaged || !process.env[DEV_NOTIF_TRIGGERS_ENV]) return;
+  const latestNote = async () => {
+    try {
+      const meetings = JSON.parse(await runPythonScript('simple_recorder.py', ['list-meetings'], true));
+      const withNotes = meetings.filter((m) => m.session_info?.summary_file);
+      const m = withNotes[0];
+      return m
+        ? { summaryFile: m.session_info.summary_file, title: m.session_info.name || 'Untitled note' }
+        : null;
+    } catch (e) {
+      sendDebugLog(`[dev-notify] list-meetings failed: ${e.message}`);
+      return null;
+    }
+  };
+  const register = (accel, label, fn) => {
+    try {
+      if (!globalShortcut.register(accel, fn)) {
+        console.warn(`[dev-notify] failed to register ${accel} (${label})`);
+      }
+    } catch (e) {
+      console.warn(`[dev-notify] register threw for ${accel}: ${e.message}`);
+    }
+  };
+  register('Control+Alt+1', 'meeting-detected', () => {
+    showMeetingDetectedNotification('DevMeeting', { pid: 0, app_id: 'dev.meeting' }, null);
+  });
+  register('Control+Alt+2', 'transcript-ready', async () => {
+    const note = await latestNote();
+    if (!note) { sendDebugLog('[dev-notify] no note for transcript-ready'); return; }
+    void showTranscriptReadyNotification({ title: note.title, summaryFile: note.summaryFile, name: note.title });
+  });
+  register('Control+Alt+3', 'note-ready', async () => {
+    const note = await latestNote();
+    if (!note) { sendDebugLog('[dev-notify] no note for note-ready'); return; }
+    void showNoteReadyNotification({ title: note.title, summaryFile: note.summaryFile });
+  });
+  sendDebugLog('[dev-notify] triggers registered (Ctrl+Alt+1/2/3)');
 }
 
 function setupAutoMeetingDetector() {
@@ -5688,6 +7936,10 @@ function setupAutoMeetingDetector() {
   }
   if (!loadAutoDetectMeetingsEnabled()) {
     sendDebugLog('[auto-detect] disabled in settings; not starting');
+    return;
+  }
+  if (!isAutoDetectSupported()) {
+    sendDebugLog('[auto-detect] requires macOS 14 (Sonoma) or later; not starting');
     return;
   }
   startMicMonitor();
@@ -5742,6 +7994,7 @@ function attachProcessingStderr(proc, label) {
 // pipelines (e.g. a queued process-streaming run during a live record) don't
 // mask each other's heartbeats. Records are logged under the source label.
 const lastHeartbeatLoggedAt = new Map();
+const lastProgressLoggedAt = new Map();
 function logPipelineStdoutLine(line, source) {
   const l = line.trim();
   if (!l) return;
@@ -5749,6 +8002,22 @@ function logPipelineStdoutLine(line, source) {
     const now = Date.now();
     if (now - (lastHeartbeatLoggedAt.get(source) || 0) < 10_000) return;
     lastHeartbeatLoggedAt.set(source, now);
+    processingLog.logLine(source, l);
+    return;
+  }
+  if (l.startsWith('PROGRESS:')) {
+    // Stage-transition markers (diarize start/done, summarize
+    // step/reducing) are rare and always worth a line. Per-chunk
+    // sub-progress (transcribe chunks, diarize embedding chunks) can tick
+    // roughly once a second for many minutes on a long recording --
+    // throttle those the same way HEARTBEAT already is, or they'd flood
+    // the on-disk log.
+    const isHighFrequency = l.startsWith('PROGRESS:transcribe:') || l.includes(':embedding:');
+    if (isHighFrequency) {
+      const now = Date.now();
+      if (now - (lastProgressLoggedAt.get(source) || 0) < 10_000) return;
+      lastProgressLoggedAt.set(source, now);
+    }
     processingLog.logLine(source, l);
     return;
   }
@@ -5849,7 +8118,6 @@ ipcMain.handle('setup-ollama-and-model', async () => {
         }
       });
       ollamaProcess.unref();
-      ollamaStartedByUs = true;
     }
 
     // Wait for Ollama to be ready (poll with early exit detection).
@@ -5876,7 +8144,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
           sendDebugLog(`Ollama ready after ${i + 1} seconds`);
           break;
         }
-      } catch (e) {
+      } catch {
         // Continue polling
       }
     }
@@ -6047,7 +8315,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
             let json;
             try {
               json = JSON.parse(line);
-            } catch (e) {
+            } catch {
               // Non-JSON line, log as-is
               sendDebugLog(line);
               continue;
@@ -6080,7 +8348,7 @@ ipcMain.handle('setup-ollama-and-model', async () => {
             sendDebugLog('AI model download completed successfully');
             try {
               await runPythonScript('simple_recorder.py', ['set-model', DEFAULT_AI_MODEL], true);
-            } catch (e) {
+            } catch {
               // Non-fatal -- config reset is best-effort
             }
             trackEvent('setup_completed', { step: 'ollama_and_model' });
@@ -6114,28 +8382,29 @@ ipcMain.handle('setup-ollama-and-model', async () => {
 
 ipcMain.handle('setup-parakeet', async () => {
   try {
-    // Download Parakeet TDT v3 (~572 MB) via the bundled backend. Used by
-    // the Setup wizard's step 2 for fresh installs. Emits coarse stage
-    // lines (PARAKEET_PULL_STAGE:downloading / :loading) rather than
-    // byte-level progress — see src/parakeet_models.py for why.
+    // Download Parakeet TDT v3 via the bundled backend. Used by
+    // the Setup wizard. Structured progress distinguishes cache download
+    // from model initialisation.
     const backendPath = getBackendPath();
-    sendDebugLog('Downloading Parakeet TDT v3 (~572 MB)...');
+    sendDebugLog('Downloading Parakeet TDT v3...');
     sendDebugLog(`$ ${backendPath} download-parakeet-model`);
 
     return new Promise((resolve) => {
       const proc = spawn(backendPath, ['download-parakeet-model'], { stdio: 'pipe' });
       let lastStdoutLine = '';
+      const stdoutReader = makeLineReader();
 
       proc.stdout.on('data', (data) => {
         const text = data.toString();
-        for (const line of text.split('\n')) {
+        for (const line of stdoutReader.feed(text)) {
           const trimmed = line.trim();
           if (!trimmed) continue;
           sendDebugLog(trimmed);
-          if (trimmed.startsWith('PARAKEET_PULL_STAGE:')) {
-            const stage = trimmed.slice('PARAKEET_PULL_STAGE:'.length);
+          if (trimmed.startsWith('PARAKEET_PULL_PROGRESS:')) {
+            let progress;
+            try { progress = JSON.parse(trimmed.slice('PARAKEET_PULL_PROGRESS:'.length)); } catch (_) { continue; }
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('parakeet-pull-progress', { stage });
+              mainWindow.webContents.send('parakeet-pull-progress', progress);
             }
           } else {
             lastStdoutLine = trimmed;
@@ -6151,7 +8420,7 @@ ipcMain.handle('setup-parakeet', async () => {
       proc.on('close', (code) => {
         let parsed = null;
         try { parsed = JSON.parse(lastStdoutLine); } catch (_) { /* not JSON */ }
-        const ok = code === 0 && (!parsed || parsed.success !== false);
+        const ok = code === 0 && parsed?.success === true;
         if (ok) {
           sendDebugLog('Parakeet model ready');
           resolve({ success: true, message: 'Parakeet model ready' });
@@ -6248,6 +8517,21 @@ registerFoldersIpc({
   getUserDataDir,
   validateMeetingFilePath,
   setCachedCustomStoragePath: (v) => { _cachedCustomStoragePath = v; },
+  // A folder add/remove rewrites the note's `folders:` frontmatter but fires no
+  // processing-complete — mirror it so the vault subfolder tracks (#413).
+  onNoteFoldersChanged: (summaryPath) => {
+    try { obsidianSync.syncNoteBySummaryPath(summaryPath); } catch (_) {}
+  },
+});
+
+// Obsidian vault sync IPC (#413): config toggle + vault picker + conflicts read.
+registerObsidianIpc({
+  ipcMain,
+  runPythonScript,
+  dialog,
+  getMainWindow: () => mainWindow,
+  obsidianSync,
+  sendDebugLog,
 });
 
 ipcMain.handle('get-ai-prompts', async () => {
@@ -6278,56 +8562,6 @@ ipcMain.handle('get-ai-prompts', async () => {
   }
 });
 
-// Helper function to ensure Ollama service is running
-async function ensureOllamaRunning() {
-  try {
-    // Check if Ollama service is responding
-    const http = require('http');
-    const response = await new Promise((resolve) => {
-      const req = http.get('http://127.0.0.1:11434/api/version', { timeout: 3000 }, (res) => {
-        resolve(res.statusCode === 200);
-      });
-      req.on('error', () => resolve(false));
-      req.on('timeout', () => { req.destroy(); resolve(false); });
-    });
-
-    if (response) {
-      return true; // Service is running
-    }
-
-    // Service not running, try to start it.
-    // The macOS-14 gate only applies to mac (os.release() is the NT build on
-    // Windows, which would always trigger the < 23 check).
-    if (process.platform === 'darwin') {
-      const macRelease = os.release();
-      if (parseInt(macRelease.split('.')[0], 10) < 23) {
-        sendDebugLog('macOS version too old for bundled Ollama — requires macOS 14 (Sonoma) or later');
-        return false;
-      }
-    }
-
-    const ollamaPath = await findOllamaExecutable();
-    if (!ollamaPath) {
-      return false;
-    }
-
-    // Start Ollama service in background with proper env vars for dylibs
-    ollamaProcess = spawn(ollamaPath, ['serve'], { detached: true, stdio: 'ignore', env: getOllamaEnv() });
-    ollamaPid = ollamaProcess.pid;
-    try { require('fs').writeFileSync(path.join(getBackendCwd(), '_internal', 'ollama.pid'), String(ollamaPid)); } catch (_) {}
-    ollamaProcess.on('exit', () => { ollamaPid = null; });
-    ollamaProcess.unref();
-    ollamaStartedByUs = true;
-
-    // Wait for service to start
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    return true;
-  } catch (error) {
-    console.error('Error ensuring Ollama is running:', error);
-    return false;
-  }
-}
-
 // Check if Ollama is installed (for setup wizard)
 ipcMain.handle('check-ollama-installed', async () => {
   try {
@@ -6351,7 +8585,7 @@ ipcMain.handle('check-model-installed', async (event, modelName) => {
       try {
         const data = JSON.parse(lines[i]);
         return { success: true, installed: data.installed };
-      } catch (e) {
+      } catch {
         continue;
       }
     }
@@ -6365,6 +8599,15 @@ ipcMain.handle('list-models', async () => {
   try {
     const result = await runPythonScript('simple_recorder.py', ['list-models']);
     const jsonData = JSON.parse(result);
+
+    // Machine RAM (GB), used by the renderer to flag local models that may
+    // exceed available memory. macOS-only: the heuristic + the "your Mac" copy
+    // are calibrated for Apple Silicon unified memory; on Windows the field is
+    // omitted so no badge shows (Windows VRAM/DirectML detection is out of
+    // scope — #248). Computed once per Settings-open list() call.
+    if (process.platform === 'darwin') {
+      jsonData.total_ram_gb = os.totalmem() / (1024 ** 3);
+    }
 
     return {
       success: true,
@@ -6501,6 +8744,83 @@ ipcMain.handle('set-transcription-engine', async (event, engine) => {
     const jsonData = JSON.parse(result.trim());
     trackEvent('model_changed', { model: engine, kind: 'transcription_engine' });
     return { success: true, ...jsonData };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+ipcMain.handle('get-diarization-engine', async () => {
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['get-diarization-engine'], true);
+    const jsonData = JSON.parse(result.trim());
+    return { success: true, ...jsonData };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+// The CLI refuses to save a non-default engine whose models are not ready
+// (success: false, models_ready: false); the renderer prepares them first
+// via setup-speaker-models.
+ipcMain.handle('set-diarization-engine', async (event, engine) => {
+  if (!isDiarizationEngine(engine)) {
+    return { success: false, error: 'Unknown speaker detection engine' };
+  }
+  try {
+    const result = await runPythonScript('simple_recorder.py', ['set-diarization-engine', engine]);
+    const jsonData = JSON.parse(result.trim());
+    if (jsonData.success) {
+      trackEvent('model_changed', { model: engine, kind: 'diarization_engine' });
+    }
+    return { success: true, ...jsonData };
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+// OpenAI-compatible ASR: the NON-SECRET config (url/model) shells to the CLI
+// like set-cloud-api-url does. api_key_set is always overridden with the
+// safeStorage truth (hasOpenAiAsrKey) - the CLI only sees the env-var key,
+// which isn't injected on these calls, so its own api_key_set is unreliable.
+ipcMain.handle('get-openai-asr-config', async () => {
+  try {
+    await migrateLegacyOpenAiAsrApiKey();
+    const result = await runPythonScript('simple_recorder.py', ['get-openai-asr-config'], true);
+    const jsonData = JSON.parse(result.trim());
+    jsonData.api_key_set = hasOpenAiAsrKey();
+    return jsonData;
+  } catch (e) { return { success: false, error: e.message }; }
+});
+
+registerOpenAiAsrIpc({
+  ipcMain,
+  runPythonScript,
+  migrateLegacyOpenAiAsrApiKey,
+  hasOpenAiAsrKey,
+});
+
+// The SECRET key: stored encrypted via safeStorage (never argv, never
+// config.json), mirroring set-cloud-api-key. Passing an empty string clears it
+// (deletes the file).
+ipcMain.handle('set-openai-asr-key', async (_event, key) => {
+  try {
+    if (typeof key !== 'string') {
+      return { success: false, error: 'OpenAI ASR API key must be a string' };
+    }
+    if (!key) {
+      markOpenAiAsrKeyCleared();
+      // The durable marker already makes every encrypted/legacy copy
+      // ineffective. Retry plaintext removal now, while retaining the marker
+      // if the locked config write is temporarily unavailable.
+      await migrateLegacyOpenAiAsrApiKey();
+      return { success: true, api_key_set: false };
+    }
+    // Finish compare-and-delete cleanup before rotation, so a failed cleanup
+    // cannot report success with plaintext left behind or overwrite the new key.
+    if (!await migrateLegacyOpenAiAsrApiKey()) {
+      return { success: false, error: 'OpenAI ASR credential migration is incomplete' };
+    }
+    const origin = getOpenAiAsrEndpointOrigin();
+    if (!origin) throw new Error('OpenAI ASR endpoint is invalid');
+    const saved = saveOpenAiAsrKey(key, origin);
+    return {
+      success: saved,
+      api_key_set: saved && Boolean(loadOpenAiAsrKey(origin)),
+    };
   } catch (e) { return { success: false, error: e.message }; }
 });
 
@@ -6653,8 +8973,7 @@ ipcMain.handle('pull-whisper-model', async (event, modelName) => {
 ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
   // Mirrors pull-whisper-model: settle-gate + SIGTERM-then-SIGKILL escalation
   // so a stalled HF download can never leave the renderer spinner hanging.
-  // Progress is coarse — we relay PARAKEET_PULL_STAGE:<stage> lines from the
-  // Python child rather than byte counts. See src/parakeet_models.py for why.
+  // Relay structured progress from the Python downloader.
   try {
     sendDebugLog(`Pulling Parakeet model: ${modelId || '<default>'}`);
     return new Promise((resolve) => {
@@ -6662,6 +8981,7 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
       if (modelId) args.push(modelId);
       const proc = spawn(getBackendPath(), args, { cwd: getBackendCwd() });
       let lastStdoutLine = '';
+      const stdoutReader = makeLineReader();
       let timedOut = false;
       let settled = false;
       let sigkillTimer = null;
@@ -6695,14 +9015,15 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
       }, 30 * 60 * 1000);
       proc.stdout.on('data', (data) => {
         const text = data.toString();
-        for (const line of text.split('\n')) {
+        for (const line of stdoutReader.feed(text)) {
           const trimmed = line.trim();
           if (!trimmed) continue;
           sendDebugLog(trimmed);
-          if (trimmed.startsWith('PARAKEET_PULL_STAGE:')) {
-            const stage = trimmed.slice('PARAKEET_PULL_STAGE:'.length);
+          if (trimmed.startsWith('PARAKEET_PULL_PROGRESS:')) {
+            let progress;
+            try { progress = JSON.parse(trimmed.slice('PARAKEET_PULL_PROGRESS:'.length)); } catch (_) { continue; }
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send('parakeet-pull-progress', { model: modelId, stage });
+              mainWindow.webContents.send('parakeet-pull-progress', { ...progress, model: modelId });
             }
           } else {
             lastStdoutLine = trimmed;
@@ -6716,7 +9037,7 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
       proc.on('close', (code) => {
         let pullResult = null;
         try { pullResult = JSON.parse(lastStdoutLine); } catch (_) { /* not JSON */ }
-        const succeeded = !timedOut && code === 0 && (!pullResult || pullResult.success !== false);
+        const succeeded = !timedOut && code === 0 && pullResult?.success === true;
         if (succeeded) {
           finishOnce(
             { success: true, model: modelId },
@@ -6744,67 +9065,16 @@ ipcMain.handle('pull-parakeet-model', async (event, modelId) => {
   }
 });
 
-ipcMain.handle('get-keep-recordings', async () => {
-  try {
-    const result = await runPythonScript('simple_recorder.py', ['get-keep-recordings'], true);
-    const jsonData = JSON.parse(result.trim());
-    return { success: true, ...jsonData };
-  } catch (e) { return { success: false, error: e.message }; }
-});
-
-ipcMain.handle('set-keep-recordings', async (event, enabled) => {
-  try {
-    const result = await runPythonScript('simple_recorder.py', ['set-keep-recordings', enabled.toString()]);
-    const jsonData = JSON.parse(result.trim());
-    return { success: true, ...jsonData };
-  } catch (e) { return { success: false, error: e.message }; }
-});
-
-ipcMain.handle('get-auto-summarize', async () => {
-  try {
-    const result = await runPythonScript('simple_recorder.py', ['get-auto-summarize'], true);
-    const jsonData = JSON.parse(result.trim());
-    return { success: true, ...jsonData };
-  } catch (e) { return { success: false, error: e.message }; }
-});
-
-ipcMain.handle('set-auto-summarize', async (event, enabled) => {
-  try {
-    const result = await runPythonScript('simple_recorder.py', ['set-auto-summarize', enabled.toString()]);
-    const jsonData = JSON.parse(result.trim());
-    return { success: true, ...jsonData };
-  } catch (e) { return { success: false, error: e.message }; }
-});
-
-ipcMain.handle('get-silence-auto-stop', async () => {
-  try {
-    const result = await runPythonScript('simple_recorder.py', ['get-silence-auto-stop'], true);
-    const jsonData = JSON.parse(result.trim());
-    return { success: true, ...jsonData };
-  } catch (e) { return { success: false, error: e.message }; }
-});
-
-ipcMain.handle('set-silence-auto-stop-enabled', async (_event, enabled) => {
-  try {
-    const result = await runPythonScript(
-      'simple_recorder.py',
-      ['set-silence-auto-stop-enabled', enabled ? 'True' : 'False']
-    );
-    const jsonData = JSON.parse(result.trim());
-    return jsonData;
-  } catch (e) { return { success: false, error: e.message }; }
-});
-
-ipcMain.handle('set-silence-auto-stop-minutes', async (_event, minutes) => {
-  try {
-    const result = await runPythonScript(
-      'simple_recorder.py',
-      ['set-silence-auto-stop-minutes', String(minutes)]
-    );
-    const jsonData = JSON.parse(result.trim());
-    return jsonData;
-  } catch (e) { return { success: false, error: e.message }; }
-});
+// Settings-toggle IPC handlers (RFC #327 Phase 2.2) — the self-contained config
+// get/set toggles (keep-recordings, auto-summarize, silence-auto-stop,
+// system-audio, language, microphone, user-name, privacy-notice-seen) extracted
+// to ./settings-ipc and registered here in place, so registration timing +
+// behavior are identical to the inline handlers this replaces. Settings-shaped
+// handlers coupled to another domain (telemetry, models, mic-monitor, calendar,
+// tray) deliberately stay in main.js until that domain's own extraction.
+registerSettingsIpc({ ipcMain, runPythonScript, sendDebugLog });
+registerPersonSampleIpc({ ipcMain, runPythonScript });
+registerSpeakerIpc({ ipcMain, runPythonScript, parsePythonFailureJson });
 
 // Fired by the renderer's silence detector. The renderer has already
 // asked main to stop the recording via pause/stop; this just surfaces
@@ -6830,11 +9100,11 @@ ipcMain.handle('show-silence-auto-stop-notification', async (_event, payload) =>
     const notif = new Notification({
       title: 'Recording stopped',
       body,
+      iconType: 'recording',
     });
     notif.on('click', () => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        if (!mainWindow.isVisible()) mainWindow.show();
-        mainWindow.focus();
+        exposeMainWindow();
       }
     });
     trackNotificationLifecycle(notif, 'silence_auto_stop');
@@ -6846,24 +9116,26 @@ ipcMain.handle('show-silence-auto-stop-notification', async (_event, payload) =>
   }
 });
 
-// Fired by useSystemAudioCapture.ts at the start of a recording whenever it's
-// about to fall back to mic-only specifically because Screen Recording
-// permission isn't granted (not when the user has the "Record system audio"
-// toggle off, and not on unsupported macOS versions — those are the user's
-// own choice / a hardware limit, not a surprise). Clicking it opens Settings
-// via the same tray-open-settings event the tray menu uses, so the user lands
-// on the row with the Grant Access / Open Settings actions.
+// Fired by useSystemAudioCapture.ts when an enabled loopback acquisition
+// genuinely fails (for example, System Audio Recording permission is denied),
+// or when a live Linux capture dies mid-recording. It is not fired when the
+// user turns system audio off or the OS is unsupported. Clicking it opens
+// Settings via the same tray-open-settings event the tray menu uses.
 ipcMain.handle('show-system-audio-mic-only-notification', async () => {
   try {
     if (!(await notificationsEnabled())) return { success: true, shown: false };
     const notif = new Notification({
       title: 'Recording mic-only',
-      body: 'Screen Recording permission is needed to capture both sides of the call. Click to fix this in Settings.',
+      // The permissions hint is macOS-only; elsewhere there is no such setting
+      // to send the user to.
+      body: process.platform === 'darwin'
+        ? 'System audio could not be captured. Check Steno’s Screen & System Audio Recording access in System Settings.'
+        : 'System audio could not be captured. Continuing with the microphone only.',
+      iconType: 'alert',
     });
     notif.on('click', () => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        if (!mainWindow.isVisible()) mainWindow.show();
-        mainWindow.focus();
+        exposeMainWindow();
         mainWindow.webContents.send('tray-open-settings');
       }
     });
@@ -6876,6 +9148,34 @@ ipcMain.handle('show-system-audio-mic-only-notification', async () => {
   }
 });
 
+// The mirror image (#517): no audio input device at all, so the recording runs
+// on system audio alone. Fired by useSystemAudioCapture.ts only once the
+// recorder is actually running; with no system audio either, the start fails
+// through recording-capture-error instead. Same notifications_enabled gate and
+// Settings click-through as the mic-only notice above.
+ipcMain.handle('show-system-audio-only-notification', async () => {
+  try {
+    if (!(await notificationsEnabled())) return { success: true, shown: false };
+    const notif = new Notification({
+      title: 'Recording system audio only',
+      body: "Steno couldn't find a microphone, so your own voice isn't being recorded.",
+      iconType: 'alert',
+    });
+    notif.on('click', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        exposeMainWindow();
+        mainWindow.webContents.send('tray-open-settings');
+      }
+    });
+    trackNotificationLifecycle(notif, 'system_audio_only');
+    notif.show();
+    return { success: true, shown: true };
+  } catch (e) {
+    sendDebugLog(`Failed to show system-audio-only notification: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+});
+
 // Fired by the renderer's processing-complete handler when we skipped
 // auto-navigate (user was on a route other than /meetings/processing).
 // Clicking the banner is an explicit "take me there" from the user (unlike
@@ -6884,45 +9184,76 @@ ipcMain.handle('show-system-audio-mic-only-notification', async () => {
 // navigate-to-meeting event — and only falls back to focus-only when
 // `summaryFile` is absent (the hardFailure case: nothing was ever written,
 // so there's nothing to open).
+async function showNoteReadyNotification(payload) {
+  // `shown` = passed the notifications_enabled gate (see show-silence-auto-stop).
+  if (!(await notificationsEnabled())) return { success: true, shown: false };
+  const { summaryFile } = payload || {};
+  const { title, detail, body, iconType, outcome } = buildNoteReadyNotificationOptions(payload);
+  const notif = new Notification({ title, detail, body, iconType });
+  notif.on('click', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      exposeMainWindow();
+      if (summaryFile) mainWindow.webContents.send('navigate-to-meeting', { summaryFile });
+    }
+  });
+  trackNotificationLifecycle(notif, 'note_ready', { outcome });
+  notif.show();
+  return { success: true, shown: true };
+}
+
 ipcMain.handle('show-note-ready-notification', async (_event, payload) => {
   try {
-    // `shown` = passed the notifications_enabled gate (see show-silence-auto-stop).
-    if (!(await notificationsEnabled())) return { success: true, shown: false };
-    const { title, failed, hardFailure, summaryFile } = payload || {};
-    // Three honest states:
-    //  - hardFailure: processing crashed (or an import never enqueued) so no
-    //    note was written — there's nothing to "open". Keep the message
-    //    neutral: it's shared by recording crashes, import crashes and import
-    //    enqueue failures, and over-promising ("audio kept") is either hollow
-    //    (no UI surfaces the orphaned audio) or wrong (enqueue failure).
-    //  - failed: a graceful transcription failure DID write a marked note —
-    //    the recording was preserved and the note explains it on open.
-    //  - otherwise: the note is genuinely ready.
-    const notif = new Notification({
-      title: hardFailure
-        ? 'Processing failed'
-        : failed
-          ? 'Transcription failed'
-          : 'Note ready',
-      body: hardFailure
-        ? `Steno couldn't process ${title ? `"${title}"` : 'your note'}.`
-        : failed
-          ? 'Your recording was preserved — open the note for details.'
-          : (title || 'Your note has finished processing'),
-    });
-    notif.on('click', () => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        if (!mainWindow.isVisible()) mainWindow.show();
-        mainWindow.focus();
-        if (summaryFile) mainWindow.webContents.send('navigate-to-meeting', { summaryFile });
-      }
-    });
-    const outcome = hardFailure ? 'hard_failure' : failed ? 'failed' : 'success';
-    trackNotificationLifecycle(notif, 'note_ready', { outcome });
-    notif.show();
-    return { success: true, shown: true };
+    return await showNoteReadyNotification(payload);
   } catch (e) {
     sendDebugLog(`Failed to show note-ready notification: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+});
+
+// Fired by the renderer's processing-complete handler when a recording finished
+// transcription but NO notes were generated (auto_summarize off → transcript-
+// only note). Unlike note-ready, this prompts the user to summarise, and is the
+// correctly-timed replacement for the old premature meeting-end "Summarise?"
+// prompt (#bug2/#bug3). One-click, matching "Take Notes": tapping "Summarise" —
+// the button OR the notification body — brings the window forward, opens the
+// note, and starts generation there, so the user watches it stream in-place;
+// "Note ready" still fires on completion.
+async function showTranscriptReadyNotification(payload) {
+  // `shown` = passed the notifications_enabled gate (see show-note-ready).
+  if (!(await notificationsEnabled())) return { success: true, shown: false };
+  const { title, summaryFile, name } = payload || {};
+  const notif = new Notification({
+    title: 'Transcript ready',
+    body: buildTranscriptReadyBody(title),
+    actions: [{ type: 'button', text: 'Summarise' }],
+    iconType: 'success',
+  });
+  // The whole notification means "yes, summarise": a body tap AND the "Summarise"
+  // button both open the note and start generation there, so the user watches it
+  // stream in-place ("Note ready" still fires on completion). Wiring both to the
+  // same action is what makes it one-click (like "Take Notes") — a body tap that
+  // only navigated was the source of the two-click ("first click opens, second
+  // click summarises"). Bring the window forward, navigate to the note, THEN
+  // kick off generation.
+  const startSummarise = () => {
+    if (mainWindow && !mainWindow.isDestroyed() && summaryFile) {
+      exposeMainWindow();
+      mainWindow.webContents.send('navigate-to-meeting', { summaryFile });
+      mainWindow.webContents.send('generate-notes-requested', { summaryFile, name });
+    }
+  };
+  notif.on('action', () => startSummarise());
+  notif.on('click', () => startSummarise());
+  trackNotificationLifecycle(notif, 'transcript_ready');
+  notif.show();
+  return { success: true, shown: true };
+}
+
+ipcMain.handle('show-transcript-ready-notification', async (_event, payload) => {
+  try {
+    return await showTranscriptReadyNotification(payload);
+  } catch (e) {
+    sendDebugLog(`Failed to show transcript-ready notification: ${e.message}`);
     return { success: false, error: e.message };
   }
 });
@@ -6950,6 +9281,47 @@ ipcMain.handle('set-notifications', async (event, enabled) => {
   }
 });
 
+// Both the persisted preference AND the live registration state — the UI needs
+// to know if the shortcut is enabled but failed to register (another app owns
+// the accelerator) so it can surface a hint.
+ipcMain.handle('get-record-hotkey', () => ({
+  success: true,
+  enabled: recordHotkeyEnabledFromDisk(),
+  registered: globalShortcut.isRegistered(RECORD_HOTKEY_ACCEL),
+}));
+
+ipcMain.handle('set-record-hotkey', async (event, enabled) => {
+  try {
+    sendDebugLog(`Setting record hotkey to: ${enabled}`);
+    const result = await runPythonScript('simple_recorder.py', ['set-record-hotkey', enabled ? 'True' : 'False']);
+
+    // Surface a persist failure rather than silently applying the shortcut.
+    const jsonMatch = result.match(/\{.*\}/s);
+    if (jsonMatch) {
+      const persisted = JSON.parse(jsonMatch[0]);
+      if (persisted.success === false) {
+        return {
+          success: false,
+          error: persisted.error || 'Failed to save record shortcut preference',
+        };
+      }
+    }
+
+    // Live-apply so the change takes effect without a relaunch. Idempotent and
+    // never unregisterAll() — see applyRecordHotkey (guards on isRegistered() so
+    // a repeat-enable can't report a spurious failure, and only ever touches
+    // this specific accelerator).
+    const registered = applyRecordHotkey(enabled);
+    if (enabled && !registered) {
+      console.error(`Failed to register global hotkey: ${RECORD_HOTKEY_ACCEL}`);
+    }
+    return { success: true, enabled, registered };
+  } catch (error) {
+    sendDebugLog(`Error setting record hotkey: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+});
+
 ipcMain.handle('get-telemetry', async () => {
   try {
     const result = await runPythonScript('simple_recorder.py', ['get-telemetry']);
@@ -6961,31 +9333,6 @@ ipcMain.handle('get-telemetry', async () => {
     };
   } catch (error) {
     sendDebugLog(`Error getting telemetry settings: ${error.message}`);
-    return { success: false, error: error.message };
-  }
-});
-
-ipcMain.handle('get-privacy-notice-seen', async () => {
-  try {
-    const result = await runPythonScript('simple_recorder.py', ['get-privacy-notice-seen']);
-    const jsonData = JSON.parse(result);
-    return {
-      success: true,
-      privacy_notice_seen: jsonData.privacy_notice_seen
-    };
-  } catch (error) {
-    sendDebugLog(`Error getting privacy notice state: ${error.message}`);
-    return { success: false, error: error.message };
-  }
-});
-
-ipcMain.handle('set-privacy-notice-seen', async () => {
-  try {
-    const result = await runPythonScript('simple_recorder.py', ['set-privacy-notice-seen']);
-    const jsonData = JSON.parse(result);
-    return jsonData;
-  } catch (error) {
-    sendDebugLog(`Error marking privacy notice seen: ${error.message}`);
     return { success: false, error: error.message };
   }
 });
@@ -7143,32 +9490,6 @@ ipcMain.handle('set-menu-bar-icon', async (event, enabled) => {
 });
 
 // System audio capture IPC handlers
-ipcMain.handle('get-system-audio', async () => {
-  try {
-    const result = await runPythonScript('simple_recorder.py', ['get-system-audio'], true);
-    const jsonData = JSON.parse(result);
-    return { success: true, ...jsonData };
-  } catch (error) {
-    sendDebugLog(`Error getting system audio setting: ${error.message}`);
-    return { success: false, error: error.message };
-  }
-});
-
-ipcMain.handle('set-system-audio', async (event, enabled) => {
-  try {
-    sendDebugLog(`Setting system audio to: ${enabled}`);
-    const result = await runPythonScript('simple_recorder.py', ['set-system-audio', enabled ? 'True' : 'False']);
-    const jsonMatch = result.match(/\{.*\}/s);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
-    }
-    return { success: true, system_audio_enabled: enabled };
-  } catch (error) {
-    sendDebugLog(`Error setting system audio: ${error.message}`);
-    return { success: false, error: error.message };
-  }
-});
-
 ipcMain.handle('get-auto-detect-meetings', async () => {
   try {
     const result = await runPythonScript('simple_recorder.py', ['get-auto-detect-meetings'], true);
@@ -7197,6 +9518,8 @@ ipcMain.handle('set-auto-detect-meetings', async (_event, enabled) => {
           sendDebugLog('[auto-detect] E2E mode; setting saved but watcher not started');
         } else if (!app.isPackaged && !process.env[AUTO_DETECT_ENV]) {
           sendDebugLog(`[auto-detect] dev mode without ${AUTO_DETECT_ENV}=1; setting saved but watcher not started`);
+        } else if (!isAutoDetectSupported()) {
+          sendDebugLog('[auto-detect] requires macOS 14 (Sonoma) or later; setting saved but watcher not started');
         } else {
           startMicMonitor();
         }
@@ -7272,90 +9595,6 @@ ipcMain.handle('set-launch-on-login', async (_event, enabled) => {
 });
 
 // Language IPC handlers
-ipcMain.handle('get-language', async () => {
-  try {
-    const result = await runPythonScript('simple_recorder.py', ['get-language'], true);
-    const jsonData = JSON.parse(result);
-    return { success: true, ...jsonData };
-  } catch (error) {
-    sendDebugLog(`Error getting language setting: ${error.message}`);
-    return { success: false, error: error.message };
-  }
-});
-
-ipcMain.handle('set-language', async (event, languageCode) => {
-  try {
-    sendDebugLog(`Setting language to: ${languageCode}`);
-    const result = await runPythonScript('simple_recorder.py', ['set-language', languageCode]);
-    const jsonMatch = result.match(/\{.*\}/s);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
-    }
-    return { success: true, language: languageCode };
-  } catch (error) {
-    sendDebugLog(`Error setting language: ${error.message}`);
-    return { success: false, error: error.message };
-  }
-});
-
-// Microphone selection IPC handlers
-ipcMain.handle('get-microphone', async () => {
-  try {
-    const result = await runPythonScript('simple_recorder.py', ['get-microphone'], true);
-    const jsonData = JSON.parse(result);
-    return { success: true, ...jsonData };
-  } catch (error) {
-    sendDebugLog(`Error getting microphone setting: ${error.message}`);
-    return { success: false, error: error.message };
-  }
-});
-
-ipcMain.handle('set-microphone', async (event, deviceId, label) => {
-  try {
-    sendDebugLog(`Setting microphone to: ${deviceId ?? 'default'}`);
-    // '--' ends Click's option parsing: without it, a device label starting
-    // with '--' (e.g. "--help") is parsed as a flag, the subcommand prints
-    // help and exits 0 without saving, and the fallback below would then
-    // report a false success.
-    const result = await runPythonScript('simple_recorder.py', [
-      'set-microphone',
-      '--',
-      deviceId ?? '',
-      label ?? '',
-    ]);
-    const jsonMatch = result.match(/\{.*\}/s);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
-    }
-    const normalizedId = deviceId && deviceId !== 'default' ? deviceId : null;
-    return { success: true, device_id: normalizedId, label: normalizedId ? label ?? null : null };
-  } catch (error) {
-    sendDebugLog(`Error setting microphone: ${error.message}`);
-    return { success: false, error: error.message };
-  }
-});
-
-ipcMain.handle('get-user-name', async () => {
-  try {
-    const result = await runPythonScript('simple_recorder.py', ['get-user-name'], true);
-    const jsonData = JSON.parse(result.trim());
-    return { success: true, ...jsonData };
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-});
-
-ipcMain.handle('set-user-name', async (event, name) => {
-  try {
-    const result = await runPythonScript('simple_recorder.py', ['set-user-name', String(name ?? '')]);
-    const jsonMatch = result.match(/\{.*\}/s);
-    if (jsonMatch) return JSON.parse(jsonMatch[0]);
-    return { success: true, user_name: String(name ?? '').trim() };
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-});
-
 // AI Provider IPC handlers
 
 // One-time forward-migration of an app-managed credential from its pre-fix
@@ -7399,7 +9638,7 @@ function saveCloudApiKey(key) {
     if (!fs.existsSync(keyDir)) {
       fs.mkdirSync(keyDir, { recursive: true });
     }
-    const encrypted = safeStorage.encryptString(key);
+    const encrypted = getSafeStorage().encryptString(key);
     fs.writeFileSync(getCloudKeyPath(), encrypted);
     return true;
   } catch (error) {
@@ -7414,7 +9653,7 @@ function loadCloudApiKey() {
     migrateLegacyCredentialFile(keyPath, '.cloud-api-key');
     if (!fs.existsSync(keyPath)) return null;
     const encrypted = fs.readFileSync(keyPath);
-    return safeStorage.decryptString(encrypted);
+    return getSafeStorage().decryptString(encrypted);
   } catch (error) {
     console.error('Failed to load cloud API key:', error.message);
     return null;
@@ -7423,6 +9662,151 @@ function loadCloudApiKey() {
 
 function hasCloudApiKey() {
   return fs.existsSync(getCloudKeyPath());
+}
+
+// --- OpenAI-compatible ASR (transcription) API key -------------------------
+// Mirrors the cloud summariser key exactly: encrypted-at-rest via safeStorage,
+// stored under getUserDataDir() (honours STENOAI_USER_DATA_DIR test isolation),
+// never written to config.json, and injected into the TRANSCRIPTION subprocess
+// env as STENOAI_OAI_API_KEY. This is the security-critical difference from the
+// upstream PR, which persisted the key in plaintext config.json.
+function getOpenAiAsrKeyPath() {
+  return path.join(getUserDataDir(), '.openai-asr-api-key');
+}
+
+// Credentials belong to a network origin, not a configurable URL path. URL's
+// origin canonicalises scheme, hostname, and the effective port (including
+// default-port elision), so equivalent endpoints compare equal while a host,
+// scheme, or port change cannot reuse the old bearer token.
+function getOpenAiAsrEndpointOrigin() {
+  return readOpenAiAsrEndpointSnapshot({
+    fs,
+    configPath: path.join(getUserDataDir(), 'config.json'),
+  })?.origin || null;
+}
+
+function isOpenAiAsrKeyCleared() {
+  return isEncryptedKeyCleared({ fs, keyPath: getOpenAiAsrKeyPath() });
+}
+
+function markOpenAiAsrKeyCleared() {
+  return markEncryptedKeyClearedAtomically({
+    fs,
+    path,
+    processId: process.pid,
+    now: Date.now(),
+    keyPath: getOpenAiAsrKeyPath(),
+  });
+}
+
+function saveOpenAiAsrKey(key, origin) {
+  try {
+    if (!origin) throw new Error('OpenAI ASR endpoint is invalid');
+    return saveEncryptedKeyAtomically({
+      fs,
+      path,
+      processId: process.pid,
+      now: Date.now(),
+      keyPath: getOpenAiAsrKeyPath(),
+      key,
+      origin,
+      safeStorage: getSafeStorage(),
+    });
+  } catch (error) {
+    console.error(error.message);
+    throw error;
+  }
+}
+
+function loadOpenAiAsrCredential(origin) {
+  try {
+    if (isOpenAiAsrKeyCleared()) return null;
+    if (!origin) return null;
+    const keyPath = getOpenAiAsrKeyPath();
+    migrateLegacyCredentialFile(keyPath, '.openai-asr-api-key');
+    const key = loadEncryptedKeyForOrigin({ fs, keyPath, origin, safeStorage: getSafeStorage() });
+    return key ? { key, origin } : null;
+  } catch (error) {
+    console.error('Failed to load OpenAI ASR API key:', error.message);
+    return null;
+  }
+}
+
+function loadOpenAiAsrKey(origin) {
+  return loadOpenAiAsrCredential(origin)?.key || null;
+}
+
+function hasOpenAiAsrKey() {
+  const origin = getOpenAiAsrEndpointOrigin();
+  return Boolean(origin && loadOpenAiAsrKey(origin));
+}
+
+function readLegacyOpenAiAsrCredential() {
+  const snapshot = readOpenAiAsrConfigSnapshot({
+    fs,
+    configPath: path.join(getUserDataDir(), 'config.json'),
+  });
+  return snapshot === null ? OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE : snapshot.legacy;
+}
+
+function secureLegacyOpenAiAsrApiKey(legacy = readLegacyOpenAiAsrCredential()) {
+  if (legacy === OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE) return false;
+  if (!legacy || !legacy.key || !legacy.origin) return false;
+  const stored = loadOpenAiAsrKey(legacy.origin);
+  const action = legacyKeyMigrationAction({
+    cleared: isOpenAiAsrKeyCleared(),
+    legacyKey: legacy.key,
+    storedKey: stored,
+  });
+  if (action !== 'secure') return action === 'remove-legacy' && Boolean(stored);
+  try {
+    // Do not remove config.json's value unless encrypt + decrypt both work.
+    return saveOpenAiAsrKey(legacy.key, legacy.origin)
+      && Boolean(loadOpenAiAsrKey(legacy.origin));
+  } catch (_) {
+    return false;
+  }
+}
+
+async function migrateLegacyOpenAiAsrApiKey(legacy = readLegacyOpenAiAsrCredential()) {
+  if (legacy === OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE) return false;
+  if (!legacy) return true;
+  const removeLegacyKey = async () => {
+    try {
+      const raw = await runPythonScript(
+        'simple_recorder.py', ['remove-legacy-openai-asr-api-key'], true,
+        { STENOAI_OAI_LEGACY_SNAPSHOT_DIGEST: legacy.snapshotDigest },
+      );
+      return JSON.parse(raw.trim()).success === true;
+    } catch (_) {
+      // A clear marker remains authoritative, or the encrypted copy is safe;
+      // either way the plaintext can be removed on a future retry.
+      return false;
+    }
+  };
+  // Invalid raw legacy values must never become encrypted credentials. They
+  // still have a raw-digest CAS snapshot, so remove only that exact stale
+  // plaintext instead of leaving it in config.json indefinitely.
+  if (!legacy.key || !legacy.origin) return removeLegacyKey();
+
+  let stored = loadOpenAiAsrKey(legacy.origin);
+  const action = legacyKeyMigrationAction({
+    cleared: isOpenAiAsrKeyCleared(),
+    legacyKey: legacy.key,
+    storedKey: stored,
+  });
+  if (action === 'none') return false;
+  if (action === 'remove-legacy') return removeLegacyKey();
+  if (action === 'secure') {
+    try {
+      if (!saveOpenAiAsrKey(legacy.key, legacy.origin)) return false;
+      stored = loadOpenAiAsrKey(legacy.origin);
+      if (stored !== legacy.key) return false;
+    } catch (_) {
+      return false;
+    }
+  }
+  return removeLegacyKey();
 }
 
 // Build the env additions a Python AI-driven subprocess needs. Merges
@@ -7439,6 +9823,43 @@ function getAiEnv() {
   if (session && session.adapterUrl && session.token && !isJwtExpired(session.token)) {
     env.STENOAI_ADAPTER_URL = session.adapterUrl;
     env.STENOAI_ADAPTER_TOKEN = session.token;
+  }
+  return env;
+}
+
+function getBackendEnv(extra = {}) {
+  return { ...withoutOpenAiAsrKey(require('process').env), ...extra };
+}
+
+// Env additions a transcription subprocess needs. Only when openai-asr is the
+// configured engine, decrypt its key from safeStorage and surface its
+// endpoint-bound credential snapshot to Python atomically.
+function getTranscriptionEnv() {
+  const env = {};
+  if (loadTranscriptionEngine() !== 'openai-asr') return env;
+  // A legacy plaintext key must be secured before this first cloud job. The
+  // deletion itself is async (via the locked Python config writer), but this
+  // sync path can safely use the encrypted copy immediately.
+  const configSnapshot = readOpenAiAsrConfigSnapshot({
+    fs,
+    configPath: path.join(getUserDataDir(), 'config.json'),
+  });
+  // Endpoint, origin, and any legacy credential come from one direct config
+  // read. Do not let the asynchronous cleanup read a replacement endpoint.
+  const legacy = configSnapshot === null
+    ? OPENAI_ASR_CONFIG_SNAPSHOT_UNREADABLE
+    : configSnapshot.legacy;
+  secureLegacyOpenAiAsrApiKey(legacy);
+  void migrateLegacyOpenAiAsrApiKey(legacy);
+  const endpoint = configSnapshot?.endpoint || null;
+  const credential = endpoint ? loadOpenAiAsrCredential(endpoint.origin) : null;
+  if (credential) {
+    env.STENOAI_OAI_API_KEY = credential.key;
+    env.STENOAI_OAI_API_ORIGIN = credential.origin;
+    // This WHATWG-canonical ASCII URL and the origin above come from one
+    // config snapshot. Python validates it again without re-reading a mutable
+    // endpoint while the bearer credential is in scope.
+    env.STENOAI_OAI_API_URL = endpoint.apiUrl;
   }
   return env;
 }
@@ -8047,6 +10468,66 @@ ipcMain.handle('close-system-audio-file', async () => {
   }
 });
 
+// Linux system-audio loopback — spawns pw-record and streams raw PCM to the
+// renderer instead of going through Chromium's capture path (see
+// ./linux-loopback.js for why). Module-level, like activeSysAudioWriteStream.
+let activeLinuxLoopback = null;
+
+// Serialises start/stop — see createSerialQueue in ./linux-loopback.js for why.
+const queueLinuxLoopback = createSerialQueue();
+
+ipcMain.handle('start-linux-loopback', () => queueLinuxLoopback(async () => {
+  try {
+    // Reclaim an unstopped prior capture, same as open-system-audio-file above
+    // — and not a rare race: a renderer reload remounts useSystemAudioCapture
+    // with a fresh activeRef, which restarts capture off main's still-
+    // 'recording' status. Leaving the old process running would feed the
+    // renderer's new subscription both streams interleaved, and stop-linux-
+    // loopback only knows the newer one.
+    if (activeLinuxLoopback) {
+      const prior = activeLinuxLoopback;
+      activeLinuxLoopback = null;
+      sendDebugLog('[linux-loopback] abandoning unstopped prior capture');
+      prior.stdout.removeAllListeners('data');
+      await prior.stop();
+    }
+    const capture = await startLoopbackCapture({
+      onError: (err) => sendDebugLog(`[linux-loopback] capture error: ${err.message}`),
+    });
+    const align = createFrameAligner(2 * capture.channels); // s16 = 2 bytes/sample
+    capture.stdout.on('data', (chunk) => {
+      const whole = align(chunk);
+      if (whole) mainWindow?.webContents.send('linux-loopback-chunk', whole);
+    });
+    capture.proc.on('exit', (code, signal) => {
+      // stop() clears the ref before killing, so reaching here still-referenced
+      // means pw-record died on its own. Tell the renderer — otherwise the
+      // recording continues with a dead system channel and no warning.
+      if (activeLinuxLoopback?.proc === capture.proc) {
+        sendDebugLog(`[linux-loopback] pw-record exited unexpectedly (code=${code}, signal=${signal})`);
+        activeLinuxLoopback = null;
+        mainWindow?.webContents.send('linux-loopback-ended', { code, signal });
+      }
+    });
+    activeLinuxLoopback = capture;
+    sendDebugLog(`[linux-loopback] capturing from ${capture.target}`);
+    return { success: true, sampleRate: capture.sampleRate, channels: capture.channels };
+  } catch (error) {
+    sendDebugLog(`[linux-loopback] start failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}));
+
+ipcMain.handle('stop-linux-loopback', () => queueLinuxLoopback(async () => {
+  const capture = activeLinuxLoopback;
+  activeLinuxLoopback = null;
+  if (!capture) return { success: true };
+  capture.stdout.removeAllListeners('data');
+  await capture.stop();
+  sendDebugLog('[linux-loopback] stopped');
+  return { success: true };
+}));
+
 // A failed renderer-side capture (mic permission denied, no audio device)
 // would otherwise be silent — the optimistic "recording" pill is dropped via
 // system-audio-recording-state, but the user gets no reason. Surface a native
@@ -8059,17 +10540,20 @@ function showRecordingFailedNotification(body) {
     new Notification({
       title: 'Steno',
       body: body || "Recording couldn't start.",
+      iconType: 'alert',
     }).show();
   } catch (error) {
     console.error('Failed to show recording-failed notification:', error.message);
   }
 }
 
-ipcMain.on('recording-capture-error', (_event, message) => {
-  sendDebugLog(`[sysaudio] capture error: ${message}`);
-  showRecordingFailedNotification(
-    message ? `Recording couldn't start: ${message}` : "Recording couldn't start.",
-  );
+ipcMain.on('recording-capture-error', (_event, message, name, phase) => {
+  // The raw text stays in the debug log, where it is what a diagnosis needs —
+  // and ONLY there. What reaches the notification is prose built from the
+  // error's name and the caller's phase; see buildCaptureErrorBody for why the
+  // message itself is never consulted.
+  sendDebugLog(`[sysaudio] capture error (${phase || 'start'}): ${name ? `${name}: ` : ''}${message}`);
+  showRecordingFailedNotification(buildCaptureErrorBody({ name, phase }));
 });
 
 ipcMain.handle('process-system-audio-recording', async (event, audioFilePath, sessionName) => {
@@ -8164,6 +10648,7 @@ ipcMain.handle('process-system-audio-recording', async (event, audioFilePath, se
 ipcMain.on('system-audio-recording-state', (event, isRecording) => {
   sendDebugLog(`[sysaudio] state -> ${isRecording ? 'true' : 'false'} (was ${systemAudioRecordingActive})`);
   systemAudioRecordingActive = isRecording;
+  applyRecordingBackgroundThrottling();
   if (!isRecording && !currentRecordingProcess) {
     // Reset the elapsed counter (avoids leaking startedAtMs when startCapture
     // fails), but DON'T blank currentRecordingSessionName here: this is a
@@ -8386,7 +10871,7 @@ function getOllamaEnv() {
   } else {
     ollamaDir = path.join(__dirname, '..', 'bin');
   }
-  const env = { ...process.env };
+  const env = getBackendEnv();
   if (process.platform === 'darwin') {
     const existing = env.DYLD_LIBRARY_PATH || '';
     env.DYLD_LIBRARY_PATH = existing ? `${ollamaDir}:${existing}` : ollamaDir;
@@ -8428,68 +10913,116 @@ async function findOllamaExecutable() {
   return null;
 }
 
-// Update checking functionality
+// Where the manual "Check for updates" reads the latest release from. Kept as a
+// named constant so the repo path has a single source of truth (and is the one
+// line to change if the repo is renamed/transferred — though the redirect
+// following below means an old build keeps working through GitHub's 301 too).
+const UPDATE_CHECK_URL = 'https://api.github.com/repos/stenolabs/stenoai/releases/latest';
+
+// Update checking functionality. Follows HTTP redirects (301/302/307/308):
+// GitHub's REST API returns a 301 to the new owner/repo path when a repo is
+// renamed or transferred, and Node's https.request does NOT follow redirects on
+// its own — so without this, a transfer would silently break the manual update
+// check for every already-installed app.
 async function checkForUpdates() {
-  return new Promise((resolve) => {
-    const options = {
-      hostname: 'api.github.com',
-      path: '/repos/ruzin/stenoai/releases/latest',
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Steno-Updater'
+  const MAX_REDIRECTS = 5;
+  // One 10s budget shared across the whole redirect chain, so a slow chain of
+  // hops can't keep the check hanging for redirects × 10s (each hop used to
+  // reset its own timeout).
+  const deadline = Date.now() + 10000;
+
+  function fetchLatest(urlStr, redirectsLeft) {
+    return new Promise((resolve) => {
+      let url;
+      try {
+        url = new URL(urlStr);
+      } catch {
+        resolve({ success: false, error: 'Invalid update URL' });
+        return;
       }
-    };
+      const options = {
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method: 'GET',
+        headers: { 'User-Agent': 'Steno-Updater' },
+      };
 
-    const req = https.request(options, (res) => {
-      let data = '';
-
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
-
-      res.on('end', () => {
-        try {
-          const release = JSON.parse(data);
-          const latestVersion = release.tag_name.replace(/^v/, ''); // Remove 'v' prefix if present
-
-          // Get current version from package.json
-          const packagePath = path.join(__dirname, 'package.json');
-          const packageContent = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
-          const currentVersion = packageContent.version;
-
-          console.log(`Current version: ${currentVersion}, Latest version: ${latestVersion}`);
-
-          // Simple version comparison (works for semantic versioning)
-          const isUpdateAvailable = compareVersions(currentVersion, latestVersion) < 0;
-
-          resolve({
-            success: true,
-            updateAvailable: isUpdateAvailable,
-            currentVersion: currentVersion,
-            latestVersion: latestVersion,
-            releaseUrl: release.html_url,
-            releaseName: release.name || `Version ${latestVersion}`,
-            downloadUrl: getDownloadUrl(release.assets)
-          });
-        } catch (error) {
-          console.error('Error parsing GitHub API response:', error);
-          resolve({ success: false, error: 'Failed to parse update data' });
+      const req = https.request(options, (res) => {
+        // Follow a redirect (repo rename/transfer → 301 to the new path).
+        if ([301, 302, 307, 308].includes(res.statusCode) && res.headers.location) {
+          res.resume(); // drain the response so the socket can be reused/freed
+          if (redirectsLeft <= 0) {
+            resolve({ success: false, error: 'Too many redirects' });
+            return;
+          }
+          // location may be relative; resolve it against the current URL. A
+          // malformed Location would make new URL() throw synchronously inside
+          // this callback (crashing the main process), so guard it and fail the
+          // check normally instead.
+          let next;
+          try {
+            next = new URL(res.headers.location, urlStr).toString();
+          } catch {
+            resolve({ success: false, error: 'Invalid redirect URL' });
+            return;
+          }
+          resolve(fetchLatest(next, redirectsLeft - 1));
+          return;
         }
+
+        let data = '';
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+
+        res.on('end', () => {
+          try {
+            const release = JSON.parse(data);
+            const latestVersion = release.tag_name.replace(/^v/, ''); // Remove 'v' prefix if present
+
+            // Get current version from package.json
+            const packagePath = path.join(__dirname, 'package.json');
+            const packageContent = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+            const currentVersion = packageContent.version;
+
+            console.log(`Current version: ${currentVersion}, Latest version: ${latestVersion}`);
+
+            // Simple version comparison (works for semantic versioning)
+            const isUpdateAvailable = compareVersions(currentVersion, latestVersion) < 0;
+
+            resolve({
+              success: true,
+              updateAvailable: isUpdateAvailable,
+              currentVersion: currentVersion,
+              latestVersion: latestVersion,
+              releaseUrl: release.html_url,
+              releaseName: release.name || `Version ${latestVersion}`,
+              downloadUrl: getDownloadUrl(release.assets)
+            });
+          } catch (error) {
+            console.error('Error parsing GitHub API response:', error);
+            resolve({ success: false, error: 'Failed to parse update data' });
+          }
+        });
       });
-    });
 
-    req.on('error', (error) => {
-      console.error('Error checking for updates:', error);
-      resolve({ success: false, error: error.message });
-    });
+      req.on('error', (error) => {
+        console.error('Error checking for updates:', error);
+        resolve({ success: false, error: error.message });
+      });
 
-    req.setTimeout(10000, () => {
-      req.destroy();
-      resolve({ success: false, error: 'Update check timeout' });
-    });
+      // Share the single deadline across all hops (min 1ms so an already-expired
+      // budget still fires promptly rather than being treated as "no timeout").
+      req.setTimeout(Math.max(1, deadline - Date.now()), () => {
+        req.destroy();
+        resolve({ success: false, error: 'Update check timeout' });
+      });
 
-    req.end();
-  });
+      req.end();
+    });
+  }
+
+  return fetchLatest(UPDATE_CHECK_URL, MAX_REDIRECTS);
 }
 
 function compareVersions(current, latest) {
@@ -8533,16 +11066,34 @@ function getDownloadUrl(assets) {
 
 ipcMain.handle('check-for-updates', async () => {
   const result = await checkForUpdates();
+  const osEligible = autoUpdateOSEligible();
   // The GitHub comparison above is a read-only display poll — it never
   // itself starts a download. Kick the real autoUpdater check alongside it
   // so a manual "Check for Updates" click actually starts a background
   // download when one's available, instead of only reporting the latest
-  // tag and waiting for the next scheduled interval. Same guard as
-  // setupAutoUpdater() so this stays a no-op (and network-free) in e2e/dev.
-  if (!IS_E2E && app.isPackaged) {
+  // tag and waiting for the next scheduled interval. Same guards as
+  // setupAutoUpdater(): no-op (and network-free) in e2e/dev, and never on a
+  // Mac below the launch floor, which must not download a build it can't run (#432).
+  if (!IS_E2E && app.isPackaged && osEligible) {
     autoUpdater.checkForUpdates().catch(() => {});
   }
-  return result;
+  // A check that just succeeded and found nothing settles an earlier FAILED
+  // check — otherwise a stale banner sits under a fresh "You're on the latest
+  // version", two contradictory answers to one question. Cleared here, in the
+  // state the About tab rehydrates from, so it stays cleared across a remount
+  // rather than only until the user switches tabs.
+  //
+  // Only non-sticky errors: this poll is our own GitHub request, so it says
+  // nothing about whether the updater can write to /Applications or whether
+  // this build has an update feed at all. Those conditions are still true and
+  // stay on screen (see update-error-copy.js).
+  if (result.success && !result.updateAvailable && !pendingUpdateErrorSticky) {
+    pendingUpdateError = null;
+  }
+  // Surface eligibility so the About tab can explain why an "update available"
+  // won't auto-install on an under-floor Mac, rather than offering a broken
+  // Restart. (Display-only; the safety is the gated kick above.)
+  return { ...result, osUpdateEligible: osEligible };
 });
 
 // Lets a freshly-(re)mounted About tab recover "an update already
@@ -8601,6 +11152,16 @@ ipcMain.handle('open-external', async (event, url) => {
     return { success: false, error: error.message };
   }
 });
+// Decodes the payload of a JWT (e.g. an OAuth id_token) without verifying
+// its signature — safe here because the token came straight from the
+// provider's own token endpoint over TLS, not from an untrusted party.
+// Used only to read the `email`/`preferred_username` claim; best-effort,
+// callers must not let a decode failure block the OAuth flow.
+function decodeJwtPayload(jwt) {
+  const payload = jwt.split('.')[1];
+  return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+}
+
 // ── Google Calendar: Token Storage ──────────────────────────────────────
 
 function getTokenFilePath() {
@@ -8617,7 +11178,7 @@ function saveGoogleTokens(tokens) {
     if (!fs.existsSync(tokenDir)) {
       fs.mkdirSync(tokenDir, { recursive: true });
     }
-    const encrypted = safeStorage.encryptString(JSON.stringify(tokens));
+    const encrypted = getSafeStorage().encryptString(JSON.stringify(tokens));
     fs.writeFileSync(getTokenFilePath(), encrypted);
     console.log('Google tokens saved');
   } catch (error) {
@@ -8631,7 +11192,7 @@ function loadGoogleTokens() {
     migrateLegacyCredentialFile(tokenPath, '.google-tokens');
     if (!fs.existsSync(tokenPath)) return null;
     const encrypted = fs.readFileSync(tokenPath);
-    const decrypted = safeStorage.decryptString(encrypted);
+    const decrypted = getSafeStorage().decryptString(encrypted);
     return JSON.parse(decrypted);
   } catch (error) {
     console.error('Failed to load Google tokens:', error.message);
@@ -8665,7 +11226,7 @@ function saveOutlookTokens(tokens) {
     if (!fs.existsSync(tokenDir)) {
       fs.mkdirSync(tokenDir, { recursive: true });
     }
-    const encrypted = safeStorage.encryptString(JSON.stringify(tokens));
+    const encrypted = getSafeStorage().encryptString(JSON.stringify(tokens));
     fs.writeFileSync(getOutlookTokenFilePath(), encrypted);
     console.log('Outlook tokens saved');
   } catch (error) {
@@ -8679,7 +11240,7 @@ function loadOutlookTokens() {
     migrateLegacyCredentialFile(tokenPath, '.outlook-tokens');
     if (!fs.existsSync(tokenPath)) return null;
     const encrypted = fs.readFileSync(tokenPath);
-    const decrypted = safeStorage.decryptString(encrypted);
+    const decrypted = getSafeStorage().decryptString(encrypted);
     return JSON.parse(decrypted);
   } catch (error) {
     console.error('Failed to load Outlook tokens:', error.message);
@@ -8787,6 +11348,14 @@ function startGoogleAuth() {
           res.end('<html><body style="font-family: -apple-system, sans-serif; text-align: center; padding: 60px;"><h2>Cancelled</h2><p>You can close this tab.</p></body></html>');
           return;
         }
+        if (tokens.id_token) {
+          try {
+            const claims = decodeJwtPayload(tokens.id_token);
+            if (claims && claims.email) tokens.email = claims.email;
+          } catch (e) {
+            console.error('Failed to decode Google id_token:', e.message);
+          }
+        }
         saveGoogleTokens(tokens);
 
         res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -8799,8 +11368,7 @@ function startGoogleAuth() {
         // Notify renderer and bring app to foreground
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('google-auth-changed');
-          mainWindow.show();
-          mainWindow.focus();
+          exposeMainWindow();
         }
 
         resolve({ success: true });
@@ -8900,7 +11468,7 @@ function exchangeCodeForTokens(code, codeVerifier, port) {
           // Store expiry as absolute timestamp
           parsed.expires_at = Date.now() + (parsed.expires_in * 1000);
           resolve(parsed);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse token response'));
         }
       });
@@ -8938,6 +11506,11 @@ async function getValidAccessToken() {
     // Preserve the refresh token (Google may not return it again)
     newTokens.refresh_token = newTokens.refresh_token || tokens.refresh_token;
     newTokens.expires_at = Date.now() + (newTokens.expires_in * 1000);
+    // Preserve the email captured at connect time — a refresh response
+    // doesn't reliably carry a fresh id_token, and even if it did, a
+    // refresh grant can't upgrade a pre-existing connection to scopes it
+    // wasn't originally consented to.
+    newTokens.email = newTokens.email || tokens.email;
     saveGoogleTokens(newTokens);
     return newTokens.access_token;
   } catch (error) {
@@ -8982,7 +11555,7 @@ function refreshAccessToken(refreshToken) {
             return;
           }
           resolve(parsed);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse refresh response'));
         }
       });
@@ -9022,7 +11595,7 @@ async function fetchGoogleCalendarList(accessToken, signal) {
             return;
           }
           resolve(parsed.items || []);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse calendar list response'));
         }
       });
@@ -9033,7 +11606,7 @@ async function fetchGoogleCalendarList(accessToken, signal) {
 }
 
 function fetchGoogleEventsForCalendar(accessToken, calendarId, params, signal) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const options = {
       hostname: 'www.googleapis.com',
       path: `/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${params.toString()}`,
@@ -9076,38 +11649,34 @@ async function fetchCalendarEvents(accessToken, maxResults = 50, signal) {
     fields: 'items(id,status,summary,description,start,end,attendees,htmlLink,conferenceData,colorId)'
   });
 
-  try {
-    const calendars = await fetchGoogleCalendarList(accessToken, signal);
-    const selectedCalendars = calendars.filter(c => c.selected);
-    if (selectedCalendars.length === 0) return [];
+  const calendars = await fetchGoogleCalendarList(accessToken, signal);
+  const selectedCalendars = calendars.filter(c => c.selected);
+  if (selectedCalendars.length === 0) return [];
 
-    const results = [];
-    const concurrency = 3;
-    for (let i = 0; i < selectedCalendars.length; i += concurrency) {
-      const chunk = selectedCalendars.slice(i, i + concurrency);
-      const chunkPromises = chunk.map(async (cal) => {
-        const items = await fetchGoogleEventsForCalendar(accessToken, cal.id, params, signal);
-        items.forEach(item => { 
-          item.calendarBackgroundColor = cal.backgroundColor; 
-          item._sourceCalendarId = cal.id;
-        });
-        return items;
+  const results = [];
+  const concurrency = 3;
+  for (let i = 0; i < selectedCalendars.length; i += concurrency) {
+    const chunk = selectedCalendars.slice(i, i + concurrency);
+    const chunkPromises = chunk.map(async (cal) => {
+      const items = await fetchGoogleEventsForCalendar(accessToken, cal.id, params, signal);
+      items.forEach(item => {
+        item.calendarBackgroundColor = cal.backgroundColor;
+        item._sourceCalendarId = cal.id;
       });
-      const chunkResults = await Promise.all(chunkPromises);
-      results.push(...chunkResults);
-    }
-    let allEvents = results.flat();
-    
-    allEvents.sort((a, b) => {
-      const startA = new Date(a.start?.dateTime || a.start?.date || 0);
-      const startB = new Date(b.start?.dateTime || b.start?.date || 0);
-      return startA.getTime() - startB.getTime();
+      return items;
     });
-
-    return allEvents.slice(0, maxResults);
-  } catch (err) {
-    throw err;
+    const chunkResults = await Promise.all(chunkPromises);
+    results.push(...chunkResults);
   }
+  const allEvents = results.flat();
+
+  allEvents.sort((a, b) => {
+    const startA = new Date(a.start?.dateTime || a.start?.date || 0);
+    const startB = new Date(b.start?.dateTime || b.start?.date || 0);
+    return startA.getTime() - startB.getTime();
+  });
+
+  return allEvents.slice(0, maxResults);
 }
 
 // ── Outlook Calendar: OAuth2 Flow with PKCE ─────────────────────────────
@@ -9187,6 +11756,17 @@ function startOutlookAuth() {
           res.end('<html><body style="font-family: -apple-system, sans-serif; text-align: center; padding: 60px;"><h2>Cancelled</h2><p>You can close this tab.</p></body></html>');
           return;
         }
+        if (tokens.id_token) {
+          try {
+            const claims = decodeJwtPayload(tokens.id_token);
+            // Work/school accounts often have a null `email` claim but a
+            // usable `preferred_username` (the UPN, which is email-shaped).
+            const email = claims && (claims.email || claims.preferred_username);
+            if (email) tokens.email = email;
+          } catch (e) {
+            console.error('Failed to decode Outlook id_token:', e.message);
+          }
+        }
         saveOutlookTokens(tokens);
 
         res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -9198,8 +11778,7 @@ function startOutlookAuth() {
 
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('outlook-auth-changed');
-          mainWindow.show();
-          mainWindow.focus();
+          exposeMainWindow();
         }
 
         resolve({ success: true });
@@ -9291,7 +11870,7 @@ function exchangeOutlookCodeForTokens(code, codeVerifier, port) {
           }
           parsed.expires_at = Date.now() + (parsed.expires_in * 1000);
           resolve(parsed);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse token response'));
         }
       });
@@ -9326,6 +11905,9 @@ async function getValidOutlookAccessToken() {
     const newTokens = await refreshOutlookAccessToken(tokens.refresh_token);
     newTokens.refresh_token = newTokens.refresh_token || tokens.refresh_token;
     newTokens.expires_at = Date.now() + (newTokens.expires_in * 1000);
+    // See the Google counterpart — preserve the email captured at connect
+    // time rather than relying on the refresh response to carry it again.
+    newTokens.email = newTokens.email || tokens.email;
     saveOutlookTokens(newTokens);
     return newTokens.access_token;
   } catch (error) {
@@ -9344,11 +11926,18 @@ async function getValidOutlookAccessToken() {
 
 function refreshOutlookAccessToken(refreshToken) {
   return new Promise((resolve, reject) => {
+    // No `scope` param: Microsoft defaults a refresh to whatever the
+    // refresh_token was originally granted. Sending OUTLOOK_SCOPES here
+    // would ask pre-existing connections (granted before openid/email were
+    // added) for scope they never consented to, and Microsoft rejects
+    // that — breaking their calendar connection the next time the access
+    // token expires. New connections still get the full scope, since it's
+    // requested at initial authorization (startOutlookAuth) and a refresh
+    // without `scope` inherits it.
     const postData = new URLSearchParams({
       client_id: OUTLOOK_CLIENT_ID,
       refresh_token: refreshToken,
-      grant_type: 'refresh_token',
-      scope: OUTLOOK_SCOPES
+      grant_type: 'refresh_token'
     }).toString();
 
     const tokenUrl = new URL(OUTLOOK_TOKEN_URL);
@@ -9373,7 +11962,7 @@ function refreshOutlookAccessToken(refreshToken) {
             return;
           }
           resolve(parsed);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse refresh response'));
         }
       });
@@ -9407,7 +11996,7 @@ async function fetchOutlookCalendarList(accessToken, signal) {
             return;
           }
           resolve(parsed.value || []);
-        } catch (err) {
+        } catch {
           reject(new Error('Failed to parse Outlook calendar list response'));
         }
       });
@@ -9418,7 +12007,7 @@ async function fetchOutlookCalendarList(accessToken, signal) {
 }
 
 function fetchOutlookEventsForCalendar(accessToken, calendarId, params, signal) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const options = {
       hostname: 'graph.microsoft.com',
       path: `/v1.0/me/calendars/${encodeURIComponent(calendarId)}/calendarView?${params.toString()}`,
@@ -9465,52 +12054,48 @@ async function fetchOutlookCalendarEvents(accessToken, maxResults = 50, signal) 
     $select: 'id,subject,body,start,end,attendees,webLink,onlineMeeting,isOnlineMeeting,isAllDay,isCancelled,responseStatus,categories'
   });
 
-  try {
-    const calendars = await fetchOutlookCalendarList(accessToken, signal);
-    if (calendars.length === 0) return [];
+  const calendars = await fetchOutlookCalendarList(accessToken, signal);
+  if (calendars.length === 0) return [];
 
-    const results = [];
-    const concurrency = 3;
-    for (let i = 0; i < calendars.length; i += concurrency) {
-      const chunk = calendars.slice(i, i + concurrency);
-      const chunkPromises = chunk.map(async (cal) => {
-        const items = await fetchOutlookEventsForCalendar(accessToken, cal.id, params, signal);
-        
-        let hexColor = undefined;
-        switch (cal.color) {
-          case 'lightBlue': hexColor = '#3B82F6'; break;
-          case 'lightGreen': hexColor = '#10B981'; break;
-          case 'lightOrange': hexColor = '#F97316'; break;
-          case 'lightGray': hexColor = '#6B7280'; break;
-          case 'lightYellow': hexColor = '#EAB308'; break;
-          case 'lightTeal': hexColor = '#14B8A6'; break;
-          case 'lightPink': hexColor = '#EC4899'; break;
-          case 'lightBrown': hexColor = '#92400E'; break;
-          case 'lightRed': hexColor = '#EF4444'; break;
-          default: hexColor = '#3B82F6';
-        }
-        
-        items.forEach(item => { 
-          item.calendarBackgroundColor = hexColor; 
-          item.id = `${cal.id}_${item.id}`;
-        });
-        return items;
+  const results = [];
+  const concurrency = 3;
+  for (let i = 0; i < calendars.length; i += concurrency) {
+    const chunk = calendars.slice(i, i + concurrency);
+    const chunkPromises = chunk.map(async (cal) => {
+      const items = await fetchOutlookEventsForCalendar(accessToken, cal.id, params, signal);
+
+      let hexColor;
+      switch (cal.color) {
+        case 'lightBlue': hexColor = '#3B82F6'; break;
+        case 'lightGreen': hexColor = '#10B981'; break;
+        case 'lightOrange': hexColor = '#F97316'; break;
+        case 'lightGray': hexColor = '#6B7280'; break;
+        case 'lightYellow': hexColor = '#EAB308'; break;
+        case 'lightTeal': hexColor = '#14B8A6'; break;
+        case 'lightPink': hexColor = '#EC4899'; break;
+        case 'lightBrown': hexColor = '#92400E'; break;
+        case 'lightRed': hexColor = '#EF4444'; break;
+        default: hexColor = '#3B82F6';
+      }
+
+      items.forEach(item => {
+        item.calendarBackgroundColor = hexColor;
+        item.id = `${cal.id}_${item.id}`;
       });
-      const chunkResults = await Promise.all(chunkPromises);
-      results.push(...chunkResults);
-    }
-    let allEvents = results.flat();
-    
-    allEvents.sort((a, b) => {
-      const startA = new Date(a.start?.dateTime || a.start?.date || 0);
-      const startB = new Date(b.start?.dateTime || b.start?.date || 0);
-      return startA.getTime() - startB.getTime();
+      return items;
     });
-
-    return allEvents.slice(0, maxResults);
-  } catch (err) {
-    throw err;
+    const chunkResults = await Promise.all(chunkPromises);
+    results.push(...chunkResults);
   }
+  const allEvents = results.flat();
+
+  allEvents.sort((a, b) => {
+    const startA = new Date(a.start?.dateTime || a.start?.date || 0);
+    const startB = new Date(b.start?.dateTime || b.start?.date || 0);
+    return startA.getTime() - startB.getTime();
+  });
+
+  return allEvents.slice(0, maxResults);
 }
 
 function normalizeOutlookEvent(event) {
@@ -9600,8 +12185,8 @@ ipcMain.handle('google-auth-start', async () => {
 ipcMain.handle('google-auth-status', async () => {
   try {
     const tokens = loadGoogleTokens();
-    return { success: true, connected: !!tokens };
-  } catch (error) {
+    return { success: true, connected: !!tokens, email: tokens?.email ?? null };
+  } catch {
     return { success: false, connected: false };
   }
 });
@@ -9628,7 +12213,7 @@ ipcMain.handle('google-auth-disconnect', async () => {
           req.on('error', () => resolve()); // Best-effort
           req.end();
         });
-      } catch (e) {
+      } catch {
         // Best-effort revocation -- ignore errors
       }
     }
@@ -10029,8 +12614,46 @@ async function firePreMeetingNotification(event) {
     return false;
   }
 
-  createNotificationWindow(event);
-  trackEvent('notification_shown', { type: 'premeeting' });
+  const notif = new Notification({ title: event.title || 'Meeting starting' });
+  // The pre-meeting toast carries a richer payload (time / meeting URL /
+  // attendees) and keeps its legacy renderer-side handlers (Join & take notes,
+  // focus-on-body-tap) plus its own click/dismiss analytics. `premeeting: true`
+  // tells NotificationToast to use that path instead of the generic
+  // action/body-click bridge the other notifications use.
+  notif.payload.premeeting = true;
+  notif.payload.time = event.start
+    ? new Date(event.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : '';
+  notif.payload.meeting_url = event.meeting_url;
+  // The calendar's own colour for the accent bar; the toast stays neutral
+  // without one (#412).
+  if (event.color) notif.payload.color = event.color;
+  notif.payload.attendees = event.attendees
+    ? event.attendees.map((a) => a.name || a.email).join(', ')
+    : '';
+  // Only count a PASSIVE dismiss here (15s auto-close or being superseded). An
+  // active click/X-dismiss is tracked by the renderer, which also flags
+  // _analyticsInteracted via close-notification-window — so skip it here to
+  // avoid double-counting. This is the same split the old createNotificationWindow
+  // used, preserved verbatim.
+  //
+  // Read THIS notif's own window (notif._window), never the module-level
+  // `notificationWindow`: when this toast is superseded, the successor reassigns
+  // `notificationWindow` (and resets its `_analyticsInteracted` to false) before
+  // this 'close' fires, so reading the module-level var would attribute this
+  // toast's dismissal to the NEXT toast's interaction flag — dropping or
+  // duplicating the dismiss. The per-instance window keeps the flag correct.
+  let premeetingShown = false;
+  notif.once('show', () => {
+    premeetingShown = true;
+    trackEvent('notification_shown', { type: 'premeeting' });
+  });
+  notif.on('close', () => {
+    if (premeetingShown && (!notif._window || !notif._window._analyticsInteracted)) {
+      trackEvent('notification_dismissed', { type: 'premeeting' });
+    }
+  });
+  notif.show();
 
   // Mark fired only after we've actually shown it, so an unshowable notif
   // (no OS support) isn't permanently skipped by the scheduler's dedupe.
@@ -10038,86 +12661,51 @@ async function firePreMeetingNotification(event) {
   return true;
 }
 
-function createNotificationWindow(event) {
-  if (notificationWindow && !notificationWindow.isDestroyed()) {
-    notificationWindow.close();
-  }
+// Renderer → main: the active toast was closed by an explicit user action (a
+// Join/body tap, an action button, or the X). Flags _analyticsInteracted so the
+// pre-meeting path doesn't ALSO count a passive dismiss for the same toast, then
+// closes the window (which fires the notification's 'close' event).
+// Only the toast window itself may drive these; the sender check keeps another
+// renderer (the main window, a future one) from closing or clicking a toast.
+const fromToastWindow = (event) =>
+  notificationWindow && !notificationWindow.isDestroyed() &&
+  event.sender === notificationWindow.webContents;
 
-  const { screen } = require('electron');
-  const primaryDisplay = screen.getPrimaryDisplay();
-  const { width } = primaryDisplay.workAreaSize;
-  const { x, y } = primaryDisplay.workArea;
-
-  notificationWindow = new BrowserWindow({
-    width: 400,
-    height: 70,
-    x: x + width - 425,
-    y: y + 1,
-    frame: false,
-    transparent: true,
-    alwaysOnTop: true,
-    resizable: false,
-    skipTaskbar: true,
-    focusable: false,
-    hasShadow: false,
-    backgroundColor: '#00000000',
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      sandbox: true,
-      preload: path.join(__dirname, 'preload.js'),
-    },
-  });
-
-  const rendererDist = path.join(__dirname, 'renderer', 'dist', 'index.html');
-  notificationWindow.loadFile(rendererDist, { hash: '/notification' });
-
-  const win = notificationWindow;
-  // Set true by close-notification-window (the renderer's Join/Focus/Close
-  // handlers all route through it, and each already tracks its own
-  // notification_clicked/_dismissed via the analytics bridge before calling
-  // it). Scoped to this window instance -- not a module-level flag -- so a
-  // new notification superseding an unactioned old one can't leak state
-  // across windows. Stays false only when the window closes via the 15s
-  // auto-close timer with no interaction at all, which is the passive-
-  // dismiss path the native Notification lifecycle already tracks but this
-  // custom BrowserWindow-based notification previously didn't.
-  win._analyticsInteracted = false;
-  let autoCloseTimer;
-  win.once('ready-to-show', () => {
-    win.showInactive();
-    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-    win.setAlwaysOnTop(true, 'screen-saver', 1);
-
-    autoCloseTimer = setTimeout(() => {
-      if (!win.isDestroyed()) {
-        win.close();
-      }
-    }, 15000);
-
-    win.on('closed', () => {
-      if (autoCloseTimer) clearTimeout(autoCloseTimer);
-      if (!win._analyticsInteracted) {
-        trackEvent('notification_dismissed', { type: 'premeeting' });
-      }
-      if (notificationWindow === win) {
-        notificationWindow = null;
-      }
-    });
-
-    win.webContents.send('show-notification', {
-      title: event.title || 'Meeting starting',
-      time: event.start ? new Date(event.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
-      meeting_url: event.meeting_url,
-      attendees: event.attendees ? event.attendees.map(a => a.name || a.email).join(', ') : '',
-    });
-  });
-}
-
-ipcMain.handle('close-notification-window', () => {
-  if (notificationWindow && !notificationWindow.isDestroyed()) {
+ipcMain.handle('close-notification-window', (event) => {
+  if (fromToastWindow(event)) {
     notificationWindow._analyticsInteracted = true;
     notificationWindow.close();
+  }
+});
+
+// Renderer → main: an action button was tapped on the generic (non-pre-meeting)
+// toast. Re-emit as the notification's 'action' event (the button index on
+// details.actionIndex, matching Electron's Notification 'action' event) so the call site's
+// existing `.on('action', ...)` handler + trackNotificationLifecycle both fire.
+ipcMain.on('notification-action-clicked', (event, { actionId, notifId } = {}) => {
+  if (fromToastWindow(event)) {
+    const notif = notificationWindow._activeCustomNotification;
+    if (notif && notif.payload.id === notifId) {
+      const index = notif.payload.actions.findIndex((a) => a.id === actionId);
+      if (index === -1) return;
+      notificationWindow._analyticsInteracted = true;
+      // Electron 42 shape: the index lives on details.actionIndex; the old
+      // positional index argument is deprecated (#412).
+      notif.emit('action', { actionIndex: index });
+    }
+  }
+});
+
+// Renderer → main: the body of the generic toast was tapped. Re-emit as the
+// notification's 'click' event so the call site's `.on('click', ...)` handler +
+// trackNotificationLifecycle both fire.
+ipcMain.on('notification-body-clicked', (event, { notifId } = {}) => {
+  if (fromToastWindow(event)) {
+    const notif = notificationWindow._activeCustomNotification;
+    if (notif && notif.payload.id === notifId) {
+      notificationWindow._analyticsInteracted = true;
+      notif.emit('click');
+    }
   }
 });
 
@@ -10239,8 +12827,8 @@ ipcMain.handle('outlook-auth-start', async () => {
 ipcMain.handle('outlook-auth-status', async () => {
   try {
     const tokens = loadOutlookTokens();
-    return { success: true, connected: !!tokens };
-  } catch (error) {
+    return { success: true, connected: !!tokens, email: tokens?.email ?? null };
+  } catch {
     return { success: false, connected: false };
   }
 });
@@ -10311,7 +12899,7 @@ function saveOrgSession(session) {
   try {
     const dir = path.dirname(getOrgSessionPath());
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const encrypted = safeStorage.encryptString(JSON.stringify(session));
+    const encrypted = getSafeStorage().encryptString(JSON.stringify(session));
     fs.writeFileSync(getOrgSessionPath(), encrypted);
     orgSessionGeneration++;
     return true;
@@ -10325,7 +12913,7 @@ function saveOrgSession(session) {
 //   file missing        → { session: null, exists: false, decryptFailed: false }
 //   present, unreadable → { session: null, exists: true,  decryptFailed: true  }
 //   present, readable   → { session,      exists: true,  decryptFailed: false }
-// The middle state matters: safeStorage.decryptString throws while the
+// The middle state matters: getSafeStorage().decryptString throws while the
 // keychain is locked (right after wake / login, or a denied prompt after an
 // app re-sign) — treating that like "signed out" is exactly what used to
 // downgrade signed-in users to local AI via the stale-adapter recovery.
@@ -10341,7 +12929,7 @@ function loadOrgSessionEx() {
     // reset it moments before the decrypt throws, and the catch below
     // would restamp it to now on every call, so the grace window could
     // never elapse and the org lock would stay fail-closed forever.
-    const session = JSON.parse(safeStorage.decryptString(encrypted));
+    const session = JSON.parse(getSafeStorage().decryptString(encrypted));
     orgSessionDecryptFailingSince = null;
     return { session, exists: true, decryptFailed: false };
   } catch (e) {
@@ -10362,7 +12950,7 @@ function clearOrgSession() {
     if (fs.existsSync(p)) fs.unlinkSync(p);
     orgSessionGeneration++;
     return true;
-  } catch (e) {
+  } catch {
     return false;
   }
 }
@@ -11158,33 +13746,62 @@ ipcMain.handle('org-try-auto-backup', async (_event, payload) => {
     const session = loadOrgSession();
     if (!session) return { attempted: false, reason: 'not-signed-in' };
 
-    // Close the sign-in seeding race (cubic P1): the sign-in handler seeds
-    // the auto-backup default fire-and-forget, so a recording that finishes
-    // right after sign-in could reach this gate before the org's
-    // auto_share_default has been written — and the read below treats an
-    // unset pref as enabled (!== false), which would auto-share against an
-    // org policy of auto_share_default=false. seedOrgAutoBackupDefault is
-    // idempotent (writes only when no pref exists, swallows its own errors),
-    // so awaiting it here deterministically materialises the policy default
-    // before we decide. The adapter is necessarily reachable on the path
-    // that actually uploads, so this fetch is the same reachability the
-    // share itself needs.
-    await seedOrgAutoBackupDefault();
-
+    // Read the stored preference first. get-org-auto-backup reports whether a
+    // preference actually exists (org_auto_backup_preference_set), which lets
+    // us skip the /policy fetch + seed subprocess entirely once one does —
+    // steady-state backups only need the stored value (issue #192).
+    //
     // Fail closed: any error / unparseable output treats the toggle as
     // disabled. A privacy + sharing setting should never default ON via a
-    // transient read failure — if the user enabled it, they can do so
-    // again explicitly. The regex match guards against stray Python
-    // stderr/stdout noise around the JSON payload.
-    let enabled = false;
-    try {
+    // transient read failure — if the user enabled it, they can do so again
+    // explicitly. The regex match guards against stray Python stderr/stdout
+    // noise around the JSON payload.
+    const readAutoBackup = async () => {
       const cfg = await runPythonScript('simple_recorder.py', ['get-org-auto-backup']);
       const jsonMatch = cfg.match(/\{.*\}/s);
-      enabled = jsonMatch
-        ? JSON.parse(jsonMatch[0])?.org_auto_backup_enabled !== false
-        : false;
+      const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+      return {
+        enabled: parsed ? parsed.org_auto_backup_enabled !== false : false,
+        isSet: parsed ? parsed.org_auto_backup_preference_set === true : false,
+      };
+    };
+
+    let enabled = false;
+    let isSet = false;
+    try {
+      ({ enabled, isSet } = await readAutoBackup());
     } catch (_) {
       sendDebugLog('org-try-auto-backup: failed to read auto-backup pref, treating as disabled');
+      return { attempted: false, reason: 'disabled' };
+    }
+
+    // Only when the preference is genuinely unset do we close the sign-in
+    // seeding race (cubic P1): the sign-in handler seeds the auto-backup
+    // default fire-and-forget, so a recording that finishes right after
+    // sign-in could reach this gate before the org's auto_share_default has
+    // been written — and an unset pref reads as enabled (!== false), which
+    // would auto-share against an org policy of auto_share_default=false.
+    // seedOrgAutoBackupDefault is idempotent (writes only when no pref exists,
+    // swallows its own errors), so awaiting it here deterministically
+    // materialises the policy default before we re-read and decide. The
+    // adapter is necessarily reachable on the path that actually uploads, so
+    // this fetch is the same reachability the share itself needs. Once a
+    // preference exists we skip this entirely.
+    if (!isSet) {
+      await seedOrgAutoBackupDefault();
+      try {
+        ({ enabled, isSet } = await readAutoBackup());
+      } catch (_) {
+        sendDebugLog('org-try-auto-backup: failed to read auto-backup pref, treating as disabled');
+        return { attempted: false, reason: 'disabled' };
+      }
+      // If the seed didn't actually materialise a preference — adapter
+      // unreachable, seed subprocess failure, or a failed config write —
+      // the pref is still unset and `enabled` is only the historical default
+      // (true). Fail closed rather than auto-share against an org policy of
+      // auto_share_default=false that we couldn't read/persist. The user can
+      // re-enable explicitly, and the next recording re-attempts the seed.
+      if (!isSet) return { attempted: false, reason: 'disabled' };
     }
     if (!enabled) return { attempted: false, reason: 'disabled' };
 

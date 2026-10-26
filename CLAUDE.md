@@ -13,7 +13,7 @@ The app is a thin Electron shell over a PyInstaller-bundled Python CLI. There is
 - **Python CLI (`simple_recorder.py`, ~2.9k lines, ~60 click commands)** is the single entry point bundled by `stenoai.spec`. Sub-modules in `src/`: `audio_recorder` (sounddevice), `transcriber` (pywhispercpp), `summarizer` (Ollama HTTP client), `ollama_manager` (lifecycle of the bundled `ollama serve`), `config` (JSON-backed user settings + model registry), `folders`, `models`, `whisper_models`.
 - **State across CLI invocations** is persisted to `recorder_state.json` and similar small JSON files — there is no daemon. Long-running recordings are a `record` subprocess kept alive by the Electron main process.
 - **User data lives in `~/Library/Application Support/stenoai/`** (`recordings/`, `transcripts/`, `output/`), resolved via `src.config.get_data_dirs()`. Repo-root `recordings/`/`transcripts/`/`output/` dirs are dev-only scratch.
-- **Bundled binaries (`bin/`)**: Ollama + ffmpeg, downloaded by `scripts/download-ollama.sh`. PyInstaller copies them into `dist/stenoai/ollama/` and `dist/stenoai/ffmpeg`. Electron then re-bundles `dist/stenoai/` as an `extraResource`.
+- **Bundled binaries (`bin/`)**: Ollama + ffmpeg, downloaded by `scripts/download-ollama.sh`. PyInstaller copies them into `dist/stenoai/ollama/` and `dist/stenoai/ffmpeg`. Electron then re-bundles `dist/stenoai/` as an `extraResource`. `bin/steno-diarize` (macOS only) is a separate Swift/CoreML sidecar built by `scripts/build-diarize-sidecar.sh` — see "Speaker diarization" below.
 - **Deep links**: app registers the `stenoai://` URL scheme. Handler logic is in `app/main.js` near `SHORTCUT_PROTOCOL`. Used by macOS Shortcuts: `stenoai://record/start?name=...` and `stenoai://record/stop`.
 
 ## Development Commands
@@ -22,7 +22,9 @@ The app is a thin Electron shell over a PyInstaller-bundled Python CLI. There is
 - Build the bundled backend: `source venv/bin/activate && pyinstaller stenoai.spec --noconfirm`
 - Inspect CLI surface: `dist/stenoai/stenoai --help`
 - Most relevant CLI commands for debugging: `status`, `setup-check`, `list_failed`, `reprocess path/to/summary.json`, `query transcript.txt`, `pipeline filename.wav`
-- Lint: `ruff check .`
+- Ad-hoc Python lint: `ruff check .`
+- Enforced Python lint ratchet: `python -m pip install -r requirements-lint.txt && python scripts/ruff_ratchet.py`
+- Intentionally update the reviewed ratchet baseline: `python scripts/ruff_ratchet.py --update`
 - Run all tests: `python -m unittest discover tests`
 - Run a single test: `python -m unittest tests.test_config.ConfigStoragePathTests.test_set_storage_path_handles_permission_errors`
 
@@ -32,12 +34,61 @@ The app is a thin Electron shell over a PyInstaller-bundled Python CLI. There is
 - Renderer dev server (HMR, no Electron): `cd app && npm run dev:renderer`
 - Typecheck renderer: `cd app && npm run typecheck:renderer`
 - Lint renderer: `cd app && npm run lint:renderer`
+- Lint Electron main process: `cd app && npm run lint:main`
 - Format renderer: `cd app && npm run format:renderer`
 - Build DMG (local, for testing): `cd app && npm run build`
 
 The Electron build pulls the bundled backend from `../dist/stenoai` via `extraResources`, so the PyInstaller step (`pyinstaller stenoai.spec --noconfirm`) must succeed *before* `npm run build` — otherwise the packaged app will be missing `stenoai`, `ollama`, and `ffmpeg`. The same applies in dev: `getBackendPath()` falls back to `dist/stenoai/stenoai`, so a fresh checkout needs the backend built once before the app can record or transcribe.
 
 For setup from a clean checkout, see `CONTRIBUTING.md` and `README.md`.
+
+### Speaker diarization (macOS only)
+Per-channel acoustic speaker diarization (splitting multiple speakers sharing
+one side of a call — e.g. two people around one mic, or multiple remote
+participants on system audio) runs through `bin/steno-diarize`, a Swift/
+CoreML sidecar (`diarize-sidecar/`) wrapping FluidAudio's diarizers —
+Sortformer (default) or Nemotron 3, an 8-speaker streaming model (streaming
+preset via `STENOAI_DIARIZE_NEMOTRON_PRESET`, default `c128-split-w8a8`, the
+100%-ANE-resident split-graph build). The user picks the engine in
+Settings -> Transcribe ("Speaker detection"), persisted as the
+`diarization_engine` config key; `src.transcriber._steno_diarize_env()`
+turns it into the sidecar's `STENOAI_DIARIZE_ENGINE` for every invocation
+(`diarize`, `model-status`, `prepare-models`), and an already-set
+`STENOAI_DIARIZE_ENGINE` still wins as a developer override. Because
+meeting processing never downloads models, `set-diarization-engine` refuses
+a non-default engine until its models are ready; the renderer prepares them
+first via `prepare-speaker-models --engine nemotron3`. The stdout JSON contract is
+identical for both engines, so Python never branches on engine.
+Invoked from Python (`src.transcriber._run_steno_diarize`) — never
+from Electron, since the batch pipeline is entirely Python-orchestrated.
+Build it *before* `pyinstaller stenoai.spec`, same as `download-ollama.sh`:
+
+```
+scripts/build-diarize-sidecar.sh   # outputs bin/steno-diarize
+scripts/download-ollama.sh
+pyinstaller stenoai.spec --noconfirm
+```
+
+`stenoai.spec` bundles `bin/steno-diarize` only when it exists and only on
+macOS (`_IS_DARWIN`). A local development build may omit it and falls back
+to legacy channel-only "You"/"Others" labeling. A macOS release build must
+build it first and assert both `bin/steno-diarize` and the bundled copy are
+executable; the release workflows enforce those checks. A failed individual
+diarization run still falls back without failing the meeting. Windows/Linux
+never get acoustic diarization;
+`_resolve_steno_diarize()` returns `None` immediately off-darwin.
+
+FluidAudio models are prepared explicitly during macOS onboarding with
+`prepare-speaker-models` and checked without writes via `speaker-model-status`.
+FluidAudio 0.17 moved the Sortformer cache to `sortformer/v3/fp16/` (a
+rebuilt model set), so an install onboarded on an older build reads as
+missing until it re-downloads; Settings -> Speaker detection shows the saved
+engine's readiness and offers that Download, since nothing else will.
+Normal meeting processing never downloads or repairs these models: the Swift
+sidecar enables FluidAudio's offline-only mode before loading them and falls
+back to channel labels when the cache is unavailable. The cache lives below
+the Steno user-data directory and therefore honors `STENOAI_USER_DATA_DIR` in
+tests; `STENOAI_DIARIZE_MODEL_DIR` is the lower-level sidecar override.
 
 ### End-to-end tests (Playwright)
 The e2e suite drives the **real Electron app** (real window, real clicks) to catch
@@ -50,8 +101,8 @@ model-free T2 spec that drives the `window.stenoai.<group>` preload bridge and
 asserts backend state on disk (config/files/JSON), using the existing specs +
 `e2e/fixtures/` helpers as templates — only reach for a UI/T1 spec when the
 interaction itself is the risk, and keep model/network-bearing assertions in the
-`@pipeline`/nightly lanes. This applies to luffy-built work too (CLAUDE.md
-overrides luffy's test-level defaults); the QA review lens checks for it.
+`@pipeline`/nightly lanes. This applies to agent-built work too: this file
+overrides an agent's own test-level defaults.
 
 - Run the whole suite: `cd app && npm run test:e2e` (needs the renderer built and,
   for T2, the backend bundle at `dist/stenoai/`).
@@ -69,7 +120,20 @@ overrides luffy's test-level defaults); the QA review lens checks for it.
     out: `--grep @pipeline` runs it (CI's `t2-pipeline-macos` job caches a whisper model),
     `--grep-invert @pipeline` keeps the other T2 specs model-free. A dev machine without the
     active engine's model **skips** it (loudly) rather than failing.
-  - **Current specs:** `org-lock.t1`, `shared-notes-policy.t1`, `org-lock-lifecycle.t2`,
+  - **`@perf` (a T1 spec)**: `live-transcript-perf.t1` is a measurement harness, not a
+    gate - it drives paced synthetic partials into the live transcript panel and reports
+    per-tick script/style/layout cost (CDP `Performance.getMetrics`), retained heap after a
+    forced GC, and DOM node count against a growing segment list. CI excludes it
+    (`--grep-invert @perf`) because wall-clock work on a shared runner is not something to
+    block a PR on. Run it before **and** after any change to live-transcript rendering:
+    `cd app && npm run test:e2e -- --project=t1 --grep @perf`. Pace matters - fired
+    back-to-back the ticks get batched into one React render and the measurement silently
+    collapses; the harness paces one per animation frame and counts DOM writes to prove it.
+  - **Current specs:** `org-lock.t1`, `shared-notes-policy.t1`, `live-transcript-lanes.t1`
+    (the live panel's rendering contract: a partial is replaced in place per speaker, a
+    final retires it, a late final sorts into place, and the Resumed divider - driven
+    through the real `live-transcript-chunk` channel via `e2e/fixtures/live-transcript.ts`),
+    `org-lock-lifecycle.t2`,
     `config-corruption.t2`, the core-loop trio `recording-lifecycle.t2` /
     `meetings-crud.t2` / `folders-crud.t2`, the config trio `settings-roundtrip.t2` /
     `ai-provider.t2` / `model-management.t2`, and the chat/org pair `chat-sessions.t2`
@@ -80,11 +144,22 @@ overrides luffy's test-level defaults); the QA review lens checks for it.
     ASR, no real model), and the calendar/notifications pair `calendar-auth.t2`
     (auth-status from a local token file + auto-detect-meetings toggle) /
     `notifications.t2` (the notifications_enabled toggle gating the note-ready /
-    silence notifications via the `shown` signal), and the onboarding spec
+    silence notifications via the `shown` signal), `diarization-engine.t2` (the
+    Speaker detection setting: Sortformer default, a non-default engine refused
+    while its models are missing, IPC allowlist, and a pre-0.17 Sortformer
+    cache reading as missing on macOS; its UI half, the download-then-save
+    picker and the upgrade Download action, is `diarization-engine.t1`), and the onboarding spec
     `setup-check.t2` (the setup-wizard allGood + checks contract) (all model-free,
     run in `t2-macos` /
     `t2-windows`); `transcription-pipeline.t2` and `honest-failure.t2` (tagged
-    `@pipeline`, run in `t2-pipeline-macos` / `t2-pipeline-windows`). Engine selection
+    `@pipeline`, run in `t2-pipeline-macos` / `t2-pipeline-windows`), and
+    `speaker-diarization.t2` (also `@pipeline`, macOS-only — skips loudly off-darwin
+    and when macOS's `say` TTS is unavailable — synthesizes real speech via `say` so
+    Parakeet/whisper.cpp produce real ASR segments, points
+    `STENOAI_DIARIZE_SIDECAR_PATH` at a fixture script returning fixed 2-speaker JSON,
+    and asserts the saved transcript's per-channel "You"/"Speaker 2"/"Others" labeling
+    and cross-channel numbering; the real `steno-diarize`/Sortformer binary itself was
+    validated directly against real recordings rather than in CI). Engine selection
     for `@pipeline` specs is shared via `e2e/fixtures/engine.ts`; model-free T2 setup
     helpers (deterministic recording config + seeded meeting summaries) live in
     `e2e/fixtures/user-config.ts`. The core-loop specs drive the preload IPC bridge and
@@ -113,10 +188,100 @@ overrides luffy's test-level defaults); the QA review lens checks for it.
   so a test can never read/write the real `~/Library/Application Support/stenoai`. The
   launch fixture (`e2e/fixtures/electron.ts`) waits on `[data-app-ready]` (no fixed timeouts)
   and force-kills the app process tree if a graceful close hangs on teardown (Windows).
-- **CI:** `.github/workflows/e2e.yml` (T1 on Ubuntu/xvfb, macOS + Windows T2; non-blocking,
-  runs per-PR). `.github/workflows/e2e-nightly.yml` (scheduled) reuses that suite via
+- **CI:** `.github/workflows/e2e.yml` runs per PR. T1 on Ubuntu/xvfb plus the macOS T2 and
+  pipeline jobs are required checks for `main`; Windows T2 remains advisory.
+  The protected T1 job runs the privacy scan, Electron main-process ESLint and the pinned
+  Ruff ratchet as unconditional steps, so any of those failures makes the required T1 check fail.
+  `.github/workflows/e2e-nightly.yml` (scheduled) reuses that suite via
   `workflow_call` for flake/drift detection and adds the T3 long-meeting job. A CI-only
   Playwright `globalSetup` kills a stray Ollama + waits for a clean 11434 before the run.
+
+## Interface copy and i18n
+
+The app ships English-only today, but the groundwork is gated so that adding a language
+stays a matter of adding a locale file rather than rebuilding the interface.
+
+**Why the gate exists.** An i18n migration rewrites hundreds of hardcoded strings into
+`t()` lookups. That edit is supposed to be pure motion — same words, new home. In practice
+it is where copy changes silently: an attempt at this rewrote `Nothing to process` into
+`Nothing was recorded.` in passing, three e2e specs went red, and nothing in the diff said
+why. Roughly two thirds of this app's copy is asserted by no test at all, so the same slip
+elsewhere would land unseen.
+
+**Two checks, run per PR (`npm run lint:i18n`, `npm run i18n:inventory`):**
+
+- **No new hardcoded copy.** `renderer/eslint.config.i18n.mjs` runs
+  `i18next/no-literal-string` plus the local interpolated-template rule at `error` over
+  JSX text and the copy-bearing attributes -
+  the DOM ones (`placeholder`, `title`, `alt`, `aria-label`) and this app's own component
+  props (`label`, `description`, `hint`, `confirmLabel`, …), which carry ~170 sites of
+  visible copy. It is a *separate* config from
+  `eslint.config.mjs` on purpose: a codebase with no i18n yet trips it hundreds of times,
+  and folding those 751 into the main lint run would make it permanently red - which this repo
+  has already seen end in four react-hooks rules downgraded to `warn`, where they are now
+  write-only. Instead `app/scripts/i18n-lint-gate.mjs` compares per-file counts against
+  `renderer/i18n-lint-baseline.json` and fails on any divergence, in both directions: a
+  higher count is new hardcoded copy, a lower one is progress that should be committed
+  (`npm run lint:i18n:update`) so the burn-down number stays honest.
+  The companion rule is intentionally syntax-only: it follows direct JSX expressions,
+  transparent conditional/type wrappers, and direct literal/template ReactNode values,
+  then stops at functions, callbacks, helpers, and other calls. That keeps the blocking
+  rule precise; broader rendered-copy paths belong to the inventory ratchet below.
+- **The English copy inventory.** `app/scripts/i18n-copy-inventory.mjs` extracts every
+  English string the renderer shows into `docs/i18n/copy-inventory.json` (1220 `copy` +
+  1175 `uncertain`, repeated copy recorded per occurrence). Interpolations use stable
+  `{{…}}` placeholders so expression renames do not create copy churn. It blocks nothing; it
+  witnesses. The review rule for an i18n migration is then one sentence: *the inventory
+  diff must show strings moving, never changing.* Afterwards it keeps working as a copy
+  changelog — an intentional wording change shows up as a one-file diff in the PR that
+  makes it.
+
+  In particular, the inventory covers callback returns, nested/filtered maps, helper
+  calls, indirect ReactNode props such as `action`, and property-access callbacks. Those
+  paths are deliberately outside the custom ESLint rule, but changing their wording still
+  makes the checked-in inventory stale and therefore fails `npm run i18n:inventory`.
+
+  Its burden of proof is **inverted** relative to the linter, and that asymmetry is the
+  design. The linter blocks, so a false positive costs a contributor time and a noisy rule
+  gets downgraded — precision wins, an allowlist is right. The inventory only witnesses, so
+  a false positive is one extra line in a generated file while a false negative is a string
+  that can be reworded with nothing to notice — recall wins. An earlier version got this
+  backwards and used an allowlist of copy *shapes*; three review rounds each found it
+  dropping different real copy (`All notes`, `AI`, `note`/`notes`, `Ask AI`, `Re-run
+  first-time setup`), because such a list has to enumerate every shape English can take.
+  Now a string is recorded unless **provably** not copy: AST position decides most of it,
+  and a reject list handles what position cannot (`const cls = 'flex items-center'` and
+  `const heading = 'Nothing to process'` sit in identical positions). Entries split into
+  `copy` — the contract a migration must hold — and `uncertain`, the recall safety net, so
+  a styling PR that only moves `uncertain` lines is a quick read.
+
+**e2e selectors stay in English — that is a feature.** 25 specs match on English copy
+(`getByRole('button', { name: 'Delete' })` and friends). Do not convert them to
+`data-testid`: they are the runtime half of the baseline oracle, and they are what caught
+the rewrite above. `e2e/fixtures/electron.ts` pins `STENOAI_UI_LANGUAGE=en` for the whole
+suite so they are deterministic regardless of the host's OS locale or a stored preference.
+Per-language coverage belongs in one dedicated locale-smoke spec (switch language, assert
+a handful of translated strings, assert no raw dotted keys leak into the UI), not in
+translating existing specs.
+
+`COPY_ATTRIBUTES` is an allowlist, so `i18n-gate.test.mjs` carries a **tripwire**: it walks
+every JSX prop name the renderer actually uses and fails if a copy-sounding one
+(`label`, `caption`, `hint`, …) is classified in neither `COPY_ATTRIBUTES` nor
+`KNOWN_NON_COPY_ATTRIBUTES`. An allowlist is acceptable exactly when its gaps are
+mechanically detectable.
+
+One gap is deliberate and covered by the other half: swapping a literal for a different
+one inside the same file leaves the per-file count unchanged, so `lint:i18n` stays green.
+That is the copy-rewrite case, and `i18n:inventory` fails on it — the two checks are built
+to cover each other rather than to duplicate each other.
+
+**What the gate does not catch,** so nobody mistakes green for complete: strings assembled
+at runtime from fragments, copy in the Electron main process (menus, tray, native
+dialogs), user-facing text emitted by the Python CLI, date and number formatting, and
+translation quality. The linter also cannot see a plain TypeScript literal that is later
+rendered — `const heading = 'Nothing to process'` — which is precisely why the inventory
+casts a wider net than the linter.
+
 
 ## Production Readiness
 This app ships as a signed DMG to real users. Before considering any change complete:
@@ -164,20 +329,28 @@ Tokens live in `app/renderer/src/globals.css` under `:root` (light) and
 - Before creating a PR, run a self-review of the full branch diff (`git diff main...HEAD`):
   - Review backend code for security issues, error handling gaps, edge cases, and best practices
   - Review frontend code for layout bugs, CSS consistency, accessibility, and polish
-  - Use the frontend-design skill for UI-related changes
+  - Put UI changes through a design pass too, not just a correctness one
   - Categorize findings by severity (critical/medium/low) and fix critical issues before merging
 
-### When to use `luffy` / `nami` (guideline, not a mandate)
+### How much process a change earns (guideline, not a mandate)
 Match the rigor to the change — don't run the heavyweight loop on a one-line edit.
-- **`luffy`** (autonomous build → multi-agent QA/Design/Eng review loop → `/verify` → PR):
-  use for **new features, risky changes, or wide-blast-radius refactors**. It's
-  token-heavy; reserve it for work that earns the review panel.
-- **Lighter self-review** (implement → test/typecheck → `/verify` if there's a runtime
-  surface → PR): use for **mechanical refactors, dead-code cleanup, copy/docs**.
-- **`nami`** (push → open/update PR → drive CI + review comments to green): effectively
-  **always**, regardless of change size — every PR should be taken to green-and-reviewed,
-  and bot/human comments evaluated critically (fix real issues, push back with reasons on
-  wrong ones). Stop at green; a human merges.
+- **New features, risky changes, wide-blast-radius refactors**: build it, then put the
+  full branch diff through a real review pass (a multi-agent panel, a second model, or
+  a human) before opening the PR. This is the work that earns the extra round.
+- **Mechanical refactors, dead-code cleanup, copy/docs**: implement, run
+  test/typecheck, exercise the runtime surface if there is one, then PR.
+- **Whoever wrote the code shouldn't be the one to sign it off.** When an agent wrote
+  it, have a different model or a human review the diff. Shared blind spots are exactly
+  the ones that survive self-review.
+- **Every PR, whatever its size**: take it to green-and-reviewed. Evaluate bot and human
+  comments critically: fix the real issues, push back with reasons on the wrong ones.
+  Stop at green; a human merges.
+- **Show the evidence.** Don't report a check as passing without having run it, and say
+  which failures are caused by the change versus pre-existing, environmental, or flaky.
+
+The maintainer drives this with a private agent crew (`luffy` for the build-and-review
+loop, `nami` for taking a PR to green). Those aren't part of this repo, so use whatever
+tooling you have. The workflow above is the portable part.
 
 ## Git Commit Guidelines
 - Do NOT include "Generated with Claude Code" attribution in commit messages
@@ -202,6 +375,19 @@ Releases are automated via `.github/workflows/build-release.yml`. Never create r
      - is vague about what actually broke ("Fixed an issue choosing X" → "Fixed an issue that could prevent choosing X").
    - Each bullet should read as one clear clause on first pass. If in doubt, read it aloud.
 4. **Bump version** in `app/package.json`.
+   - **Update the in-app What's new panel** in `app/renderer/src/lib/releaseHighlights.ts`
+     alongside the public changelog. Keep 2–4 short, user-facing highlights for
+     this release, with a working in-app destination for each. Remove the previous
+     release's highlights; the build binds this list to `app/package.json`'s version.
+     Reuse bundled logos where relevant (for example Anthropic/OpenAI for Agents),
+     and include a small local illustration or screenshot when it explains the feature.
+     Keep visuals optional, accessible, and readable in light and dark mode; do not
+     fetch release content or images on launch. For a maintenance release with no
+     highlights, use an empty list so no dialog is shown.
+   - Preview both themes and check: an upgrade shows the panel once when the app
+     is foregrounded and idle; dismissal survives restart; first-run setup and
+     recording are not interrupted; Settings → About can reopen it. Run
+     `npm run test:e2e -- --project=t1 whats-new.t1.spec.ts` from `app/`.
 5. **Commit and merge** the README + changelog + version bump to `main` (or push directly if explicitly authorised).
 6. **Draft release notes** as markdown — they become the GitHub Release body verbatim:
    - One-line summary at the top.
@@ -217,9 +403,9 @@ Releases are automated via `.github/workflows/build-release.yml`. Never create r
    ```
    (If using `-m` instead of `-F`, pass `--cleanup=whitespace` anyway — the comment-stripping default applies to both.)
 9. The tag push triggers the workflow which:
-   - Builds signed + notarized DMGs for both arm64 and x64
+   - Builds the signed + notarized macOS arm64 DMG and ZIP; the release workflow is Apple-Silicon-only
    - Creates a GitHub Release with the tag message as the body
-   - Uploads both DMGs as release assets
+   - Uploads the DMG, ZIP, stable download alias, and `latest-mac.yml` update manifest as release assets
    - Posts a release announcement to Discord (summary + a few headline features + the contributor thank-you), via the `Announce release on Discord` step (`scripts/discord-release-announce.mjs`). This is automatic and requires no manual Discord post. It no-ops unless the `DISCORD_WEBHOOK_URL` repo secret is set (an incoming webhook for the announcements channel), and is `continue-on-error` so a Discord hiccup never fails the release.
 10. Do NOT build DMGs locally for releases, do NOT use `gh release create` manually. Do NOT post the Discord release announcement by hand — the workflow does it.
 

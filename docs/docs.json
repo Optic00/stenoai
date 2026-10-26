@@ -31,6 +31,7 @@
               "features/summaries",
               "features/report-templates",
               "features/ask-your-meetings",
+              "features/agents",
               "features/speaker-labels",
               "features/apple-shortcuts"
             ]
@@ -93,7 +94,7 @@
         },
         {
           "anchor": "GitHub",
-          "href": "https://github.com/ruzin/stenoai",
+          "href": "https://github.com/stenolabs/stenoai",
           "icon": "github"
         },
         {
@@ -119,7 +120,7 @@
     "links": [
       {
         "label": "GitHub",
-        "href": "https://github.com/ruzin/stenoai"
+        "href": "https://github.com/stenolabs/stenoai"
       }
     ],
     "primary": {
@@ -130,7 +131,7 @@
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/ruzin/stenoai",
+      "github": "https://github.com/stenolabs/stenoai",
       "discord": "https://discord.gg/DZ6vcQnxxu",
       "x": "https://x.com/ruzin_saleem"
     }

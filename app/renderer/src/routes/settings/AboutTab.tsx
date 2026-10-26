@@ -4,6 +4,9 @@ import { Button } from '@/components/ui/button';
 import { ipc } from '@/lib/ipc';
 import { useAppVersion } from '@/hooks/useSettings';
 import { COMPACT_BTN, SettingRow } from './primitives';
+import { useWhatsNew } from '@/components/WhatsNew';
+import { CHANGELOG_URL, WHATS_NEW_COPY } from '@/lib/releaseHighlights';
+import { t } from '@/i18n';
 
 /** Plain external-link text (matches TemplatesTab's "learn more" link) for
  *  rows that just navigate out, rather than a bordered Button — keeps the
@@ -23,13 +26,8 @@ function ExternalLinkAction({ label, onClick }: { label: string; onClick: () => 
   );
 }
 
-// docs.stenoai.co/changelog (not github.com), so these go through the
-// generic shell.openExternal channel rather than updates.openReleasePage,
-// which is locked to the github.com origin (see main.js's open-release-page
-// handler) for the contextual "View release" button below.
-const CHANGELOG_URL = 'https://docs.stenoai.co/changelog';
 const DISCORD_URL = 'https://discord.gg/DZ6vcQnxxu';
-const GITHUB_URL = 'https://github.com/ruzin/stenoai';
+const GITHUB_URL = 'https://github.com/stenolabs/stenoai';
 const TERMS_URL = 'https://stenoai.co/terms.html';
 const PRIVACY_URL = 'https://stenoai.co/privacy.html';
 
@@ -38,9 +36,14 @@ type CheckState =
   | { kind: 'checking' }
   | { kind: 'error'; message: string }
   | { kind: 'up-to-date' }
-  | { kind: 'update-available'; version: string; releaseUrl: string };
+  | { kind: 'update-available'; version: string; releaseUrl: string }
+  // An update exists on GitHub but this Mac is below the 14.4 launch floor, so
+  // it can't be installed here (#432). We explain it rather than offer a broken
+  // "View release" download nudge.
+  | { kind: 'update-blocked-os'; version: string };
 
 export function AboutTab() {
+  const whatsNew = useWhatsNew();
   const version = useAppVersion();
   const [checkState, setCheckState] = React.useState<CheckState>({ kind: 'idle' });
   const [downloadPercent, setDownloadPercent] = React.useState<number | null>(null);
@@ -52,33 +55,66 @@ export function AboutTab() {
   // set this — whichever observes completion first wins, and once true a
   // later-arriving percent-only snapshot is ignored rather than merged.
   const settledRef = React.useRef(false);
+  // Separate from settledRef, which is about the progress bar. Every
+  // authoritative write to the banner bumps this: the live update-error and
+  // update-error-cleared events, and the re-read after a manual check. The
+  // mount-time getStatus() below captures it before its request and drops its
+  // own reply if anything has written since — main answers with the state as of
+  // the REQUEST, so a newer write has to win regardless of which reply lands
+  // last. Without it, a stale reply's `e ?? persisted` merge sees the cleared
+  // null and puts the settled failure straight back on screen.
+  const errorSeqRef = React.useRef(0);
 
   React.useEffect(() => {
     const offAvailable = ipc().on.updateAvailable(() => {
       // Confirms the real background updater has started fetching this
       // version — the progress bar below is about to start moving.
+      //
+      // Deliberately does NOT clear the banner: main keeps a sticky failure
+      // through this event, because finding a version proves the feed was
+      // readable and nothing else. Clearing here would hide a failure main
+      // still holds, and a remount would bring it straight back.
       settledRef.current = false;
-      setDownloadError(null);
       setDownloadPercent((p) => p ?? 0);
     });
     const offProgress = ipc().on.updateDownloadProgress((evt) => {
+      // Bytes are actually arriving — that is what disproves a full disk or a
+      // permission problem, so this is where main clears both kinds and where
+      // the banner goes with them.
+      errorSeqRef.current += 1;
+      setDownloadError(null);
       setDownloadPercent(evt.percent);
     });
     const offDownloaded = ipc().on.updateDownloaded((evt) => {
       settledRef.current = true;
+      // Main clears the failure here too (both kinds — the bytes are on disk).
+      // Usually download-progress got there first, but a resumed or cached
+      // transfer can make this the first event this tab sees, and then the
+      // banner would sit next to "Restart to Update".
+      errorSeqRef.current += 1;
+      setDownloadError(null);
       setDownloadPercent(null);
       setDownloadedVersion(evt.version);
     });
     const offError = ipc().on.updateError((evt) => {
       settledRef.current = true;
+      errorSeqRef.current += 1;
       setDownloadPercent(null);
       setDownloadError(evt.message);
+    });
+    // Main settled an earlier failure (a cycle came back clean). Nothing else
+    // fires on that path, so without this the banner would stay on a tab that
+    // happens to be open.
+    const offErrorCleared = ipc().on.updateErrorCleared(() => {
+      errorSeqRef.current += 1;
+      setDownloadError(null);
     });
     return () => {
       offAvailable();
       offProgress();
       offDownloaded();
       offError();
+      offErrorCleared();
     };
   }, []);
 
@@ -94,6 +130,9 @@ export function AboutTab() {
   // the progress bar alongside it.
   React.useEffect(() => {
     let cancelled = false;
+    // Captured before the request: anything that writes the banner while this
+    // is in flight makes the reply stale, whichever order they land in.
+    const seqAtRequest = errorSeqRef.current;
     void ipc()
       .updates.getStatus()
       .then((result) => {
@@ -101,7 +140,7 @@ export function AboutTab() {
         if (result.downloadedVersion) {
           settledRef.current = true;
           setDownloadedVersion((v) => v ?? result.downloadedVersion);
-        } else if (result.downloadError) {
+        } else if (result.downloadError && errorSeqRef.current === seqAtRequest) {
           // A failed background update persists in main; restore it so
           // returning to About still shows the failure. Terminal for this
           // cycle (like a completed download), so mark settled — a stale
@@ -125,7 +164,11 @@ export function AboutTab() {
         setCheckState({ kind: 'error', message: result.error });
         return;
       }
-      if (result.updateAvailable) {
+      if (result.updateAvailable && result.osUpdateEligible === false) {
+        // Update exists but this macOS is below the launch floor (#432) — don't
+        // point the user at a DMG that won't run.
+        setCheckState({ kind: 'update-blocked-os', version: result.latestVersion });
+      } else if (result.updateAvailable) {
         setCheckState({
           kind: 'update-available',
           version: result.latestVersion,
@@ -133,11 +176,27 @@ export function AboutTab() {
         });
       } else {
         setCheckState({ kind: 'up-to-date' });
+        // A check that just succeeded settles an earlier failed one, so a stale
+        // banner doesn't sit under a fresh "You're on the latest version" as two
+        // contradictory answers to the same question. Main owns that decision —
+        // it knows whether the failure was disproved by this check or is still
+        // true (a full disk, a permission problem) — so re-read rather than
+        // clearing locally, and stay in sync with what a remount would show.
+        // Same staleness rule as the mount effect, in the other direction: if a
+        // live update-error lands while this read is in flight, that error is
+        // newer than the state main answered with, and overwriting it would
+        // wipe a failure that just happened.
+        const seqAtRequest = errorSeqRef.current;
+        const status = await ipc().updates.getStatus();
+        if (status.success && errorSeqRef.current === seqAtRequest) {
+          errorSeqRef.current += 1;
+          setDownloadError(status.downloadError);
+        }
       }
     } catch (e) {
       setCheckState({
         kind: 'error',
-        message: e instanceof Error ? e.message : 'Check failed',
+        message: e instanceof Error ? e.message : t('settings.about.checkFailed'),
       });
     }
   };
@@ -157,15 +216,23 @@ export function AboutTab() {
   // on the button itself (Checking for Updates -> You're on the latest
   // version / Check failed), so the description only needs to add the
   // persistent, actionable update-available case.
-  const versionLabel = `Version ${version.data?.version ?? '—'}`;
+  const installedVersion = version.data?.version ?? '—';
   const checkDescription =
     checkState.kind === 'update-available'
-      ? `${versionLabel} — Update available (v${checkState.version})`
-      : versionLabel;
+      ? t('settings.about.updateAvailable', {
+          version: installedVersion,
+          newVersion: checkState.version,
+        })
+      : checkState.kind === 'update-blocked-os'
+        ? t('settings.about.updateBlockedOs', {
+            version: installedVersion,
+            newVersion: checkState.version,
+          })
+        : t('settings.about.version', { version: installedVersion });
 
   return (
     <section data-settings-tab="about">
-      <SettingRow label="Steno" description={checkDescription}>
+      <SettingRow label={t('settings.about.stenoLabel')} description={checkDescription}>
         <div className="flex items-center gap-2">
           {checkState.kind === 'update-available' && (
             <Button
@@ -174,7 +241,7 @@ export function AboutTab() {
               className={COMPACT_BTN}
               onClick={() => void ipc().updates.openReleasePage(checkState.releaseUrl)}
             >
-              View release
+              {t('settings.about.viewRelease')}
             </Button>
           )}
           <Button
@@ -188,20 +255,20 @@ export function AboutTab() {
             {checkState.kind === 'checking' ? (
               <>
                 <Loader2 className="mr-1.5 size-3 animate-spin" />
-                Checking for Updates
+                {t('settings.about.checkingForUpdates')}
               </>
             ) : checkState.kind === 'up-to-date' ? (
               <>
                 <Check className="mr-1.5 size-3" />
-                You're on the latest version
+                {t('settings.about.onLatest')}
               </>
             ) : checkState.kind === 'error' ? (
               <>
                 <X className="mr-1.5 size-3" />
-                Check failed
+                {t('settings.about.checkFailed')}
               </>
             ) : (
-              'Check for Updates'
+              t('settings.about.checkForUpdates')
             )}
           </Button>
         </div>
@@ -213,7 +280,7 @@ export function AboutTab() {
             className="mb-1.5 flex items-center justify-between text-[12px]"
             style={{ color: 'var(--fg-2)' }}
           >
-            <span>Downloading update…</span>
+            <span>{t('settings.about.downloadingUpdate')}</span>
             <span className="tabular-nums">{downloadPercent}%</span>
           </div>
           <div
@@ -228,41 +295,52 @@ export function AboutTab() {
         </div>
       )}
 
+      {/* main.js sends a finished sentence that already names what failed
+          (check vs download) — see update-error-copy.js. Rendering it verbatim
+          is deliberate: the old "Update download failed: {raw}" prefix claimed
+          a download even when the check never got that far, and pasted
+          net:: codes and bundle paths into the UI. */}
       {downloadError && (
         <div className="py-3 text-[12px]" style={{ color: 'var(--danger)' }}>
-          Update download failed: {downloadError}
+          {downloadError}
         </div>
       )}
 
       {downloadedVersion && (
         <div className="py-3">
           <Button className="w-full" onClick={() => ipc().updates.install()}>
-            Restart to Update (v{downloadedVersion})
+            {t('settings.about.restartToUpdate', { version: downloadedVersion })}
           </Button>
         </div>
       )}
 
-      <SettingRow label="Release notes" description="See what's new">
+      <SettingRow label={t('settings.about.releaseNotes.label')} description={t('settings.about.releaseNotes.description')}>
         <ExternalLinkAction
-          label="View"
+          label={t('settings.about.releaseNotes.action')}
           onClick={() => void ipc().shell.openExternal(CHANGELOG_URL)}
         />
       </SettingRow>
 
-      <SettingRow label="Discord" description="Join the community, ask questions, share feedback">
+      {whatsNew.available && (
+        <SettingRow label={WHATS_NEW_COPY.settingsLabel} description={WHATS_NEW_COPY.settingsDescription}>
+          <Button variant="ghost" size="sm" onClick={whatsNew.show}>{WHATS_NEW_COPY.view}</Button>
+        </SettingRow>
+      )}
+
+      <SettingRow label={t('settings.about.discord.label')} description={t('settings.about.discord.description')}>
         <ExternalLinkAction
-          label="Join"
+          label={t('settings.about.discord.action')}
           onClick={() => void ipc().shell.openExternal(DISCORD_URL)}
         />
       </SettingRow>
 
       <SettingRow
-        label="GitHub"
-        description="Steno is open source — browse the code, file issues"
+        label={t('settings.about.github.label')}
+        description={t('settings.about.github.description')}
         noBorder
       >
         <ExternalLinkAction
-          label="View"
+          label={t('settings.about.github.action')}
           onClick={() => void ipc().shell.openExternal(GITHUB_URL)}
         />
       </SettingRow>
@@ -278,7 +356,7 @@ export function AboutTab() {
           onClick={() => void ipc().shell.openExternal(TERMS_URL)}
           className="hover:underline"
         >
-          Terms of Service
+          {t('settings.about.termsService')}
         </button>
         <span aria-hidden="true">·</span>
         <button
@@ -286,7 +364,7 @@ export function AboutTab() {
           onClick={() => void ipc().shell.openExternal(PRIVACY_URL)}
           className="hover:underline"
         >
-          Privacy Policy
+          {t('settings.about.privacyPolicy')}
         </button>
       </div>
     </section>

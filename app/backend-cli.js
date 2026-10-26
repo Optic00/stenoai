@@ -19,18 +19,58 @@
 const path = require('path');
 const { spawn: _spawnRaw } = require('child_process');
 
-// Wrap spawn so every backend / ollama launch defaults to windowsHide:true.
+const OPENAI_ASR_KEY_ENV = 'STENOAI_OAI_API_KEY';
+const OPENAI_ASR_ORIGIN_ENV = 'STENOAI_OAI_API_ORIGIN';
+const OPENAI_ASR_URL_ENV = 'STENOAI_OAI_API_URL';
+
+function withoutOpenAiAsrKey(env) {
+  return Object.fromEntries(
+    Object.entries(env || {}).filter(([name]) => ![
+      OPENAI_ASR_KEY_ENV,
+      OPENAI_ASR_ORIGIN_ENV,
+      OPENAI_ASR_URL_ENV,
+    ].includes(name.toUpperCase())),
+  );
+}
+
+// Wrap spawn so every backend / ollama launch defaults to windowsHide:true
+// AND PYTHONUNBUFFERED:1.
 // The PyInstaller backend (stenoai.exe) and bundled ollama.exe are console
-// subsystem binaries; without this Electron pops a visible console window on
-// Windows for every recording, live-transcribe, query, and the long-lived
-// `ollama serve` keeps one open for the whole session. No-op on macOS/Linux.
-// Callers can still override by passing an explicit windowsHide.
+// subsystem binaries; without windowsHide, Electron pops a visible console
+// window on Windows for every recording, live-transcribe, query, and the
+// long-lived `ollama serve` keeps one open for the whole session. No-op on
+// macOS/Linux.
+// PYTHONUNBUFFERED matters because stdout/stderr are piped (not a TTY) here,
+// so Python defaults to block-buffering them -- a logger.info() call can sit
+// unflushed for many minutes on a long operation (a multi-hour recording's
+// ffmpeg preprocessing/diarization/transcription), making the pipeline look
+// hung even while it's genuinely working, and starving the inactivity
+// watchdog (TRANSCRIBE_INACTIVITY_MS) of the HEARTBEAT:/log lines it needs to
+// tell real silence from buffered-but-alive. Harmless for non-Python
+// binaries (ollama/ffmpeg) -- just an unused env var.
+// Callers can still override either by passing an explicit windowsHide/env.
 function spawn(command, args, options) {
+  const unbufferedEnv = (existingEnv) => ({
+    // Never inherit an ambient ASR credential into arbitrary backend jobs.
+    // The transcription path supplies it explicitly only for openai-asr.
+    ...withoutOpenAiAsrKey(require('process').env),
+    PYTHONUNBUFFERED: '1',
+    ...(existingEnv || {}),
+  });
   if (Array.isArray(args) || args === undefined || args === null) {
-    return _spawnRaw(command, args, { windowsHide: true, ...(options || {}) });
+    const opts = options || {};
+    return _spawnRaw(command, args, {
+      windowsHide: true,
+      ...opts,
+      env: unbufferedEnv(opts.env),
+    });
   }
-  // 2-arg form: spawn(command, options)
-  return _spawnRaw(command, { windowsHide: true, ...args });
+  // 2-arg form: spawn(command, options) -- `args` IS the options object here.
+  return _spawnRaw(command, {
+    windowsHide: true,
+    ...args,
+    env: unbufferedEnv(args.env),
+  });
 }
 
 // Terminate a process AND its child processes. On Windows `process.kill(pid)`
@@ -97,7 +137,7 @@ function createBackendCli({
       const backendPath = getBackendPath();
 
       // Log the command being executed (unless silent)
-      console.log('Running:', `${backendPath} ${args.join(' ')}`);
+      console.log('Running:', `${backendPath} ${sanitizeArgsForLog(args)}`);
       if (!silent) {
         // Sanitize the echoed argv: denylisted commands (query, save-template,
         // set-user-name/storage-path, folder + URL setters) carry content/PII in
@@ -108,7 +148,9 @@ function createBackendCli({
 
       const process = spawn(backendPath, args, {
         cwd: getBackendCwd(),
-        env: Object.keys(extraEnv).length > 0 ? { ...require('process').env, ...extraEnv } : undefined
+        // spawn() supplies the sanitized inherited environment; extraEnv is
+        // intentionally the only way a caller can add a secret to this job.
+        env: Object.keys(extraEnv).length > 0 ? extraEnv : undefined
       });
 
       // Opt-in persistent capture for the legacy process-recording path only.
@@ -152,7 +194,14 @@ function createBackendCli({
         if (code === 0) {
           resolve(stdout);
         } else {
-          reject(new Error(`Python script failed with code ${code}: ${stderr}`));
+          const err = new Error(`Python script failed with code ${code}: ${stderr}`);
+          // Callers (see parsePythonFailureJson in main.js) recover a graceful
+          // {"success": false, "error": ...} a CLI command printed to stdout
+          // right before exiting non-zero -- without these, that message is
+          // unreachable and every failure looks like a generic crash.
+          err.stdout = stdout;
+          err.stderr = stderr;
+          reject(err);
         }
       });
 
@@ -166,4 +215,4 @@ function createBackendCli({
   return { getBackendPath, getBackendCwd, runPythonScript };
 }
 
-module.exports = { spawn, killProcessTree, createBackendCli };
+module.exports = { spawn, killProcessTree, createBackendCli, withoutOpenAiAsrKey };

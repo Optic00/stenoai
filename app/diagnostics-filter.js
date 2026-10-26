@@ -75,9 +75,24 @@ const ARGS_ECHO_REDACTORS = {
   'set-remote-ollama-url': redactRest,
   'test-remote-ollama': redactRest,
   'set-cloud-api-url': redactRest,
-  // device_id + a user-assigned device label (e.g. "Valentin's AirPods") —
+  // --api-url may embed credentials or a private org hostname (same class as
+  // set-cloud-api-url). The ASR key never travels via argv - it is held in
+  // safeStorage and injected through the environment.
+  'set-openai-asr-config': redactRest,
+  // device_id + a user-assigned device label (e.g. "Conference AirPods") -
   // same PII class as set-user-name.
   'set-microphone': redactRest,
+  'confirm-speaker': redactRest,
+  'create-person-profile': redactRest,
+  'rename-person-profile': redactRest,
+  'delete-person-profile': redactRest,
+  'get-speaker-sample-audio': redactRest,
+  'mark-speaker-cluster': redactRest,
+  'set-cluster-review-state': redactRest,
+  'speaker-naming-status': redactRest,
+  'suggest-speakers': redactRest,
+  'speaker-timestamps': redactRest,
+  'get-person-sample-audio': redactRest,
 };
 
 // Return the argv rewritten for the `$ stenoai <...>` debug echo. Non-

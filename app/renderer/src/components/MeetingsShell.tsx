@@ -33,6 +33,7 @@ import {
 import { useRecording } from '@/hooks/useRecording';
 import { navigate, useRoute } from '@/lib/router';
 import type { Meeting } from '@/lib/ipc';
+import { UI_LOCALE } from '@/lib/locale';
 
 interface MeetingsShellProps {
   activeSummaryFile: string | null;
@@ -78,15 +79,21 @@ export function MeetingsShell({
 
   const [newFolderOpen, setNewFolderOpen] = React.useState(false);
   const [newFolderName, setNewFolderName] = React.useState('');
+  const creatingFolder = React.useRef(false);
+  const [folderError, setFolderError] = React.useState<string | null>(null);
+  const createFolderLabel = createFolder.isPending ? 'Creating folder…' : 'Create folder';
   const [renameTarget, setRenameTarget] = React.useState<
     { type: 'folder' | 'meeting'; id: string; current: string; itemRect: DOMRectReadOnly } | null
   >(null);
   const [context, setContext] = React.useState<SidebarContextAction | null>(null);
-  const [deleteTarget, setDeleteTarget] = React.useState<
-    | { type: 'folder'; id: string; name: string; meetingCount: number }
-    | { type: 'meeting'; id: string; name: string }
-    | null
-  >(null);
+  // Folders only: deleting a folder is NOT undoable, so it keeps a confirm step.
+  // Notes delete straight away and are caught by the Undo toast instead (#234).
+  const [deleteTarget, setDeleteTarget] = React.useState<{
+    type: 'folder';
+    id: string;
+    name: string;
+    meetingCount: number;
+  } | null>(null);
 
   // Sidebar shows only folder rows + counts. buildSidebar gives us folder
   // metadata (name + meeting count); the per-folder meetings array is unused.
@@ -131,10 +138,18 @@ export function MeetingsShell({
 
   const handleCreateFolder = async () => {
     const name = newFolderName.trim();
-    if (!name) return;
-    await createFolder.mutateAsync({ name });
-    setNewFolderName('');
-    setNewFolderOpen(false);
+    if (!name || creatingFolder.current) return;
+    creatingFolder.current = true;
+    setFolderError(null);
+    try {
+      await createFolder.mutateAsync({ name });
+      setNewFolderName('');
+      setNewFolderOpen(false);
+    } catch {
+      setFolderError('Could not create folder. Please try again.');
+    } finally {
+      creatingFolder.current = false;
+    }
   };
 
   const openRename = (
@@ -159,7 +174,7 @@ export function MeetingsShell({
     }
   };
 
-  const openDeleteConfirm = () => {
+  const onDeleteAction = () => {
     if (!context) return;
     if (context.type === 'folder') {
       const folder = folders.data?.find((f) => f.id === context.id);
@@ -167,31 +182,31 @@ export function MeetingsShell({
       const meetingCount =
         meetings.data?.filter((m) => (m.folders ?? []).includes(context.id)).length ?? 0;
       setDeleteTarget({ type: 'folder', id: context.id, name: folder.name, meetingCount });
-    } else {
-      const target = meetings.data?.find((m) => m.session_info.summary_file === context.id);
-      if (!target) return setContext(null);
-      setDeleteTarget({
-        type: 'meeting',
-        id: context.id,
-        name: target.session_info.name || 'Untitled Meeting',
-      });
+      setContext(null);
+      return;
     }
+    // Notes: no confirm step — the soft-delete's Undo toast is the safety net,
+    // so asking first would just add a click to an already reversible action.
+    const target = meetings.data?.find((m) => m.session_info.summary_file === context.id);
     setContext(null);
+    if (!target) return;
+    const summaryFile = target.session_info.summary_file;
+    void deleteMeeting
+      .mutateAsync(target)
+      .then(() => {
+        if (activeSummaryFile === summaryFile) navigate('/');
+      })
+      .catch((err) => {
+        // A refused delete (main's busy-guard) leaves the row in place. Log it
+        // rather than throwing an unhandled rejection; the row staying put is
+        // the user-visible signal here, and MeetingDetail surfaces the reason.
+        console.error('Delete failed:', err);
+      });
   };
 
-  const handleConfirmDelete = async () => {
+  const handleConfirmDeleteFolder = async () => {
     if (!deleteTarget) return;
-    if (deleteTarget.type === 'folder') {
-      await deleteFolder.mutateAsync(deleteTarget.id);
-    } else {
-      const target = meetings.data?.find(
-        (m) => m.session_info.summary_file === deleteTarget.id,
-      );
-      if (target) {
-        await deleteMeeting.mutateAsync(target);
-        if (activeSummaryFile === deleteTarget.id) navigate('/');
-      }
-    }
+    await deleteFolder.mutateAsync(deleteTarget.id);
     setDeleteTarget(null);
   };
 
@@ -233,7 +248,7 @@ export function MeetingsShell({
           action={context}
           onClose={() => setContext(null)}
           onRename={(label) => openRename(context.type, context.id, label, context.itemRect)}
-          onDelete={openDeleteConfirm}
+          onDelete={onDeleteAction}
           folders={folders.data ?? []}
           meetings={meetings.data ?? []}
         />
@@ -242,36 +257,31 @@ export function MeetingsShell({
       <ConfirmDialog
         open={!!deleteTarget}
         onOpenChange={(o) => !o && setDeleteTarget(null)}
-        title={
-          deleteTarget?.type === 'folder'
-            ? `Delete folder "${deleteTarget.name}"?`
-            : deleteTarget
-              ? `Delete note "${deleteTarget.name}"?`
-              : ''
-        }
+        title={deleteTarget ? `Delete folder "${deleteTarget.name}"?` : ''}
         description={
-          deleteTarget?.type === 'folder' ? (
-            deleteTarget.meetingCount > 0 ? (
-              <>
-                {deleteTarget.meetingCount} meeting
-                {deleteTarget.meetingCount === 1 ? '' : 's'} will be moved back to All Notes. No
-                recordings or transcripts will be deleted.
-              </>
-            ) : (
-              <>No recordings or transcripts will be deleted.</>
-            )
+          deleteTarget && deleteTarget.meetingCount > 0 ? (
+            <>
+              {deleteTarget.meetingCount} meeting
+              {deleteTarget.meetingCount === 1 ? '' : 's'} will be moved back to All Notes. No
+              recordings or transcripts will be deleted.
+            </>
           ) : (
-            <>This will delete the transcript, summary, and all associated files.</>
+            <>No recordings or transcripts will be deleted.</>
           )
         }
         confirmLabel="Delete"
         destructive
-        onConfirm={handleConfirmDelete}
-        isPending={deleteFolder.isPending || deleteMeeting.isPending}
+        onConfirm={handleConfirmDeleteFolder}
+        isPending={deleteFolder.isPending}
       />
 
-      <Dialog open={newFolderOpen} onOpenChange={setNewFolderOpen}>
-        <DialogContent>
+      <Dialog open={newFolderOpen} onOpenChange={(open) => {
+        if (!creatingFolder.current) {
+          setNewFolderOpen(open);
+          setFolderError(null);
+        }
+      }}>
+        <DialogContent closeDisabled={createFolder.isPending}>
           <DialogHeader>
             <DialogTitle>New folder</DialogTitle>
             <DialogDescription>
@@ -279,6 +289,7 @@ export function MeetingsShell({
             </DialogDescription>
           </DialogHeader>
           <Input
+            disabled={createFolder.isPending}
             value={newFolderName}
             onChange={(e) => setNewFolderName(e.target.value)}
             placeholder="e.g. Acme Corp"
@@ -287,11 +298,14 @@ export function MeetingsShell({
               if (e.key === 'Enter') void handleCreateFolder();
             }}
           />
+          {folderError && <p role="alert">{folderError}</p>}
           <DialogFooter>
             <DialogClose asChild>
-              <Button variant="outline">Cancel</Button>
+              <Button variant="outline" disabled={createFolder.isPending}>Cancel</Button>
             </DialogClose>
-            <Button onClick={() => void handleCreateFolder()}>Create folder</Button>
+            <Button disabled={createFolder.isPending || !newFolderName.trim()} aria-busy={createFolder.isPending} onClick={() => void handleCreateFolder()}>
+              {createFolderLabel}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -514,7 +528,7 @@ export function formatDateLabel(info: Meeting['session_info']): string | undefin
     d.getDate() === yesterday.getDate();
   if (wasYesterday) return 'Yesterday';
   if (now.getTime() - d.getTime() < 7 * 24 * 60 * 60 * 1000) {
-    return d.toLocaleDateString(undefined, { weekday: 'short' });
+    return d.toLocaleDateString(UI_LOCALE, { weekday: 'short' });
   }
-  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  return d.toLocaleDateString(UI_LOCALE, { month: 'short', day: 'numeric' });
 }

@@ -6,14 +6,17 @@ import { ipc } from '@/lib/ipc';
 import { useNavigate, getLastNonSettingsRoute, useRoute, getRouteParam } from '@/lib/router';
 import { useAppVersion } from '@/hooks/useSettings';
 import { useRecording } from '@/hooks/useRecording';
-import { SettingsNav, SETTINGS_TAB_LABELS, type SettingsTabId } from './settings/SettingsNav';
+import { SettingsNav, settingsTabLabel, type SettingsTabId } from './settings/SettingsNav';
 import { GeneralTab } from './settings/GeneralTab';
 import { AiTab } from './settings/AiTab';
 import { TemplatesTab } from './settings/TemplatesTab';
+import { PeopleTab } from './settings/PeopleTab';
 import { OrganisationTab } from './settings/OrganisationTab';
 import { AdvancedTab } from './settings/AdvancedTab';
+import { IntegrationsTab } from './settings/IntegrationsTab';
 import { DeveloperTab } from './settings/DeveloperTab';
 import { AboutTab } from './settings/AboutTab';
+import { t } from '@/i18n';
 
 // Per-tab intro copy, shown in the page header above the divider (rather
 // than repeated inside each tab's own content, which used to duplicate the
@@ -21,10 +24,10 @@ import { AboutTab } from './settings/AboutTab';
 // opposed to AiTab's per-section copy, or tabs with no intro at all) need an
 // entry here.
 const SETTINGS_TAB_DESCRIPTIONS: Partial<Record<SettingsTabId, React.ReactNode>> = {
-  templates: (
+  get templates() {
+    return (
     <>
-      Templates are the instructions your AI follows when turning a
-      transcript into a summary —{' '}
+      {t('settings.nav.templatesIntro')}{' '}
       <button
         type="button"
         onClick={() =>
@@ -33,15 +36,21 @@ const SETTINGS_TAB_DESCRIPTIONS: Partial<Record<SettingsTabId, React.ReactNode>>
         className="inline-flex items-center gap-1 underline underline-offset-2 hover:no-underline"
         style={{ color: 'var(--fg-1)' }}
       >
-        learn more
+        {t('settings.nav.learnMore')}
         <ExternalLink className="size-3" />
       </button>
     </>
-  ),
-  organisation: 'Connect to Steno Enterprise for your organisation.',
+    );
+  },
+  get people() {
+    return t('settings.nav.peopleIntro');
+  },
+  get organisation() {
+    return t('settings.nav.organisationIntro');
+  },
 };
 
-// Deep-linkable tab ids: the 7 SettingsTabId nav destinations, plus
+// Deep-linkable tab ids: the 8 SettingsTabId nav destinations, plus
 // 'transcription' as a legacy alias that resolves onto 'ai' (its content
 // moved into AiTab's Transcription section, which renders first on that
 // page) — keeps `/settings?tab=transcription` links working unmodified.
@@ -50,7 +59,9 @@ const DEEP_LINK_IDS = [
   'transcription',
   'ai',
   'templates',
+  'people',
   'organisation',
+  'integrations',
   'advanced',
   'developer',
   'about',
@@ -59,6 +70,17 @@ type DeepLinkId = (typeof DEEP_LINK_IDS)[number];
 
 function resolveTab(id: DeepLinkId): SettingsTabId {
   return id === 'transcription' ? 'ai' : id;
+}
+
+// Resolve the `?tab=` param of a route to a nav tab, or null when absent or
+// not a known deep-link id. Single definition shared by the first-mount
+// initialTab and the route-reactive sync effect so the two can't drift.
+function tabFromRoute(route: string): SettingsTabId | null {
+  const requested = getRouteParam(route, 'tab');
+  if (requested && (DEEP_LINK_IDS as readonly string[]).includes(requested)) {
+    return resolveTab(requested as DeepLinkId);
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -76,19 +98,36 @@ export function Settings() {
   // Used by the sidebar's "Sign in to organisation" CTA to land users
   // directly on the org sign-in form rather than the General tab.
   const route = useRoute();
-  const initialTab = React.useMemo<SettingsTabId>(() => {
-    const requested = getRouteParam(route, 'tab');
-    if (requested && (DEEP_LINK_IDS as readonly string[]).includes(requested)) {
-      return resolveTab(requested as DeepLinkId);
-    }
-    return 'general';
-  }, []); // Intentional — only consume the URL param on first mount.
+  const initialTab = React.useMemo<SettingsTabId>(
+    () => tabFromRoute(route) ?? 'general',
+    [], // Intentional — only consume the URL param on first mount.
+  );
   const [tab, setTab] = React.useState<SettingsTabId>(initialTab);
+  // Keep the visible tab in sync when the `?tab=` param changes AFTER mount —
+  // e.g. the ⌘K settings search navigates to /settings?tab=<id> while Settings
+  // is already open. initialTab (above) only consumes the param on first mount,
+  // so without this the hash would update but the tab wouldn't switch.
+  //
+  // A bare `/settings` (no param) resets to General — the same meaning the
+  // absent param has on first mount. This matters for browser Back: nav-rail
+  // clicks push `?tab=` entries onto the hash history (route is the single
+  // source of truth since #411), so Back can land on the bare route and must
+  // not leave a stale tab visible.
+  React.useEffect(() => {
+    setTab(tabFromRoute(route) ?? 'general');
+  }, [route]);
   const version = useAppVersion();
   // Templates' own editor is a full-page takeover with its own header/back
   // button — while it's open, the outer "Templates" title/description/divider
   // would just be a leftover from the list view carried over on top of it.
   const [templateEditorOpen, setTemplateEditorOpen] = React.useState(false);
+  // Leaving the Templates tab (via the nav rail OR the ⌘K settings search)
+  // unmounts TemplatesTab, but its editor-open flag lived on here — a stale
+  // `true` would suppress the page header when Templates is reopened. Reset it
+  // whenever the active tab isn't Templates.
+  React.useEffect(() => {
+    if (tab !== 'templates' && templateEditorOpen) setTemplateEditorOpen(false);
+  }, [tab, templateEditorOpen]);
   const showPageHeader = !(tab === 'templates' && templateEditorOpen);
 
   // Supplies AppShell's recordingStatus/onToggleRecording props directly —
@@ -119,7 +158,12 @@ export function Settings() {
       sidebar={
         <SettingsNav
           activeTab={tab}
-          onSelect={setTab}
+          // The route is the single source of truth for the visible tab: a nav
+          // click navigates `?tab=<id>` and the route→tab effect below switches
+          // the tab. Calling setTab directly instead would leave the URL's
+          // `?tab=` stale, so a later ⌘K search to that same tab would bail on
+          // router's unchanged-hash early-return and silently do nothing (#405).
+          onSelect={(id) => navigate(`/settings?tab=${id}`)}
           onBack={() => navigate(getLastNonSettingsRoute() || '/')}
           version={version.data?.version}
         />
@@ -154,7 +198,7 @@ export function Settings() {
                   color: 'var(--fg-1)',
                 }}
               >
-                {SETTINGS_TAB_LABELS[tab]}
+                {settingsTabLabel(tab)}
               </h1>
               {SETTINGS_TAB_DESCRIPTIONS[tab] && (
                 <p
@@ -193,7 +237,9 @@ export function Settings() {
             {tab === 'general' && <GeneralTab />}
             {tab === 'ai' && <AiTab />}
             {tab === 'templates' && <TemplatesTab onEditingChange={setTemplateEditorOpen} />}
+            {tab === 'people' && <PeopleTab />}
             {tab === 'organisation' && <OrganisationTab />}
+            {tab === 'integrations' && <IntegrationsTab />}
             {tab === 'advanced' && <AdvancedTab />}
             {tab === 'developer' && <DeveloperTab />}
             {tab === 'about' && <AboutTab />}

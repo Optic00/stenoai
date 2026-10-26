@@ -9,7 +9,11 @@
  */
 
 // ---------- shared result envelope ----------
-export type Result<T> = ({ success: true } & T) | { success: false; error: string };
+export type Result<T> = ({ success: true } & T) | {
+  success: false;
+  error: string;
+  error_code?: string;
+};
 
 // ---------- domain types ----------
 export interface SessionInfo {
@@ -56,14 +60,30 @@ export interface Meeting {
   action_items?: unknown[];
   transcript?: string;
   is_diarised?: boolean;
+  /** Whether a per-meeting speaker sidecar exists. The detail view uses this
+   *  to avoid spawning two speaker backend reads for ordinary notes. */
+  has_speaker_sidecar?: boolean;
   diarised_text?: string | null;
   folders?: string[];
+  /** Whether the ORIGINAL recording is still on disk (list-meetings only —
+   *  derived from one directory listing, extension-agnostic). keep_recordings
+   *  defaults off, so this is false for most notes, and everything that needs
+   *  the audio (re-transcribe, speaker samples, any future re-diarization) is
+   *  quietly unavailable without it. */
+  has_audio?: boolean;
+  steno_transfer?: { sourceMeetingID: string };
   /** User notes as persisted + returned by the backend (`_parse_meeting_markdown` -> `user_notes`). */
   user_notes?: string | null;
   /** Renderer-side notes for the in-progress / draft recording (live + processing views). */
   notes?: string;
   reports?: Report[];
   active_report?: string;
+  /** Sections of this note the user has edited since it was generated, read by
+   *  main from the `_original.json` sidecar (`editedFieldNames`). Always an
+   *  array when it comes from `get-meeting`; optional because the renderer also
+   *  builds synthetic Meeting objects for the live recording. Drives the
+   *  confirm before a regenerate replaces those sections. */
+  edited_fields?: string[];
   /** Synthetic flag set by the renderer for the in-progress recording. Never sent by backend. */
   is_recording?: boolean;
   /** Synthetic flag set by the renderer when a recording is in the processing pipeline (post-stop, pre-summary). */
@@ -108,16 +128,33 @@ export interface CalendarEvent {
   color?: string;
 }
 
+/** A partial update for one meeting note. Every content field below is written
+ *  into its own `## ` section of the .md, leaving the rest of the file
+ *  (transcript included) byte-identical; main rejects any value carrying a
+ *  markdown heading, since that would forge a section boundary. */
 export interface UpdateMeetingPatch {
   name?: string;
   summary?: string;
+  /** Not editable on .md notes yet (the participants editor is a later build);
+   *  still honoured by the legacy .json format. */
   participants?: unknown[];
   key_points?: string[];
-  action_items?: unknown[];
+  action_items?: string[];
+  /** `## Key Topics`: one `### title` subsection per area, analysis below it. */
+  discussion_areas?: { title: string; analysis?: string }[];
   /** The user's own notes (My notes tab). Upserts the `## User Notes` body
    *  section of the .md (or the `user_notes` field of a legacy .json); an
    *  empty string removes the section. */
   user_notes?: string;
+}
+
+export interface ChatRequest {
+  scope: 'live' | 'meeting' | 'notes' | 'general';
+  question: string;
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  recordingId?: string;
+  file?: string;
+  folder?: string | null;
 }
 
 export interface ChatSessionsBlob {
@@ -125,7 +162,8 @@ export interface ChatSessionsBlob {
     id: string;
     name: string;
     summaryFile?: string;
-    messages: Array<{ role: 'user' | 'assistant'; content: string; ts: number }>;
+    scopeFolderId?: string | null;
+    messages: Array<{ role: 'user' | 'assistant'; content: string; ts: number; context?: string }>;
     createdAt: number;
     updatedAt: number;
   }>;
@@ -319,10 +357,15 @@ export type SetupCheckResponse = Result<{
   allGood: boolean;
   checks: SetupCheckItem[];
 }>;
+export type SpeakerModelStatusResponse = Result<{
+  ready: boolean;
+  cache_directory: string;
+  required_models: string[];
+  missing_models: string[];
+}>;
 
 export type MicPermissionResponse = Result<{ status: MicPermissionStatus }>;
 export type MicPermissionGrantResponse = Result<{ granted: boolean }>;
-export type ScreenRecordingPermissionResponse = Result<{ screenPermission: string }>;
 
 /** Mirrors RECORDING_TRIGGERS in main.js -- what UI action started the
  *  recording, so PostHog can tell whether the meeting-detected nudge
@@ -348,6 +391,8 @@ export type PauseRecordingResponse = Result<{ message: string }>;
 export type ResumeRecordingResponse = Result<{ message: string }>;
 
 export interface QueueStatus {
+  recordingId?: string | null;
+  chatSummaryFile?: string | null;
   success: true;
   isProcessing: boolean;
   queueSize: number;
@@ -370,6 +415,14 @@ export interface QueueStatus {
    *  different one" by identity rather than the collidable display name. Null
    *  for a fresh new-note recording or when idle. */
   recordingSummaryFile?: string | null;
+  /** The real note file the current recording/processing session produces (the
+   *  instant-stop placeholder, then rewritten by the pipeline). Deterministic
+   *  from the audio stem and stable across record→process, so useMeetings can
+   *  dedupe the synthetic "__live__/…" row against the real note once it exists
+   *  (one recording, one row — #bug4). Only the Parakeet instant-stop path
+   *  writes that placeholder, so dedup only bites there; Whisper/import have no
+   *  placeholder (dedup is a no-op even when this is set), and it's null idle. */
+  liveSummaryFile?: string | null;
 }
 
 export type PickAudioFileResponse = Result<{ filePath: string }>;
@@ -377,8 +430,28 @@ export type RecordingsDirResponse = Result<{ path: string }>;
 
 export type ListMeetingsResponse = Result<{ meetings: Meeting[] }>;
 export type GetMeetingResponse = Result<{ meeting: Meeting }>;
-export type UpdateMeetingResponse = Result<{ message: string; updatedData: Meeting }>;
-export type DeleteMeetingResponse = Result<{ message: string }>;
+export type UpdateMeetingResponse = Result<{
+  message: string;
+  updatedData: Meeting;
+  /** Which generated sections the save rewrote. Markdown notes only: empty for
+   *  a title/notes-only save and for the legacy .json format. */
+  edited_fields?: string[];
+}>;
+// Soft-delete (#234): main hides only the summary and returns an `id` + a
+// MAIN-owned `deadline` (epoch ms) so the renderer can offer Undo. `message` is
+// set instead when there was nothing to delete (no summary / already gone).
+export type DeleteMeetingResponse = Result<{ message?: string; id?: string; deadline?: number }>;
+
+/** A note with an in-flight soft-delete window (#234), from list-pending-deletes. */
+export interface PendingDelete {
+  id: string;
+  /** The exact `summary_file` string the note is listed under. */
+  summaryFile: string;
+  /** MAIN-owned deadline (epoch ms) — the countdown is display-only. */
+  deadline: number;
+  meeting: Meeting;
+}
+export type ListPendingDeletesResponse = Result<{ pending: PendingDelete[] }>;
 export type SaveMeetingNotesResponse = Result<{ path: string }>;
 
 export type QueryResponse = Result<{ answer: string }>;
@@ -404,6 +477,186 @@ export type ListTemplatesResponse = Result<{
   default_template_id: string;
 }>;
 export type SaveTemplateResponse = Result<{ template: Template }>;
+
+export interface PersonProfile {
+  person_id: string;
+  display_name: string;
+  prototype_counts: Record<string, number>;
+  hard_negative_counts: Record<string, number>;
+  sample_available: boolean;
+  updated_at: number;
+}
+export type ListPersonProfilesResponse = Result<{ person_profiles: PersonProfile[] }>;
+export type CreatePersonProfileResponse = Result<{ person_id: string; display_name: string }>;
+
+export interface SpeakerCandidate {
+  person_id: string;
+  display_name: string;
+  distance: number;
+  hard_negative_conflict: boolean;
+  /** Distance to this person's nearest stored hard-negative, or null when
+   *  they have none -- explains hard_negative_conflict (suppression is
+   *  relative: negative evidence must rival the positive to suppress). */
+  negative_distance: number | null;
+}
+export interface SpeakerSample {
+  start: number;
+  end: number;
+  text: string | null;
+}
+export interface SpeakerSuggestion {
+  status: 'confirmed' | 'possible' | 'none';
+  suggested_person_id: string | null;
+  suggested_name: string | null;
+  merged_from: string[];
+  candidates: SpeakerCandidate[];
+  reasons: string[];
+  // Identification anchors -- without these, "Unidentified speaker" gives a
+  // human nothing to go on to figure out who it actually is.
+  speech_duration_seconds: number;
+  segment_count: number;
+  /** "MM:SS" / "H:MM:SS" of this cluster's earliest segment, or null if the
+   *  sidecar has no segment timestamps (a pre-this-feature sidecar). */
+  first_timestamp: string | null;
+  /** Quoted excerpt of what this cluster said, at its longest (most
+   *  trustworthy) segment -- null if no saved transcript overlaps it. */
+  sample_text: string | null;
+  /** Several excerpts, chronological, each independently playable. Index i
+   *  here is exactly what `getSampleAudio(..., i)` plays -- both sides
+   *  derive the list from the shared `sample_segments`, so the clip always
+   *  matches the text beside it. `text` is null for a segment no transcript
+   *  line covers; the entry stays, because its audio is still playable and
+   *  dropping it would shift every later index. */
+  samples: SpeakerSample[];
+  /** A human marked this cluster as holding more than one person. Never
+   *  derived -- no measurable property of a blended centroid distinguishes
+   *  one voice from two (0.8270 to the contaminating speaker in the real
+   *  case this exists for). True takes the cluster out of naming entirely:
+   *  no suggestion, no candidates, and confirm-speaker refuses it. */
+  contains_multiple_speakers: boolean;
+  /** True when duration/segment-count shape matches the real-data-validated
+   *  echo/crosstalk artifact pattern (SUGGESTION_MIN_AVG_TURN_SECONDS) --
+   *  a UI hint only, never excludes the cluster from confirm-speaker. */
+  is_likely_artifact: boolean;
+  /** Display name of the person this exact cluster was already confirmed
+   *  as, from a real SpeakerPrototype in config.json -- null if never
+   *  confirmed. Persists across navigation/reload unlike the panel's
+   *  transient post-click feedback, which is plain component state. */
+  confirmed_by_user: string | null;
+  /** The same confirmation's person_id. Display names are not identity -- a
+   *  rename can leave two profiles reading alike -- so anything deciding
+   *  WHICH person a cluster went to compares this, not the name. Optional:
+   *  a payload predating this field simply carries no id. */
+  confirmed_person_id?: string | null;
+  /** How far a human got reviewing this cluster. `"generic"` means they
+   *  looked at it and chose to leave it unnamed -- the one review outcome
+   *  that leaves no other trace, so it is read from here rather than from
+   *  component state and survives a remount by construction. Absent on a
+   *  payload predating the field, and on every unreviewed row. Never
+   *  affects the suggestion: it records progress, not evidence. */
+  review_state?: string | null;
+}
+export type SuggestSpeakersResponse = Result<{
+  schema_version: 1;
+  diarization_run_id: string | null;
+  meeting_id: string;
+  /** Whether the source recording still exists on disk (keep_recordings
+   *  defaults off, so this is false for most older backfilled meetings) --
+   *  checked once per meeting; gates whether a play button can render. */
+  recording_available: boolean;
+  /** Clusters, plus one extra for each cluster marked as holding more than
+   *  one person. Surfaced because the ceiling is real and invisible in the
+   *  output: Sortformer's four-slot architecture returns a five-person
+   *  channel as four clusters with nothing indicating anything was lost.
+   *  Nothing consumes this number today -- Sortformer takes no speaker-count
+   *  hint, so there is no re-diarization call to feed it into. */
+  minimum_speaker_count: number;
+  /** People whose confirmation in this meeting was made against a
+   *  diarization run that no longer describes the clusters below, because
+   *  the meeting was re-diarized since. Their voice evidence is untouched
+   *  and keeps scoring candidates everywhere; what is lost is the link to a
+   *  cluster, and only re-confirming restores it. Absent or empty is the
+   *  normal case, including on every library that was never re-diarized. */
+  stale_assignments?: StaleAssignment[];
+  channels: Record<string, Record<string, SpeakerSuggestion>>;
+}>;
+
+export interface StaleAssignment {
+  person_id: string;
+  display_name: string;
+}
+
+export interface MarkSpeakerClusterParams {
+  meetingStem: string;
+  channel: string;
+  diarizationSpeakerId: string;
+  expectedRunId: string;
+  containsMultipleSpeakers: boolean;
+}
+
+export interface SetClusterReviewStateParams {
+  meetingStem: string;
+  channel: string;
+  diarizationSpeakerId: string;
+  expectedRunId: string;
+  /** True records "a human reviewed this and left it unnamed"; false
+   *  removes that marking, which is the undo. */
+  generic: boolean;
+}
+export type SetClusterReviewStateResponse = Result<{
+  resolved_diarization_speaker_id: string;
+  /** Every raw cluster id the marked row covers. The panel shows merged
+   *  rows, so one click can reach several ids. */
+  fragment_ids: string[];
+  review_state: string | null;
+}>;
+export type MarkSpeakerClusterResponse = Result<{
+  resolved_diarization_speaker_id: string;
+  contains_multiple_speakers: boolean;
+  /** Display names whose confirmation of THIS cluster the marking withdrew.
+   *  Marking implies the name was wrong, so the prototype (a blended
+   *  two-voice embedding) and the hard negatives it created are removed
+   *  rather than left enrolled. */
+  cleared_confirmation_from: string[];
+  minimum_speaker_count: number;
+}>;
+
+/** Feeds the one sentence shown before a delete. `has_sidecar: false` means
+ *  this meeting was never diarized -- nothing is at risk, no warning. */
+export type SpeakerNamingStatusResponse = Result<{
+  meeting_id: string;
+  has_sidecar: boolean;
+  total_clusters: number;
+  named_clusters: number;
+  unnamed_clusters: number;
+}>;
+
+export interface ConfirmSpeakerParams {
+  meetingStem: string;
+  channel: string;
+  diarizationSpeakerId: string;
+  expectedRunId: string;
+  personId?: string;
+  newPersonName?: string;
+}
+export type ConfirmSpeakerResponse = Result<{
+  person_id: string;
+  display_name: string;
+  prototype_id: string;
+  resolved_diarization_speaker_id: string;
+  merged_from: string[];
+  hard_negatives_added_against: string[];
+  /** Display names of people whose previous confirmation of this SAME
+   *  cluster was superseded by this confirm (the "Change" flow) -- their
+   *  stale prototype and derived hard negatives were removed. */
+  reassigned_from: string[];
+  relabeled_lines: number;
+}>;
+
+// audio_base64 (a WAV clip), not a filesystem path: the renderer's CSP
+// (media-src 'self' blob:) has no file: allowance, so a raw path could
+// never actually play -- the renderer builds a blob: URL from these bytes.
+export type GetSpeakerSampleAudioResponse = Result<{ audio_base64: string }>;
 
 export interface Report {
   id: string;
@@ -439,6 +692,9 @@ export type ListModelsResponse = Result<{
   supported_models: Record<string, RawSupportedModel>;
   current_model: string;
   provider: string;
+  // Machine RAM in GB (main.js attaches os.totalmem()); used to flag local
+  // models that may exceed available memory. Absent -> never warn.
+  total_ram_gb?: number;
 }>;
 export type GetCurrentModelResponse = Result<{ model: string }>;
 
@@ -478,14 +734,47 @@ export type ParakeetStatusResponse = Result<{
   installed: boolean;
 }>;
 
-export type TranscriptionEngine = 'parakeet' | 'whisper';
+export type TranscriptionEngine = 'parakeet' | 'whisper' | 'openai-asr';
 
 export type GetTranscriptionEngineResponse = Result<{
   engine: TranscriptionEngine;
   valid_engines: TranscriptionEngine[];
 }>;
 
+/** macOS speaker-diarization engine (Config.VALID_DIARIZATION_ENGINES). */
+export type DiarizationEngine = 'sortformer' | 'nemotron3';
+
+export type GetDiarizationEngineResponse = Result<{
+  engine: DiarizationEngine;
+  valid_engines: DiarizationEngine[];
+}>;
+
+/** A non-default engine is only saved once its models are ready; otherwise
+ *  the backend answers success: false with models_ready: false. */
+export type SetDiarizationEngineResponse =
+  | { success: true; engine: DiarizationEngine }
+  | { success: false; error: string; error_code?: string; models_ready?: false };
+
+export type GetOpenAiAsrConfigResponse = Result<{
+  api_url: string;
+  api_key_set: boolean;
+  model: string;
+}>;
+
+export type SetOpenAiAsrConfigResponse = Result<{
+  api_url: string;
+  api_key_set: boolean;
+  model: string;
+}>;
+
+export type SetOpenAiAsrKeyResponse = Result<{ api_key_set: boolean }>;
+
 export type GetNotificationsResponse = Result<{ notifications_enabled: boolean }>;
+// `enabled` is the persisted preference; `registered` is the live global-
+// shortcut registration state (false when enabled but another app owns the
+// accelerator). The setter returns the same two fields.
+export type GetRecordHotkeyResponse = Result<{ enabled: boolean; registered: boolean }>;
+export type SetRecordHotkeyResponse = Result<{ enabled: boolean; registered: boolean }>;
 export type GetTelemetryResponse = Result<{
   telemetry_enabled: boolean;
   anonymous_id?: string;
@@ -503,6 +792,10 @@ export type GetWhisperModelResponse = Result<{ whisper_model: string; supported_
 export type GetKeepRecordingsResponse = Result<{ keep_recordings: boolean }>;
 
 export type GetAutoSummarizeResponse = Result<{ auto_summarize_enabled: boolean }>;
+
+export type GetAutoInstallWhenIdleResponse = Result<{ auto_install_when_idle: boolean }>;
+
+export type GetIdentityMatchingEnabledResponse = Result<{ identity_matching_enabled: boolean }>;
 
 export type GetSilenceAutoStopResponse = Result<{
   silence_auto_stop_enabled: boolean;
@@ -524,6 +817,10 @@ export type StoragePathResponse = Result<{
   default_path: string;
 }>;
 export type PickStorageFolderResponse = Result<{ folderPath: string }>;
+export type GetObsidianSyncResponse = Result<{ obsidian_sync_enabled: boolean }>;
+export type GetObsidianVaultPathResponse = Result<{ obsidian_vault_path: string }>;
+export type ObsidianConflict = { vaultRelPath: string; detectedAt: string; reason: string };
+export type GetObsidianConflictsResponse = Result<{ conflicts: Record<string, ObsidianConflict> }>;
 export type GetAiPromptsResponse = Result<{ summarization: string }>;
 
 export type GetAiProviderResponse = Result<{
@@ -543,7 +840,7 @@ export type GetAiProviderResponse = Result<{
   bedrock_supported_models: string[];
 }>;
 
-export type AuthStatusResponse = Result<{ connected: boolean }>;
+export type AuthStatusResponse = Result<{ connected: boolean; email?: string | null }>;
 export type GetCalendarEventsResponse =
   | { success: true; events: CalendarEvent[] }
   | { success: false; needsAuth: true }
@@ -556,6 +853,10 @@ export type CheckForUpdatesResponse = Result<{
   releaseUrl: string;
   releaseName: string;
   downloadUrl: string | null;
+  // macOS only: false when this OS is below the app's launch floor (14.4), so
+  // an available update can't be auto-installed and the About tab explains that
+  // instead of offering a broken Restart (#432). Absent/true elsewhere.
+  osUpdateEligible?: boolean;
 }>;
 
 // downloadedVersion is null until a download finishes (or after one already
@@ -592,6 +893,8 @@ export interface SummaryTitleEvent {
 }
 export interface SummaryCompleteEvent {
   success: boolean;
+  /** Fixed reprocess failure code; never raw backend diagnostics. */
+  error_code?: string;
   sessionName: string;
   summaryFile?: string;
   /** True when this completion belongs to a template report generation rather
@@ -601,6 +904,8 @@ export interface SummaryCompleteEvent {
 }
 export interface ProcessingCompleteEvent {
   success: boolean;
+  /** Fixed reprocess failure code; never raw backend diagnostics. */
+  error_code?: string;
   sessionName: string;
   message: string;
   meetingData?: Meeting;
@@ -626,6 +931,11 @@ export interface ProcessingCompleteEvent {
    *  reprocess banner regardless of whether STREAM_ERROR or a non-zero exit
    *  ended it. */
   report?: boolean;
+  /** True when summarization actually ran (STREAM_COMPLETE), i.e. the note has
+   *  generated notes. False/absent on the transcript-only path (auto_summarize
+   *  off → SUMMARY_SKIPPED). Drives whether the renderer fires "Note ready" vs
+   *  the "Transcript ready — generate notes?" prompt (#bug2/#bug3). */
+  notesGenerated?: boolean;
 }
 export interface QueryChunkEvent {
   queryId: string;
@@ -659,7 +969,21 @@ export interface ParakeetPullProgressEvent {
   /** Present on pull-parakeet-model invocations; omitted on
    *  setup-parakeet (which downloads the default model with no id arg). */
   model?: string | null;
-  stage: 'downloading' | 'loading' | string;
+  stage: 'preparing' | 'downloading' | 'loading' | 'complete' | string;
+  completed_files?: number;
+  total_files?: number;
+  file_bytes?: number;
+  /** Exact bytes from the Hub's file metadata; absent when that lookup failed. */
+  downloaded_bytes?: number;
+  total_bytes?: number;
+}
+/** Speaker-diarization model download ('setup-speaker-models'). While
+ *  `downloading`, percent is the measured share of the model download; once
+ *  `compiling` (CoreML optimising for this Mac, then the small embedding
+ *  models) there is nothing to measure. Phase only ever moves forward. */
+export interface SpeakerModelsProgressEvent {
+  percent: number;
+  phase: 'listing' | 'downloading' | 'compiling';
 }
 export interface ParakeetPullCompleteEvent {
   model?: string | null;
@@ -742,6 +1066,11 @@ export interface ShortcutStartRecordingEvent {
   sessionName: string | null;
 }
 
+export interface MeetingTransferImportedEvent {
+  summaryFile: string;
+  duplicate: boolean;
+}
+
 // ---------- bridge shape ----------
 type RequestFn<Args extends unknown[], Res> = (...args: Args) => Promise<Res>;
 type SendFn<Args extends unknown[]> = (...args: Args) => void;
@@ -751,11 +1080,8 @@ export interface StenoaiBridge {
   version: number;
 
   app: {
+    platform: 'darwin' | 'linux' | 'win32';
     getVersion: RequestFn<[], AppVersionResponse>;
-    /** Screen Recording permission changes don't apply to an already-running
-     *  process on macOS — this is the one-click "apply it now" follow-up.
-     *  Never actually resolves (the process exits first). */
-    relaunch: RequestFn<[], void>;
   };
 
   window: { focus: SendFn<[]>; readyToShow: SendFn<[]> };
@@ -780,6 +1106,9 @@ export interface StenoaiBridge {
     check: RequestFn<[], SetupCheckResponse>;
     ollamaAndModel: RequestFn<[], Result<Record<string, unknown>>>;
     parakeet: RequestFn<[], Result<Record<string, unknown>>>;
+    /** Without an engine, reports/prepares the saved diarization engine's models. */
+    speakerModelsStatus: RequestFn<[engine?: DiarizationEngine], SpeakerModelStatusResponse>;
+    speakerModels: RequestFn<[engine?: DiarizationEngine], SpeakerModelStatusResponse>;
     test: RequestFn<[], Result<Record<string, unknown>>>;
     triggerWizard: RequestFn<[], Result<Record<string, unknown>>>;
   };
@@ -792,14 +1121,6 @@ export interface StenoaiBridge {
   perm: {
     checkMicrophone: RequestFn<[], MicPermissionResponse>;
     requestMicrophone: RequestFn<[], MicPermissionGrantResponse>;
-    /** macOS only: safely triggers the native prompt for a 'not-determined'
-     *  user by calling desktopCapturer.getSources() in an ordinary, properly
-     *  try/caught main-process handler — deliberately NOT the same code path
-     *  recording capture uses (see main.js for why that one can't do this). */
-    requestScreenRecording: RequestFn<[], ScreenRecordingPermissionResponse>;
-    /** Deep-links to System Settings > Screen Recording — macOS won't
-     *  re-prompt once denied/restricted, so this is the only way back. */
-    openScreenRecordingSettings: RequestFn<[], Result<Record<string, never>>>;
   };
 
   recording: {
@@ -824,12 +1145,6 @@ export interface StenoaiBridge {
       Result<{
         supported: boolean;
         osVersion: string;
-        screenPermission: string;
-        // Screen Recording permission as of process launch (macOS only;
-        // frozen at startup — a mid-session grant only takes effect after a
-        // relaunch, so consumers gating loopback usability must read this,
-        // not the live `screenPermission`).
-        screenPermissionAtLaunch: string;
         experimental?: boolean;
         platform?: string;
       }>
@@ -840,9 +1155,14 @@ export interface StenoaiBridge {
     openSystemAudioFile: RequestFn<[name: string], Result<{ filePath: string }>>;
     appendSystemAudioChunk: RequestFn<[bytes: Uint8Array], Result<Record<string, never>>>;
     closeSystemAudioFile: RequestFn<[], Result<{ filePath: string }>>;
+    /** Linux-only: starts a pw-record subprocess in main capturing the default
+     *  sink's monitor (see app/linux-loopback.js). PCM arrives via
+     *  on.linuxLoopbackChunk, not through getDisplayMedia. */
+    startLinuxLoopback: RequestFn<[], Result<{ sampleRate: number; channels: number }>>;
+    stopLinuxLoopback: RequestFn<[], Result<Record<string, never>>>;
     /** Report a renderer-side capture failure so main can surface a native
      *  notification (a failed start would otherwise be silent). Fire-and-forget. */
-    reportCaptureError: SendFn<[message: string]>;
+    reportCaptureError: SendFn<[message: string, name?: string, phase?: 'start' | 'ongoing' | 'stop']>;
     processSystemAudio: RequestFn<[filePath: string, name: string], Result<{ message: string }>>;
     // Fire-and-forget: the handler copies the file into recordings/ and queues
     // it (addToProcessingQueue), then resolves immediately with no payload —
@@ -867,10 +1187,19 @@ export interface StenoaiBridge {
     update: RequestFn<[summaryFile: string, patch: UpdateMeetingPatch], UpdateMeetingResponse>;
     revealFolder: RequestFn<[filePath: string], Result<Record<string, never>>>;
     delete: RequestFn<[meeting: Meeting], DeleteMeetingResponse>;
+    undoDelete: RequestFn<[id: string], Result<{ meeting: Meeting }>>;
+    commitDelete: RequestFn<[id: string], Result<Record<string, never>>>;
+    listPendingDeletes: RequestFn<[], ListPendingDeletesResponse>;
     reprocess: RequestFn<
       [summaryFile: string, regenTitle: boolean, name: string],
       Result<{ message: string }>
     >;
+    /** Re-run transcription on the source recording (#266) with the current
+     *  settings, then re-summarise. Only wired when `recordingAvailable` is true. */
+    retranscribe: RequestFn<[summaryFile: string, name: string], Result<{ message: string }>>;
+    /** Whether the source recording for a note still exists on disk, gating the
+     *  re-transcribe action (available only when keep-recordings was on). */
+    recordingAvailable: RequestFn<[summaryFile: string], Result<{ available: boolean }>>;
     saveNotes: RequestFn<[name: string, notes: string], SaveMeetingNotesResponse>;
     exportTranscript: RequestFn<
       [defaultFilename: string, content: string],
@@ -892,8 +1221,18 @@ export interface StenoaiBridge {
     deleteReport: RequestFn<[summaryFile: string, reportId: string], Result<Record<string, never>>>;
   };
 
+  meetingTransfer: {
+    importPackage: RequestFn<
+      [filePath?: string],
+      Result<{ cancelled?: boolean; summaryFile?: string; duplicate?: boolean }>
+    >;
+    exportPackage: RequestFn<[summaryFile: string], Result<{ cancelled?: boolean }>>;
+    ready: RequestFn<[], Result<Record<string, never>>>;
+  };
+
   query: {
     ask: RequestFn<[file: string, q: string], QueryResponse>;
+    chatContext: SendFn<[id: string, request: ChatRequest]>;
     askStream: SendFn<[id: string, file: string, q: string]>;
     chatGlobalStream: SendFn<[id: string, q: string, folderId?: string | null]>;
     cancel: SendFn<[id: string]>;
@@ -924,6 +1263,32 @@ export interface StenoaiBridge {
     remove: RequestFn<[id: string], Result<Record<string, never>>>;
     setDefault: RequestFn<[id: string], Result<Record<string, never>>>;
     reset: RequestFn<[id: string], Result<Record<string, never>>>;
+  };
+
+  speakers: {
+    listProfiles: RequestFn<[], ListPersonProfilesResponse>;
+    suggestForMeeting: RequestFn<[meetingStem: string], SuggestSpeakersResponse>;
+    confirm: RequestFn<[params: ConfirmSpeakerParams], ConfirmSpeakerResponse>;
+    createProfile: RequestFn<[displayName: string], CreatePersonProfileResponse>;
+    renameProfile: RequestFn<[id: string, displayName: string], Result<Record<string, never>>>;
+    deleteProfile: RequestFn<[id: string], Result<Record<string, never>>>;
+    getSampleAudio: RequestFn<
+      [
+        meetingStem: string,
+        channel: string,
+        diarizationSpeakerId: string,
+        expectedRunId: string,
+        segmentIndex?: number,
+      ],
+      GetSpeakerSampleAudioResponse
+    >;
+    getPersonSampleAudio: RequestFn<[id: string], GetSpeakerSampleAudioResponse>;
+    markCluster: RequestFn<[params: MarkSpeakerClusterParams], MarkSpeakerClusterResponse>;
+    setClusterReviewState: RequestFn<
+      [params: SetClusterReviewStateParams],
+      SetClusterReviewStateResponse
+    >;
+    namingStatus: RequestFn<[meetingStem: string], SpeakerNamingStatusResponse>;
   };
 
   models: {
@@ -957,9 +1322,25 @@ export interface StenoaiBridge {
     set: RequestFn<[engine: TranscriptionEngine], Result<{ engine: TranscriptionEngine }>>;
   };
 
+  diarizationEngine: {
+    get: RequestFn<[], GetDiarizationEngineResponse>;
+    set: RequestFn<[engine: DiarizationEngine], SetDiarizationEngineResponse>;
+  };
+
+  openaiAsr: {
+    getConfig: RequestFn<[], GetOpenAiAsrConfigResponse>;
+    setConfig: RequestFn<
+      [cfg: { api_url?: string; model?: string }],
+      SetOpenAiAsrConfigResponse
+    >;
+    setKey: RequestFn<[key: string], SetOpenAiAsrKeyResponse>;
+  };
+
   settings: {
     getNotifications: RequestFn<[], GetNotificationsResponse>;
     setNotifications: RequestFn<[v: boolean], Result<Record<string, never>>>;
+    getRecordHotkey: RequestFn<[], GetRecordHotkeyResponse>;
+    setRecordHotkey: RequestFn<[v: boolean], SetRecordHotkeyResponse>;
     getTelemetry: RequestFn<[], GetTelemetryResponse>;
     setTelemetry: RequestFn<
       [v: boolean, source: TelemetryToggleSource],
@@ -983,6 +1364,10 @@ export interface StenoaiBridge {
     setKeepRecordings: RequestFn<[v: boolean], Result<Record<string, never>>>;
     getAutoSummarize: RequestFn<[], GetAutoSummarizeResponse>;
     setAutoSummarize: RequestFn<[v: boolean], Result<Record<string, never>>>;
+    getAutoInstallWhenIdle: RequestFn<[], GetAutoInstallWhenIdleResponse>;
+    setAutoInstallWhenIdle: RequestFn<[v: boolean], Result<Record<string, never>>>;
+    getIdentityMatchingEnabled: RequestFn<[], GetIdentityMatchingEnabledResponse>;
+    setIdentityMatchingEnabled: RequestFn<[v: boolean], Result<Record<string, never>>>;
     getSilenceAutoStop: RequestFn<[], GetSilenceAutoStopResponse>;
     setSilenceAutoStopEnabled: RequestFn<[v: boolean], SetSilenceAutoStopEnabledResponse>;
     setSilenceAutoStopMinutes: RequestFn<[v: number], SetSilenceAutoStopMinutesResponse>;
@@ -990,10 +1375,12 @@ export interface StenoaiBridge {
       [payload: { minutes: number; sessionName: string | null }],
       Result<Record<string, never>>
     >;
-    /** Fired at recording start when loopback is skipped specifically because
-     *  Screen Recording permission isn't granted (see main.js — not fired for
-     *  the toggle-off or OS-unsupported cases, which aren't a surprise). */
+    /** Fired when an enabled loopback acquisition genuinely fails; not fired
+     *  for the toggle-off or OS-unsupported cases. */
     showSystemAudioMicOnlyNotification: RequestFn<[], Result<Record<string, never>>>;
+    /** Fired when a recording starts with no audio input device and continues
+     *  on system audio alone (#517). */
+    showSystemAudioOnlyNotification: RequestFn<[], Result<Record<string, never>>>;
     showNoteReadyNotification: RequestFn<
       [
         payload: {
@@ -1001,9 +1388,24 @@ export interface StenoaiBridge {
           failed?: boolean;
           hardFailure?: boolean;
           summaryFile?: string | null;
+          actionItemCount?: number;
         },
       ],
       Result<Record<string, never>>
+    >;
+    /** Transcript-only note finished transcription with no notes generated
+     *  (auto_summarize off). Prompts "Generate notes?" — the action starts
+     *  generation in the background, a body tap opens the note. Returns `shown`
+     *  for the notifications_enabled gate. (#bug2/#bug3) */
+    showTranscriptReadyNotification: RequestFn<
+      [
+        payload: {
+          title?: string;
+          summaryFile?: string | null;
+          name?: string | null;
+        },
+      ],
+      Result<{ shown?: boolean }>
     >;
     /** Design-for-test seam for the pre-meeting notification (production fire
      *  path is the main-side scheduler). Returns `shown` for the gate/suppression. */
@@ -1020,6 +1422,12 @@ export interface StenoaiBridge {
     getStoragePath: RequestFn<[], StoragePathResponse>;
     setStoragePath: RequestFn<[p: string], Result<Record<string, never>>>;
     pickStorageFolder: RequestFn<[], PickStorageFolderResponse>;
+    getObsidianSync: RequestFn<[], GetObsidianSyncResponse>;
+    setObsidianSync: RequestFn<[v: boolean], Result<Record<string, never>>>;
+    getObsidianVaultPath: RequestFn<[], GetObsidianVaultPathResponse>;
+    setObsidianVaultPath: RequestFn<[p: string], Result<Record<string, never>>>;
+    pickObsidianVaultFolder: RequestFn<[], PickStorageFolderResponse>;
+    getObsidianConflicts: RequestFn<[], GetObsidianConflictsResponse>;
     getAiPrompts: RequestFn<[], GetAiPromptsResponse>;
     saveDiagnostics: RequestFn<
       [defaultFilename: string, content: string],
@@ -1086,13 +1494,22 @@ export interface StenoaiBridge {
     parakeetPullProgress: Subscribe<ParakeetPullProgressEvent>;
     parakeetPullComplete: Subscribe<ParakeetPullCompleteEvent>;
     setupOllamaProgress: Subscribe<SetupOllamaProgressEvent>;
+    speakerModelsProgress: Subscribe<SpeakerModelsProgressEvent>;
     liveTranscriptReady: Subscribe<LiveTranscriptReadyEvent>;
     liveTranscriptChunk: Subscribe<LiveTranscriptChunkEvent>;
     liveTranscriptError: Subscribe<LiveTranscriptErrorEvent>;
+    /** Raw interleaved s16 PCM from the Linux loopback capture — see
+     *  recording.startLinuxLoopback. Electron serialises the main-side Buffer
+     *  as a Uint8Array on this side of the bridge. */
+    linuxLoopbackChunk: Subscribe<Uint8Array>;
+    /** pw-record died on its own (crash, PipeWire restart) — no more chunks
+     *  are coming. Not emitted on a normal stopLinuxLoopback(). */
+    linuxLoopbackEnded: Subscribe<{ code: number | null; signal: string | null }>;
     updateAvailable: Subscribe<UpdateAvailableEvent>;
     updateDownloadProgress: Subscribe<UpdateProgressEvent>;
     updateDownloaded: Subscribe<UpdateDownloadedEvent>;
     updateError: Subscribe<UpdateErrorEvent>;
+    updateErrorCleared: Subscribe<void>;
     googleAuthChanged: Subscribe<{ connected: boolean }>;
     outlookAuthChanged: Subscribe<{ connected: boolean }>;
     shortcutStartRecording: Subscribe<ShortcutStartRecordingEvent>;
@@ -1103,14 +1520,25 @@ export interface StenoaiBridge {
     autoPauseRequested: Subscribe<void>;
     autoResumeRequested: Subscribe<void>;
     autoSummariseRequested: Subscribe<void>;
+    /** Main asks the renderer to generate notes for a transcript-only note in
+     *  the background (from the "Generate notes" action on the transcript-ready
+     *  notification). Renderer runs the same reprocess path as GenerateNotesBar. */
+    generateNotesRequested: Subscribe<{ summaryFile: string; name?: string | null }>;
     navigateToMeeting: Subscribe<{ summaryFile: string }>;
     trayOpenSettings: Subscribe<void>;
+    meetingTransferImported: Subscribe<MeetingTransferImportedEvent>;
     showQuitDialog: Subscribe<{ type: 'recording' | 'processing'; jobCount?: number }>;
     showNotification: Subscribe<{
+      id?: string;
       title: string;
-      time: string;
+      body?: string;
+      time?: string;
       meeting_url?: string;
       attendees?: string;
+      premeeting?: boolean;
+      iconType?: 'app' | 'alert' | 'success' | 'recording';
+      color?: string;
+      actions?: { id: string; text: string; type?: 'primary' | 'secondary' }[];
     }>;
   };
 
@@ -1134,12 +1562,35 @@ export interface StenoaiBridge {
     chatStream: SendFn<[streamId: string, payload: OrgChatPayload]>;
   };
 
+  share: {
+    /** Whether a native share sheet exists on this machine (macOS only). Treat
+     *  an unresolved query as false so the entries never flash in before the
+     *  capability is known. */
+    canShare: RequestFn<[], boolean>;
+    /** Write the payload into the managed share temp directory and pop the
+     *  native sheet on it. `kind: 'pdf'` takes HTML and rasterises it first;
+     *  `'text'` is written as UTF-8. `anchor` is a point in window coordinates
+     *  so the sheet pops from the clicked entry. `success` means only that the
+     *  sheet opened - the destination is never reported back. */
+    shareFile: RequestFn<
+      [
+        kind: 'pdf' | 'text',
+        defaultFilename: string,
+        payload: string,
+        anchor: { x: number; y: number },
+      ],
+      Result<Record<string, never>>
+    >;
+  };
+
   dialog: {
     respondQuit: SendFn<[confirmed: boolean]>;
   };
 
   notification: {
     close: RequestFn<[], void>;
+    actionClicked: SendFn<[actionId: string, notifId?: string]>;
+    bodyClicked: SendFn<[notifId?: string]>;
   };
 
   subscribeQueryStream: (

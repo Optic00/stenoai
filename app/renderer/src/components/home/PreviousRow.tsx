@@ -1,8 +1,9 @@
-import { FileText, Folder as FolderIcon, Loader2 } from 'lucide-react';
+import { AudioLines, Folder as FolderIcon, Loader2 } from 'lucide-react';
 import type { Meeting } from '@/lib/ipc';
 import { navigate } from '@/lib/router';
 import { useMeetingsList } from '@/lib/meetingsListContext';
 import { stripReasoning } from '@/lib/markdown';
+import { isLiveRowFile } from '@/lib/liveMeetingRow';
 
 interface PreviousRowProps {
   meeting: Meeting;
@@ -57,15 +58,16 @@ export function PreviousRow({ meeting, folderName }: PreviousRowProps) {
       }}
     >
       <div className="flex min-w-0 flex-1 items-center gap-3.5">
-        {/* Neutral note glyph — paper+ink, no per-note colour. Notes are told
-            apart by title + preview, not an arbitrary hash colour (which read
-            as meaningful and collided with the reserved status hues). */}
+        {/* Letter avatar — the note title's first initial, native-macOS-style.
+            Still paper+ink with no per-note colour: notes are told apart by
+            title + preview, not an arbitrary hash colour (which read as
+            meaningful and collided with the reserved status hues). */}
         <div
           aria-hidden="true"
-          className="flex size-9 flex-shrink-0 items-center justify-center rounded-lg"
+          className="flex size-9 flex-shrink-0 items-center justify-center rounded-lg text-[15px] font-medium"
           style={{ background: 'var(--surface-sunken)', color: 'var(--fg-2)' }}
         >
-          <FileText className="size-[17px]" />
+          {title.charAt(0).toUpperCase()}
         </div>
         
         <div className="flex min-w-0 flex-col gap-1">
@@ -114,8 +116,31 @@ export function PreviousRow({ meeting, folderName }: PreviousRowProps) {
         className="flex flex-col items-end gap-1.5 pl-4 text-[12.5px] tabular-nums"
         style={{ color: 'var(--fg-2)' }}
       >
-        <span>{isSynthetic ? 'Now' : (when ?? '')}</span>
-        {duration && <span className="text-[11.5px] opacity-70">{duration}</span>}
+        {/* "Now" only for the synthetic live row. A note being reprocessed is
+            flagged is_processing too, but it was recorded when it was. */}
+        <span>{isLiveRowFile(info.summary_file) ? 'Now' : (when ?? '')}</span>
+        {/* Original audio still on disk. Shown only when present, never as a
+            crossed-out "missing" marker: keep_recordings defaults off, so
+            absence is the normal case and flagging it on most rows would be
+            noise. What the icon buys is knowing, without opening the note,
+            which recordings can still be re-transcribed or listened to for
+            speaker review — the actions that silently disappear once the
+            audio is gone. Sits beside the duration because both describe
+            the recording rather than the note. */}
+        {(duration || (!isSynthetic && meeting.has_audio)) && (
+          <span className="flex items-center gap-1 text-[11.5px] opacity-70">
+            {!isSynthetic && meeting.has_audio && (
+              <AudioLines
+                className="size-3"
+                aria-label="Original audio still available"
+                data-testid="previous-row-has-audio"
+              >
+                <title>Original audio still available</title>
+              </AudioLines>
+            )}
+            {duration}
+          </span>
+        )}
       </div>
     </div>
   );

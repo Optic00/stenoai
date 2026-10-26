@@ -17,13 +17,14 @@ import {
   useOrgSession,
   useUnshareOrgMeeting,
 } from '@/hooks/useOrg';
+import { UI_LOCALE } from '@/lib/locale';
 
 function formatDate(epoch: number): string {
   const d = new Date(epoch * 1000);
   const now = new Date();
   const sameDay = d.toDateString() === now.toDateString();
   if (sameDay) return 'today, ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  return d.toLocaleDateString(UI_LOCALE, { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
 function NotSignedIn() {
@@ -171,7 +172,7 @@ export function OrgSharedDetail({ id }: { id: string }) {
       <button
         type="button"
         onClick={() => navigate('/org/shared')}
-        className="mb-5 inline-flex items-center gap-1.5 text-[12px] hover:text-[color:var(--fg-1)]"
+        className="mb-5 inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[12px] transition-colors hover:bg-[color:var(--surface-hover)] hover:text-[color:var(--fg-1)]"
         style={{ color: 'var(--fg-2)' }}
       >
         <ArrowLeft size={12} /> Shared notes

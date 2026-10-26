@@ -17,6 +17,8 @@ type SettingKind =
   | 'userName'
   | 'keepRecordings'
   | 'autoSummarize'
+  | 'autoInstallWhenIdle'
+  | 'identityMatching'
   | 'silenceEnabled'
   | 'silenceMinutes'
   | 'systemAudio'
@@ -33,6 +35,12 @@ type SettingsBridge = {
     setUserName: (v: string) => Promise<unknown>;
     setKeepRecordings: (v: boolean) => Promise<unknown>;
     setAutoSummarize: (v: boolean) => Promise<unknown>;
+    setAutoInstallWhenIdle: (v: boolean) => Promise<unknown>;
+    getIdentityMatchingEnabled: () => Promise<{
+      success?: boolean;
+      identity_matching_enabled?: boolean;
+    }>;
+    setIdentityMatchingEnabled: (v: boolean) => Promise<unknown>;
     setSilenceAutoStopEnabled: (v: boolean) => Promise<unknown>;
     setSilenceAutoStopMinutes: (v: number) => Promise<unknown>;
     setSystemAudio: (v: boolean) => Promise<unknown>;
@@ -63,6 +71,12 @@ const CASES: Case[] = [
   // false flips the default (true) so the assertion has teeth — a no-op setter
   // would leave the key unset/true and fail this case.
   { kind: 'autoSummarize', value: false, configKey: 'auto_summarize_enabled' },
+  // false flips the default (true) so the assertion has teeth — a no-op setter
+  // would leave the key unset/true and fail this case.
+  { kind: 'autoInstallWhenIdle', value: false, configKey: 'auto_install_when_idle' },
+  // Speaker identification stores biometric voice profiles, so its fresh
+  // default is asserted separately below before this explicit opt-in.
+  { kind: 'identityMatching', value: true, configKey: 'identity_matching_enabled' },
   { kind: 'silenceEnabled', value: false, configKey: 'silence_auto_stop_enabled' },
   { kind: 'silenceMinutes', value: 15, configKey: 'silence_auto_stop_minutes' },
   // false flips the macOS default (true) so this has teeth on the primary signed
@@ -98,6 +112,10 @@ function applySetting(
           return s.settings.setKeepRecordings(value as boolean);
         case 'autoSummarize':
           return s.settings.setAutoSummarize(value as boolean);
+        case 'autoInstallWhenIdle':
+          return s.settings.setAutoInstallWhenIdle(value as boolean);
+        case 'identityMatching':
+          return s.settings.setIdentityMatchingEnabled(value as boolean);
         case 'silenceEnabled':
           return s.settings.setSilenceAutoStopEnabled(value as boolean);
         case 'silenceMinutes':
@@ -131,6 +149,14 @@ test('settings setters persist each value to the right config.json key; real dir
   const realDirBefore = fileSig(realUserDataDir());
   const { page } = await launchApp();
 
+  const identityMatchingDefault = await page.evaluate(() =>
+    (window as StenoWindow).stenoai.settings.getIdentityMatchingEnabled(),
+  );
+  expect(identityMatchingDefault).toMatchObject({
+    success: true,
+    identity_matching_enabled: false,
+  });
+
   for (const { kind, value, configKey } of CASES) {
     await applySetting(page, kind, value);
     await expect
@@ -142,6 +168,16 @@ test('settings setters persist each value to the right config.json key; real dir
 
   // Keystone: the real user-data dir is byte-for-byte untouched.
   expect(fileSig(realUserDataDir())).toBe(realDirBefore);
+});
+
+test('Italian language survives the backend settings round-trip', async ({ launchApp, userDataDir }) => {
+  const { page } = await launchApp();
+  const result = await page.evaluate(() => window.stenoai.settings.setLanguage('it'));
+  expect(result).toMatchObject({ success: true, language: 'it' });
+  await expect.poll(() => readUserConfig(userDataDir).language).toBe('it');
+
+  const reloaded = await page.evaluate(() => window.stenoai.settings.getLanguage());
+  expect(reloaded).toMatchObject({ success: true, language: 'it' });
 });
 
 // set-microphone takes two args (device_id, label) and writes two config
@@ -211,7 +247,7 @@ test('Advanced-tab Reset button clears the custom storage path (#304); real dir 
   userDataDir,
 }) => {
   const realDirBefore = fileSig(realUserDataDir());
-  const { page } = await launchApp();
+  const { page } = await launchApp({ releaseHighlightsSeen: true });
 
   // Setup (not under test): seed a custom path via the bridge so the Reset
   // button is rendered (it only shows when custom_path differs from default).

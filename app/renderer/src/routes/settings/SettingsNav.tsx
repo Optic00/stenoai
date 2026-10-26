@@ -4,22 +4,27 @@ import {
   Code2,
   Info,
   LayoutTemplate,
+  Plug,
   Settings2,
   Sparkles,
+  Users,
   Wrench,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { t } from '@/i18n';
 
 // The full set of nav rail destinations. Distinct from Settings.tsx's
 // deep-linkable TabId, which additionally accepts the legacy 'transcription'
 // id as an alias that resolves onto 'ai' — the nav rail itself only ever
-// renders/highlights these seven.
+// renders/highlights the ids listed here.
 export type SettingsTabId =
   | 'general'
   | 'ai'
   | 'templates'
+  | 'people'
   | 'organisation'
+  | 'integrations'
   | 'advanced'
   | 'developer'
   | 'about';
@@ -38,31 +43,112 @@ interface NavGroup {
 const NAV_GROUPS: NavGroup[] = [
   {
     items: [
-      { id: 'general', label: 'Preferences', icon: Settings2 },
-      { id: 'ai', label: 'AI', icon: Sparkles },
-      { id: 'templates', label: 'Templates', icon: LayoutTemplate },
+      {
+        id: 'general',
+        get label() {
+          return t('settings.nav.preferences');
+        },
+        icon: Settings2,
+      },
+      {
+        id: 'ai',
+        get label() {
+          return t('settings.nav.ai');
+        },
+        icon: Sparkles,
+      },
+      {
+        id: 'templates',
+        get label() {
+          return t('settings.nav.templates');
+        },
+        icon: LayoutTemplate,
+      },
+      {
+        id: 'people',
+        get label() {
+          return t('settings.nav.people');
+        },
+        icon: Users,
+      },
     ],
   },
   {
-    header: 'Workspace',
-    items: [{ id: 'organisation', label: 'Organisation', icon: Building2 }],
+    get header() {
+      return t('settings.nav.workspace');
+    },
+    items: [
+      {
+        id: 'organisation',
+        get label() {
+          return t('settings.nav.organisation');
+        },
+        icon: Building2,
+      },
+    ],
   },
   {
-    header: 'System',
+    get header() {
+      return t('settings.nav.system');
+    },
     items: [
-      { id: 'advanced', label: 'Advanced', icon: Wrench },
-      { id: 'developer', label: 'Developer', icon: Code2 },
-      { id: 'about', label: 'About', icon: Info },
+      {
+        id: 'integrations',
+        get label() {
+          return t('settings.nav.integrations');
+        },
+        icon: Plug,
+      },
+      {
+        id: 'advanced',
+        get label() {
+          return t('settings.nav.advanced');
+        },
+        icon: Wrench,
+      },
+      {
+        id: 'developer',
+        get label() {
+          return t('settings.nav.developer');
+        },
+        icon: Code2,
+      },
+      {
+        id: 'about',
+        get label() {
+          return t('settings.nav.about');
+        },
+        icon: Info,
+      },
     ],
   },
 ];
 
-// Flat id -> label lookup so Settings.tsx can show the active tab's own name
+// Id -> label lookup so Settings.tsx can show the active tab's own name
 // as the page title (matches the Granola reference: the header names the
 // section, it isn't a static "Settings" caption).
-export const SETTINGS_TAB_LABELS: Record<SettingsTabId, string> = Object.fromEntries(
-  NAV_GROUPS.flatMap((g) => g.items).map((item) => [item.id, item.label]),
-) as Record<SettingsTabId, string>;
+export function settingsTabLabel(id: SettingsTabId): string {
+  switch (id) {
+    case 'general':
+      return t('settings.nav.preferences');
+    case 'ai':
+      return t('settings.nav.ai');
+    case 'templates':
+      return t('settings.nav.templates');
+    case 'people':
+      return t('settings.nav.people');
+    case 'organisation':
+      return t('settings.nav.organisation');
+    case 'integrations':
+      return t('settings.nav.integrations');
+    case 'advanced':
+      return t('settings.nav.advanced');
+    case 'developer':
+      return t('settings.nav.developer');
+    case 'about':
+      return t('settings.nav.about');
+  }
+}
 
 interface SettingsNavProps {
   activeTab: SettingsTabId;
@@ -105,8 +191,8 @@ export function SettingsNav({ activeTab, onSelect, onBack, version }: SettingsNa
         <button
           type="button"
           onClick={onBack}
-          aria-label="Back"
-          className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-[6px] border-0 bg-transparent transition-colors hover:bg-[color:var(--surface-hover)] hover:text-[color:var(--fg-1)]"
+          aria-label={t('settings.nav.back')}
+          className="flex size-7 shrink-0 cursor-pointer items-center justify-center rounded-[6px] border-0 bg-transparent transition-colors hover:bg-[color:var(--surface-active)] hover:text-[color:var(--fg-1)]"
           style={{ color: 'var(--fg-2)' }}
         >
           <ArrowLeft size={14} />
@@ -115,14 +201,14 @@ export function SettingsNav({ activeTab, onSelect, onBack, version }: SettingsNa
           className="text-[13px] font-medium"
           style={{ color: 'var(--fg-1)' }}
         >
-          Settings
+          {t('settings.nav.title')}
         </span>
       </div>
 
       <div
         className="flex min-h-0 flex-1 flex-col gap-px overflow-auto px-2 pb-2"
         role="group"
-        aria-label="Settings sections"
+        aria-label={t('settings.nav.sectionsAria')}
       >
         {NAV_GROUPS.map((group, i) => (
           <div key={group.header ?? `group-${i}`}>
@@ -163,7 +249,7 @@ export function SettingsNav({ activeTab, onSelect, onBack, version }: SettingsNa
         className="mt-auto px-3 py-3 text-[11px]"
         style={{ color: 'var(--fg-muted)' }}
       >
-        Steno {version ?? ''}
+        {t('settings.nav.version', { version: version ?? '' })}
       </div>
     </nav>
   );
