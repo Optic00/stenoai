@@ -3,7 +3,7 @@ import { PARAKEET_LANGUAGE_CODES } from '@/lib/transcription-languages';
 export type LangOption = { value: string; label: string };
 
 // Curated language list shown in Settings → Transcribe. Whisper supports
-// all 13 (it covers 99 languages at the model level; the dropdown is just
+// all entries (it covers 99 languages at the model level; the dropdown is just
 // the tested curation). Chinese is split into Simplified (zh-Hans) and
 // Traditional (zh-Hant): whisper.cpp always emits Simplified, so Traditional
 // is a post-transcription OpenCC conversion (see src/chinese.py) — both map
@@ -14,8 +14,10 @@ export const LANGUAGES_WHISPER: LangOption[] = [
   { value: 'es', label: 'Spanish' },
   { value: 'fr', label: 'French' },
   { value: 'de', label: 'German' },
+  { value: 'it', label: 'Italian' },
   { value: 'nl', label: 'Dutch' },
   { value: 'pt', label: 'Portuguese' },
+  { value: 'ru', label: 'Russian' },
   { value: 'ja', label: 'Japanese' },
   { value: 'zh-Hans', label: 'Chinese (Simplified)' },
   { value: 'zh-Hant', label: 'Chinese (Traditional)' },

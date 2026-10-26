@@ -12,6 +12,7 @@ import {
   classifyCompletionNotification,
   chooseCompletionNotification,
   meetingAlreadyHasNotes,
+  countActionItems,
   completionActions,
 } from '@/lib/completionNotification';
 import type { Meeting, QueueStatus, RecordingTrigger } from '@/lib/ipc';
@@ -193,7 +194,9 @@ export function useRecording() {
         // flashes out with no explanation. Route it through the same native
         // notification the renderer-capture failure path uses.
         ipc().recording.reportCaptureError(
-          err instanceof Error ? err.message : 'Recording could not start'
+          err instanceof Error ? err.message : 'Recording could not start',
+          undefined,
+          'start'
         );
         throw err;
       }
@@ -267,17 +270,27 @@ export function useRecording() {
      *  produced no job (nothing was captured), which the watchdog uses to
      *  break out of an otherwise-forever spinner (issue #343). */
     queueSize: queue.data?.queueSize ?? 0,
-    // Fall back to currentJob (the in-flight processing session) when no
-    // recording is active. Keeps `sessionName` populated through the full
-    // recording → processing → done lifecycle so the synthetic in-progress
-    // row in useMeetings stays visible while a note is processing —
-    // otherwise Home goes blank between "stopped" and "processed" and the
-    // user can't see anything is happening in the background.
-    sessionName: queue.data?.sessionName ?? queue.data?.currentJob ?? null,
+    // The name the CURRENT state actually backs, which keeps `sessionName`
+    // populated through the full recording → processing → done lifecycle so the
+    // synthetic in-progress row in useMeetings stays visible while a note is
+    // processing — otherwise Home goes blank between "stopped" and "processed"
+    // and the user can't see anything is happening in the background.
+    //
+    // The branch matters, and `queue.sessionName ?? currentJob` was not enough:
+    // main keeps currentRecordingSessionName after a capture start that failed
+    // in the renderer (see liveMeetingRow.shouldShowLiveRow). If a PREVIOUS note
+    // was still processing at that moment, that dead name outranked the real
+    // job's and the processing row was labelled with a note that never recorded
+    // a second of audio. With no live capture, the in-flight job owns the label.
+    sessionName: queue.data?.hasRecording
+      ? (queue.data?.sessionName ?? null)
+      : (queue.data?.currentJob ?? null),
     /** The note (summary-file realpath) an active continue/resume is recording
      *  INTO — lets a detail view match by identity rather than the collidable
      *  display name. Null for a fresh new-note recording or when idle. */
     recordingSummaryFile: queue.data?.recordingSummaryFile ?? null,
+    recordingId: queue.data?.recordingId ?? null,
+    chatSummaryFile: queue.data?.chatSummaryFile ?? null,
     /** The real note file the live recording/processing session produces.
      *  useMeetings dedupes the synthetic live row against it so one recording
      *  never shows as two entries (#bug4). Only Parakeet writes the placeholder
@@ -386,7 +399,9 @@ export function useRecordingEvents() {
           // capture-error notification the start path uses.
           void stopRecording({ navigateToNote: false }).catch((err) => {
             ipc().recording.reportCaptureError(
-              err instanceof Error ? err.message : 'Recording could not stop'
+              err instanceof Error ? err.message : 'Recording could not stop',
+              undefined,
+              'stop'
             );
           });
         }
@@ -599,28 +614,33 @@ export function useRecordingProcessingEffects() {
           // and short-circuit when the user has notifications disabled. A
           // renderer round-trip to fetch the setting first would be a wasted
           // poll; the gate stays single-source-of-truth in main.
-          void ipc()
-            .settings.showNoteReadyNotification({
-              title,
-              summaryFile: finishedSummaryFile,
-              failed: isFailed,
-            })
-            .catch(() => {
-              // Notification failure isn't fatal. The note remains available.
-            });
-        } else if (notification === 'transcript-ready') {
-          // Transcript-only note (auto_summarize off). This actionable prompt
-          // wins over the Obsidian preservation notice when only one toast can
-          // be shown, so the user retains the route to generate notes.
-          void ipc()
-            .settings.showTranscriptReadyNotification({
-              title,
-              summaryFile: finishedSummaryFile,
-              name: data.sessionName ?? null,
-            })
-            .catch(() => {
-              // Notification failure isn't fatal.
-            });
+          if (kind === 'note-ready') {
+            void ipc()
+              .settings.showNoteReadyNotification({
+                title,
+                summaryFile: finishedSummaryFile,
+                failed: isFailed,
+                actionItemCount:
+                  data.notesGenerated &&
+                  data.summaryFile &&
+                  data.meetingData?.session_info.summary_file === data.summaryFile
+                  ? countActionItems(data.meetingData?.action_items)
+                  : undefined,
+              })
+              .catch(() => {
+                // Notification failure isn't fatal. The note remains available.
+              });
+          } else {
+            void ipc()
+              .settings.showTranscriptReadyNotification({
+                title,
+                summaryFile: finishedSummaryFile,
+                name: data.sessionName ?? null,
+              })
+              .catch(() => {
+                // Notification failure isn't fatal.
+              });
+          }
         }
         // else: on this note's own detail page → nothing. The streaming
         // UI's own listener swaps to the static view; no extra signal

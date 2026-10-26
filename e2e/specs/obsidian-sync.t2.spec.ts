@@ -198,8 +198,12 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
   const realDirBefore = fileSig(realUserDataDir());
   const vault = path.join(userDataDir, 'obs-reprocess-vault');
   mkdirSync(vault, { recursive: true });
+  // Use a dedicated local mock port so a developer's Ollama on 11434 is never
+  // contacted or stopped by this model-free test.
+  const ollama = await startMockOllama({ chatReply: REGENERATED_REPLY, port: 0 });
   writeUserConfig(userDataDir, {
-    ai_provider: 'local',
+    ai_provider: 'remote',
+    remote_ollama_url: ollama.url,
     obsidian_sync_enabled: true,
     obsidian_vault_path: vault,
   });
@@ -209,7 +213,6 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
     transcript: 'Alice: regenerate this note with the current template.',
   });
 
-  const ollama = await startMockOllama({ chatReply: REGENERATED_REPLY });
   try {
     const { app, page } = await launchApp();
 
@@ -241,9 +244,14 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
       summaryPath,
     );
     expect(result.success).toBe(true);
+    // The main process commits the fork before resolving reprocess. Distinguish
+    // a failed fork from a toast delivery failure in CI diagnostics.
+    expect(vaultFiles(vault).length).toBe(2);
+    expect(readFileSync(originalPath, 'utf8')).toBe('HAND-EDITED IN OBSIDIAN');
 
-    // Assert the short-lived toast immediately. The remaining disk and settings
-    // checks can legitimately take longer than its 15-second lifetime on CI.
+    // Assert the short-lived toast before slower settings checks. Since main's
+    // toast scheduler now queues behind a visible 15-second toast, allow one
+    // full predecessor lifetime plus loading time on Windows.
     const findNotificationWindow = async () => {
       // A fast duplicate completion can briefly leave the superseded toast in
       // ElectronApplication.windows() while its replacement mounts. Search
@@ -273,7 +281,7 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
         notification = await findNotificationWindow();
         return Boolean(notification);
       }, {
-        timeout: 14_000,
+        timeout: 32_000,
         intervals: [100],
       })
       .toBe(true);

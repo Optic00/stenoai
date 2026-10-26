@@ -10,6 +10,7 @@ import {
   useSetObsidianVaultPath,
 } from '@/hooks/useSettings';
 import { COMPACT_BTN } from './primitives';
+import { t } from '@/i18n';
 
 /**
  * Integrations settings (#413). Currently: Obsidian vault sync — a one-way
@@ -49,21 +50,20 @@ export function IntegrationsTab() {
             className="flex items-center gap-1.5 text-[14px] font-normal"
             style={{ color: 'var(--fg-1)' }}
           >
-            Sync to Obsidian
+            {t('settings.integrations.obsidian.label')}
             {/* Obsidian's crystal motif, inline after the name — the app's icon
                 system is lucide, so use its Gem rather than a one-off brand SVG. */}
             <Gem size={14} style={{ color: '#7c6cf5' }} aria-hidden />
           </div>
           <div className="mt-[2px] text-[13px]" style={{ color: 'var(--fg-2)' }}>
-            Mirror your notes into an Obsidian vault folder as Markdown. One-way (Steno → vault);
-            edits made in Obsidian are never overwritten.
+            {t('settings.integrations.obsidian.description')}
           </div>
         </div>
         <Switch
           checked={enabled.data ?? false}
           onCheckedChange={(v) => setEnabled.mutate(v)}
           disabled={enabled.data === undefined}
-          aria-label="Sync to Obsidian"
+          aria-label={t('settings.integrations.obsidian.aria')}
           className="mt-1 shrink-0"
         />
       </div>
@@ -77,12 +77,12 @@ export function IntegrationsTab() {
             className="text-[14px] font-normal"
             style={{ color: 'var(--fg-1)', marginBottom: 2 }}
           >
-            Vault folder
+            {t('settings.integrations.vaultFolder.label')}
           </div>
           <div className="mb-2 text-[13px]" style={{ color: 'var(--fg-2)' }}>
             {path
-              ? 'Notes are written here, under subfolders that mirror your Steno folders.'
-              : 'Choose a folder inside your Obsidian vault to sync notes into.'}
+              ? t('settings.integrations.vaultFolder.withPath')
+              : t('settings.integrations.vaultFolder.noPath')}
           </div>
           {path && (
             <code
@@ -96,11 +96,11 @@ export function IntegrationsTab() {
         </div>
         <div className="flex shrink-0 gap-2 pt-1">
           <Button variant="outline" size="sm" className={COMPACT_BTN} onClick={chooseFolder}>
-            Choose…
+            {t('settings.integrations.vaultFolder.choose')}
           </Button>
           {path && (
             <Button variant="ghost" size="sm" className={COMPACT_BTN} onClick={clearFolder}>
-              Clear
+              {t('settings.integrations.vaultFolder.clear')}
             </Button>
           )}
         </div>
@@ -108,7 +108,7 @@ export function IntegrationsTab() {
 
       {enabled.data && !path && (
         <div className="py-3 text-[13px]" style={{ color: 'var(--fg-2)' }}>
-          Sync is on but no vault folder is set yet — choose one above to start mirroring.
+          {t('settings.integrations.noVaultWarning')}
         </div>
       )}
 
@@ -116,9 +116,11 @@ export function IntegrationsTab() {
         <div className="space-y-2 py-3 text-[13px]" style={{ color: 'var(--fg-2)' }}>
           <div>
             <span style={{ color: 'var(--fg-1)' }}>
-              {conflictCount} Obsidian edit{conflictCount === 1 ? '' : 's'} preserved.
+              {conflictCount === 1
+                ? t('settings.integrations.conflicts.preserved.one', { count: conflictCount })
+                : t('settings.integrations.conflicts.preserved.other', { count: conflictCount })}
             </span>{' '}
-            Steno never overwrites a vault file that changed outside the app.
+            {t('settings.integrations.conflicts.preserved.description')}
           </div>
           <div className="space-y-1.5">
             {conflictEntries.map(([stem, conflict]) => (
@@ -149,17 +151,16 @@ export function IntegrationsTab() {
                   ) : (
                     <span className="shrink-0 text-[12px]">
                       {conflict.reason === 'external-edit-on-delete'
-                        ? 'Deletion skipped'
+                        ? t('settings.integrations.conflicts.reason.delete')
                         : conflict.reason === 'external-edit-preserved'
-                          ? 'Steno copy removed'
-                          : 'Update skipped'}
+                          ? t('settings.integrations.conflicts.reason.removed')
+                          : t('settings.integrations.conflicts.reason.update')}
                     </span>
                   )}
                 </div>
                 {conflict.replacementVaultRelPath && (
                   <div className="mt-1 text-[11px]">
-                    Edited vault file kept on the left. Its regenerated Steno copy was saved on the
-                    right.
+                    {t('settings.integrations.conflicts.replacementDescription')}
                   </div>
                 )}
               </div>
