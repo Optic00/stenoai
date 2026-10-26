@@ -246,7 +246,30 @@ test('reprocess preserves an Obsidian edit and writes the regenerated note separ
     expect(result.success).toBe(true);
     // The main process commits the fork before resolving reprocess. Distinguish
     // a failed fork from a toast delivery failure in CI diagnostics.
-    expect(vaultFiles(vault).length).toBe(2);
+    const filesAfterReprocess = vaultFiles(vault);
+    let forkDiagnostic = '';
+    if (filesAfterReprocess.length !== 2) {
+      // The CI artifact does not retain this temporary vault. Report only
+      // synthetic filenames and index fields needed to distinguish a failed
+      // fork, a moved replacement, and a transient Windows read/write error.
+      let index: Record<string, unknown> | undefined;
+      let indexError: string | undefined;
+      try { index = JSON.parse(readFileSync(statePath, 'utf8')); }
+      catch (error) { indexError = (error as NodeJS.ErrnoException).code || 'parse-error'; }
+      let originalEdited: boolean | string;
+      try { originalEdited = readFileSync(originalPath, 'utf8') === 'HAND-EDITED IN OBSIDIAN'; }
+      catch (error) { originalEdited = (error as NodeJS.ErrnoException).code || 'read-error'; }
+      const notes = index?.notes as Record<string, { vaultRelPath?: string }> | undefined;
+      const conflicts = index?.conflicts as Record<string, { reason?: string }> | undefined;
+      forkDiagnostic = JSON.stringify({
+        vaultEntries: readdirSync(vault, { recursive: true }),
+        trackedVaultRelPath: notes?.['obs-reprocess']?.vaultRelPath,
+        conflictReasons: Object.values(conflicts || {}).map((conflict) => conflict.reason),
+        indexError,
+        originalEdited,
+      });
+    }
+    expect(filesAfterReprocess.length, forkDiagnostic).toBe(2);
     expect(readFileSync(originalPath, 'utf8')).toBe('HAND-EDITED IN OBSIDIAN');
 
     // Assert the short-lived toast before slower settings checks. Since main's
