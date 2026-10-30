@@ -38,11 +38,39 @@ type LaunchOptions = {
 type LaunchResult = { app: ElectronApplication; page: Page };
 
 type Fixtures = {
+  procSnapshot: void;
   userDataDir: string;
   launchApp: (opts?: LaunchOptions) => Promise<LaunchResult>;
 };
 
 export const test = base.extend<Fixtures>({
+  // TEMPORARY CI diagnostic (#598): macOS T2 slows down for every spec after
+  // live-meeting-chat. Log the busiest processes after each test so the run
+  // shows what keeps burning CPU. Remove once the cause is fixed.
+  procSnapshot: [
+    async ({}, use, testInfo) => {
+      await use();
+      if (!process.env.CI || process.platform !== 'darwin') return;
+      try {
+        const out = execSync('ps -Ao pid,ppid,pcpu,rss,etime,command -r | cut -c1-200 | head -13', {
+          encoding: 'utf8',
+          timeout: 5_000,
+        });
+        // Leftovers that idle at low CPU would not show in the top list above.
+        const ours = execSync(
+          "ps -Ao pid,ppid,pcpu,rss,etime,command | grep -Ei 'stenoai|electron|ollama|python|transcribe' | grep -v grep | cut -c1-200 || true",
+          { encoding: 'utf8', timeout: 5_000 },
+        );
+        console.log(
+          `[proc-snapshot] after "${testInfo.title}" (${testInfo.status}, ${testInfo.duration} ms)\n${out}[proc-snapshot] app-related:\n${ours}`,
+        );
+      } catch (err) {
+        console.log(`[proc-snapshot] ps failed: ${(err as Error).message}`);
+      }
+    },
+    { auto: true },
+  ],
+
   // Per-test isolated user-data dir. The keystone (STENOAI_USER_DATA_DIR) routes
   // every app + backend write here instead of the real ~/Library/... dir, so a
   // test can never corrupt real user data. Removed after the test.
